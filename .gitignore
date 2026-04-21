@@ -1,0 +1,6 @@
+.tools/
+bin/
+vendor/
+*.test
+*.out
+.DS_Store

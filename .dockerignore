@@ -1,0 +1,8 @@
+.git
+.github
+.tools
+deploy
+docs
+*.md
+!go.mod
+!go.sum
