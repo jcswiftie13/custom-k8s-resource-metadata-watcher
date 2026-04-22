@@ -32,6 +32,9 @@ func main() {
 		metricsAddr = flag.String("metrics-addr", ":8080", "Address to serve /metrics on")
 		kubeconfig  = flag.String("kubeconfig", "", "Path to kubeconfig (empty = in-cluster)")
 		logLevel    = flag.String("log-level", "info", "Log level: debug | info | warn | error")
+		kubeQPS     = flag.Float64("kube-api-qps", 20, "Maximum QPS the kubernetes client issues against the apiserver")
+		kubeBurst   = flag.Int("kube-api-burst", 40, "Maximum burst the kubernetes client issues against the apiserver")
+		workers     = flag.Int("reconcile-workers", 4, "Number of goroutines that drain the reconcile workqueue")
 	)
 	flag.Parse()
 
@@ -50,6 +53,9 @@ func main() {
 		log.Error("build kube client config failed", "err", err)
 		os.Exit(1)
 	}
+	restCfg.QPS = float32(*kubeQPS)
+	restCfg.Burst = *kubeBurst
+	log.Info("kube client configured", "qps", restCfg.QPS, "burst", restCfg.Burst)
 	client, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
 		log.Error("kubernetes client failed", "err", err)
@@ -59,9 +65,13 @@ func main() {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector())
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	registerClientGoMetrics(reg)
 	ps := sink.NewPrometheusSink(reg)
 
-	col, err := collector.New(cfg, client, ps, log)
+	col, err := collector.New(cfg, client, ps, log, collector.Options{
+		Workers:    *workers,
+		Registerer: reg,
+	})
 	if err != nil {
 		log.Error("collector init failed", "err", err)
 		os.Exit(1)

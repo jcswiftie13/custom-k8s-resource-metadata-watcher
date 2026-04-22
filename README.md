@@ -34,6 +34,31 @@ Local (against the current kubeconfig context):
 ./bin/metadata-exporter --config=deploy/config-example.yaml --kubeconfig=$HOME/.kube/config
 ```
 
+### Runtime flags
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--config` | `/etc/metadata-exporter/config.yaml` | Path to the YAML config file. |
+| `--metrics-addr` | `:8080` | Address the `/metrics` and `/healthz` endpoints listen on. |
+| `--kubeconfig` | *(empty)* | Explicit kubeconfig path; empty falls back to in-cluster. |
+| `--log-level` | `info` | One of `debug`, `info`, `warn`, `error`. |
+| `--kube-api-qps` | `20` | Maximum QPS of the kubernetes client against the apiserver. |
+| `--kube-api-burst` | `40` | Maximum burst of the kubernetes client against the apiserver. |
+| `--reconcile-workers` | `4` | Number of goroutines draining the reconcile workqueue. |
+
+Tune `--kube-api-qps` / `--kube-api-burst` downward on large clusters to cap
+exporter pressure on the apiserver, and upward when tens of namespaces are
+watched in parallel. The exporter also exposes its own self-metrics to help
+you right-size the workqueue:
+
+- `exporter_reconcile_queue_depth` — current queue depth gauge.
+- `exporter_reconcile_total{rule,result}` — reconcile attempts per rule.
+- `exporter_reconcile_duration_seconds` — reconcile latency histogram per anchor kind.
+- `exporter_parent_index_hit_total` / `exporter_parent_index_fallback_total` — parent-event routing stats.
+- `exporter_parent_index_size{direction}` — reverse-index map sizes (by_parent / by_anchor), useful for leak detection.
+- `exporter_update_filter_size` — cached metadata-digest count used by the update-event filter.
+- `rest_client_requests_total{code,method,host}` + `rest_client_request_duration_seconds{verb,host}` — standard client-go metrics, handy for spotting apiserver pressure.
+
 Deploy to a cluster:
 
 ```sh
@@ -46,17 +71,20 @@ pod-level service discovery will find the exporter automatically.
 
 ## Integration tests (Kind)
 
-End-to-end checks run the exporter inside a cluster, apply a sample Deployment
-(Pod → ReplicaSet → Deployment owner chain), scrape `/metrics`, then delete the
-workload and assert the series disappears.
+End-to-end checks run the exporter inside a Kind cluster and drive a set of
+Go-based scenarios that cover correctness, API-server watch topology, and
+burst-churn behaviour. See [docs/INTEGRATION_TESTS.md](docs/INTEGRATION_TESTS.md)
+for the full scenario list.
 
-**Requirements:** Docker, `kind`, `kubectl`, `curl`, and a Bash shell.
+**Requirements:** Docker, `kind`, `kubectl`, Go (matching `go.mod`), and a
+Bash shell.
 
 **Full flow** (creates a dedicated Kind cluster named `metadata-exporter-it`,
-then deletes it on success or failure):
+applies the kustomize base, then runs `go test -tags integration` — the
+cluster is deleted on success or failure):
 
 ```sh
-./test/integration/run.sh
+make e2e
 ```
 
 **Use an existing cluster** (current kubeconfig context; the script will not
@@ -73,15 +101,16 @@ export SKIP_KIND_CREATE=1
 
 | Variable | Purpose |
 |----------|---------|
-| `SKIP_CLUSTER_DELETE` | If set (with default `run.sh` behavior), skip `kind delete cluster` when the script created the cluster |
+| `SKIP_CLUSTER_DELETE` | Keep the Kind cluster after the run (only when `run.sh` created it) |
+| `SKIP_GO_TEST` | Apply manifests and exit; useful for interactive debugging |
 | `INTEGRATION_IMAGE` | Docker image tag to build and load (default `metadata-exporter:it`) |
 | `DOCKER_BUILD_PLATFORM` | e.g. `linux/amd64` for cross-platform image builds |
-| `PF_LOCAL_PORT` | Local port for `kubectl port-forward` (default `18080`) |
-| `METRICS_WAIT_SEC` / `DELETE_WAIT_SEC` | Timeouts for scraping and delete propagation |
+| `GOTEST_FLAGS` | Extra flags forwarded to `go test` (e.g. `-run TestTopology_`) |
 
 CI runs the same script via [.github/workflows/integration.yaml](.github/workflows/integration.yaml) after [helm/kind-action](https://github.com/helm/kind-action) provisions the cluster.
 
-Manifests live under [test/integration/manifests/](test/integration/manifests/).
+Manifests live under [test/integration/manifests/](test/integration/manifests/)
+and the Go test harness under [test/integration/e2e/](test/integration/e2e/).
 
 ## Project layout
 

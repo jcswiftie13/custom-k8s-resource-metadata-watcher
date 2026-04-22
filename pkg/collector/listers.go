@@ -53,8 +53,9 @@ type ScopedInformers struct {
 }
 
 // NewScopedInformers constructs factories for every (namespace, kind) using
-// the supplied selectors. When w.Namespaces is empty, a single cluster-wide
-// scope ("") is used.
+// the supplied selectors. When w.Namespaces is empty a single cluster-wide
+// scope ("") is used; one factory per kind is created in that mode, so the
+// apiserver sees N_kinds watches regardless of cluster size.
 func NewScopedInformers(client kubernetes.Interface, w config.WatchScope, log *slog.Logger) *ScopedInformers {
 	if log == nil {
 		log = slog.Default()
@@ -62,6 +63,16 @@ func NewScopedInformers(client kubernetes.Interface, w config.WatchScope, log *s
 	namespaces := w.Namespaces
 	if len(namespaces) == 0 {
 		namespaces = []string{""}
+		log.Info("watch mode = cluster-wide",
+			"factoriesPerKind", 1,
+			"kinds", len(allKinds),
+		)
+	} else {
+		log.Info("watch mode = per-namespace",
+			"namespaces", namespaces,
+			"factoriesPerKind", len(namespaces),
+			"kinds", len(allKinds),
+		)
 	}
 	si := &ScopedInformers{
 		client:       client,

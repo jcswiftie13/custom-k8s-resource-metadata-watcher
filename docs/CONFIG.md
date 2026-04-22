@@ -13,6 +13,7 @@ This document is the source of truth for the YAML schema.
 - [5. Flattening labels and annotations](#5-flattening-labels-and-annotations)
 - [6. Recipes](#6-recipes)
 - [7. Troubleshooting](#7-troubleshooting)
+- [8. Runtime internals](#8-runtime-internals)
 
 ---
 
@@ -87,6 +88,19 @@ than the Pod selector.
 - `namespaces: ["foo"]` → namespace-scoped LIST/WATCH (still satisfies the
   cluster-wide RBAC). A `RoleBinding` can be substituted if you wish, but you
   must bind it in every listed namespace.
+
+### Watch topology: cluster-wide vs per-namespace
+
+| Mode | When applied | Watches opened | Trade-offs |
+|------|--------------|----------------|------------|
+| cluster-wide | `watch.namespaces` omitted/empty | one per kind (~5 total) | Lightest on the apiserver. Fine-grained `labelSelector` / `fieldSelector` still shrinks each watch. |
+| per-namespace | `watch.namespaces` non-empty | `len(namespaces) × 5` | Strong isolation; useful when you need different RBAC per namespace or when `fieldSelector: metadata.name=...` scopes down to a single pod per namespace. |
+
+The active mode is printed at startup (`watch mode = cluster-wide` or
+`watch mode = per-namespace`) and is reflected in the number of informer
+factories listed in the log line. Namespace filtering happens in the
+client-go cache, so cluster-wide mode does **not** increase per-event CPU;
+it only flattens the watch fan-out against the apiserver.
 
 ---
 
@@ -396,3 +410,57 @@ rules:
 | Startup error mentioning `fieldSelector`              | Field is not in the per-resource whitelist.                                                         | Move the predicate to `labelSelector` or remove it.                                          |
 | Warning "pod selector combined with stricter parent selector ..." | Parents are filtered away; owner chain can't resolve them.                                          | Drop the parent selector or broaden it.                                                      |
 | `metrics-addr` refuses connections                    | Container port mismatch or the process crashed at config validation.                                | Check logs; the pod's readiness probe targets `/healthz`.                                    |
+
+---
+
+## 8. Runtime internals
+
+This section documents behaviors that do not live in the YAML schema but
+materially affect the exporter's apiserver footprint.
+
+### Workqueue + worker pool
+
+Every informer event produces a tiny `anchorRef = {kind, namespace, name}`
+key and pushes it onto a rate-limited `workqueue`. A pool of worker
+goroutines (size controlled by `--reconcile-workers`) drains the queue and
+runs a single `reconcile` per anchor. The queue dedupes identical keys, so
+100 Deployment updates in a second that touch the same anchors collapse
+into one reconcile each.
+
+Self-metrics for observability:
+
+- `exporter_reconcile_queue_depth` (gauge) — current pending work.
+- `exporter_reconcile_total{rule,result}` (counter) — reconcile attempts.
+- `exporter_reconcile_duration_seconds` (histogram per `anchor_kind`).
+
+### Reverse parent index
+
+The naive approach to "Deployment X changed, update every Pod that ultimately
+depends on it" would scan every Pod in the namespace on each parent event.
+Instead, each successful reconcile records the UIDs of the objects walked by
+the owner chain into a `parentUID → {anchorRef}` map. Parent informer events
+look up the UID and enqueue only the affected anchors. A cache miss (cold
+start or orphaned UID) falls back to the historical namespace rescan once,
+and subsequent reconciles populate the index organically.
+
+Routing stats are visible as:
+
+- `exporter_parent_index_hit_total` — parent events resolved via the index.
+- `exporter_parent_index_fallback_total` — cold-path namespace rescans.
+
+### Update-event filter
+
+Informer `UpdateFunc` callbacks are cheap to fire but expensive to process
+when the payload is large (Pods ship with big `status` subresources). The
+collector memoises a digest of `{metadata.generation, labels, annotations}`
+per UID and short-circuits updates whose digest matches the previous
+observation. `status`-only churn (heartbeats, condition timestamps) therefore
+never reaches the workqueue.
+
+### Apiserver rate limiting
+
+`--kube-api-qps` (default 20) and `--kube-api-burst` (default 40) configure
+the kubernetes client's token bucket. In practice the exporter issues almost
+no client traffic once informers have synced — most load is inbound watch
+events — but these flags let operators cap the blast radius of startup
+LISTs and owner-chain retries on huge clusters.
