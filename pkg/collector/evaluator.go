@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	clientscheme "k8s.io/client-go/kubernetes/scheme"
 
 	"github.com/example/metadata-exporter/pkg/config"
 )
@@ -84,6 +85,15 @@ func Compile(rule *config.Rule) (*CompiledRule, error) {
 			OnMissing: ext.OnMissingValue(),
 		}
 	}
+
+	flattenLabels, err := compileFlatten(rule)
+	if err != nil {
+		return nil, err
+	}
+	if len(flattenLabels) > 0 {
+		cr.Labels = append(cr.Labels, flattenLabels...)
+		cr.LabelOrder, cr.Labels = reorderLabels(cr.Labels)
+	}
 	return cr, nil
 }
 
@@ -120,7 +130,36 @@ func (e *Evaluator) ToUnstructured(obj runtime.Object) (map[string]interface{}, 
 	if err != nil {
 		return nil, fmt.Errorf("to unstructured: %w", err)
 	}
+	enrichTypeMetaFromScheme(m, obj)
 	return m, nil
+}
+
+// enrichTypeMetaFromScheme fills missing kind/apiVersion from the global
+// client scheme. Lister/informer objects often have empty embedded TypeMeta
+// while retaining their concrete Go type, so JSONPath "kind" would otherwise
+// evaluate to empty.
+func enrichTypeMetaFromScheme(m map[string]interface{}, obj runtime.Object) {
+	if m == nil || obj == nil {
+		return
+	}
+	k, _ := m["kind"].(string)
+	v, _ := m["apiVersion"].(string)
+	if k != "" && v != "" {
+		return
+	}
+	gvks, _, err := clientscheme.Scheme.ObjectKinds(obj)
+	if err != nil || len(gvks) == 0 {
+		return
+	}
+	gvk := gvks[0]
+	if k == "" && gvk.Kind != "" {
+		m["kind"] = gvk.Kind
+	}
+	if v == "" {
+		if gv := gvk.GroupVersion(); gv.String() != "" {
+			m["apiVersion"] = gv.String()
+		}
+	}
 }
 
 // EvaluateForEach returns the list of items produced by the rule's forEach

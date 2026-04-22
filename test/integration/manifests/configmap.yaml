@@ -1,0 +1,64 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metadata-exporter
+  labels:
+    app.kubernetes.io/name: metadata-exporter-integration
+data:
+  config.yaml: |
+    metricPrefix: "it_"
+
+    watch:
+      namespaces: ["metadata-exporter-it"]
+      selectors:
+        Pod:
+          fieldSelector: "status.phase!=Succeeded"
+
+    rules:
+      - name: "pod_info"
+        help: "Integration test: one series per Pod."
+        anchor: Pod
+        relations:
+          - name: top
+            via: topController
+        labels:
+          namespace:
+            path: "metadata.namespace"
+          pod:
+            path: "metadata.name"
+          phase:
+            path: "status.phase"
+          controller_kind:
+            source: top
+            path: "kind"
+          controller_name:
+            source: top
+            path: "metadata.name"
+        flatten:
+          - namePrefix: "controller_annotation_"
+            source: top
+            path: "metadata.annotations"
+            keys:
+              - "integration.test/controller-note"
+
+      - name: "pod_container_info"
+        help: "Integration test: one series per (Pod, container)."
+        anchor: Pod
+        forEach: "spec.containers[*]"
+        relations:
+          - name: top
+            via: topController
+        labels:
+          namespace:
+            path: "metadata.namespace"
+          pod:
+            path: "metadata.name"
+          container:
+            source: item
+            path: "name"
+          image:
+            source: item
+            path: "image"
+          controller_name:
+            source: top
+            path: "metadata.name"

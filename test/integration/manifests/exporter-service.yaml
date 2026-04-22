@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: metadata-exporter
+  labels:
+    app.kubernetes.io/name: metadata-exporter-integration
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: metadata-exporter-integration
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+      protocol: TCP

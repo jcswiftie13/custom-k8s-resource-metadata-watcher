@@ -1,0 +1,24 @@
+name: integration
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  kind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1.12.0
+        with:
+          wait: 300s
+
+      - name: Run Kind integration tests
+        env:
+          SKIP_KIND_CREATE: "1"
+          KIND_CLUSTER_NAME: kind
+          DOCKER_BUILD_PLATFORM: linux/amd64
+        run: ./test/integration/run.sh

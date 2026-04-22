@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 
-FROM golang:1.22-bookworm AS build
+FROM golang:1.25-bookworm AS build
 
 ENV CGO_ENABLED=0 \
     GOOS=linux \
