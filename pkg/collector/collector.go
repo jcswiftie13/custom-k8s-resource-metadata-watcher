@@ -121,6 +121,9 @@ func collectReadKinds(r *config.Rule) map[string]struct{} {
 			addSource(f.EffectiveSource())
 		}
 	}
+	for _, fl := range r.Flatten {
+		addSource(fl.EffectiveSource())
+	}
 	return out
 }
 

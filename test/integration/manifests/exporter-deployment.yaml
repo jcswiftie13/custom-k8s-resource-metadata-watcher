@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metadata-exporter
+  labels:
+    app.kubernetes.io/name: metadata-exporter-integration
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: metadata-exporter-integration
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: metadata-exporter-integration
+    spec:
+      serviceAccountName: metadata-exporter
+      securityContext:
+        runAsNonRoot: true
+        # Distroless image uses USER nonroot; kubelet requires a numeric UID when runAsNonRoot is set.
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: metadata-exporter
+          image: metadata-exporter:it
+          imagePullPolicy: Never
+          args:
+            - --config=/etc/metadata-exporter/config.yaml
+            - --metrics-addr=:8080
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/metadata-exporter
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: metadata-exporter

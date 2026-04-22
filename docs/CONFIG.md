@@ -10,8 +10,9 @@ This document is the source of truth for the YAML schema.
 - [2. `watch` — scoping the informers](#2-watch--scoping-the-informers)
 - [3. `rules` — declaring metrics](#3-rules--declaring-metrics)
 - [4. Pod-level vs Container-level](#4-pod-level-vs-container-level)
-- [5. Recipes](#5-recipes)
-- [6. Troubleshooting](#6-troubleshooting)
+- [5. Flattening labels and annotations](#5-flattening-labels-and-annotations)
+- [6. Recipes](#6-recipes)
+- [7. Troubleshooting](#7-troubleshooting)
 
 ---
 
@@ -230,7 +231,92 @@ custom_pod_container_info{namespace="prod",pod="api-abc",container="sidecar",ima
 
 ---
 
-## 5. Recipes
+## 5. Flattening labels and annotations
+
+Sometimes a Kubernetes `metadata.annotations` or `metadata.labels` map carries
+several related values that you would like to expose as **individual
+Prometheus labels** on the same series — for example, one label per well-known
+controller annotation. `flatten:` is a declarative, **allow-list** based way
+to do that without growing `labels:` by hand.
+
+```yaml
+rules:
+  - name: "pod_info"
+    anchor: Pod
+    relations:
+      - { name: top, via: topController }
+    labels:
+      namespace: { path: "metadata.namespace" }
+      pod:       { path: "metadata.name" }
+    flatten:
+      - namePrefix: "controller_annotation_"
+        source: top                # default "anchor"
+        path: "metadata.annotations"
+        keys:
+          - "integration.test/controller-note"
+          - "integration.test/owner"
+        onMissing: ""              # optional; default ""
+      - namePrefix: "pod_label_"
+        path: "metadata.labels"
+        keys: ["app.kubernetes.io/name"]
+```
+
+### Schema
+
+| Field         | Required | Default    | Meaning                                                                         |
+|---------------|----------|------------|---------------------------------------------------------------------------------|
+| `namePrefix`  | no       | `""`       | Prepended verbatim to every generated Prometheus label name.                    |
+| `source`      | no       | `"anchor"` | Same semantics as on `labels:` entries (`item` still requires `forEach`).       |
+| `path`        | yes      |            | Must resolve to a `map[string]interface{}` (typically `metadata.annotations` / `metadata.labels`). |
+| `keys`        | yes      |            | Non-empty list of map keys to extract. Keys must be unique within an entry.     |
+| `onMissing`   | no       | `""`       | Returned for any key absent from the resolved map (or when `path` misses).      |
+
+### Name generation and sanitisation
+
+Prometheus label names must match `[a-zA-Z_][a-zA-Z0-9_]*`. Kubernetes
+annotation / label keys frequently use `.`, `/`, or `-`, so each `key` is run
+through a deterministic sanitiser before being prefixed:
+
+- Every character outside `[A-Za-z0-9_]` is replaced with `_`.
+- If the first character is a digit, the result is prefixed with `_`.
+
+Examples:
+
+| Key                                   | Sanitised fragment                  |
+|---------------------------------------|-------------------------------------|
+| `integration.test/controller-note`    | `integration_test_controller_note`  |
+| `app.kubernetes.io/name`              | `app_kubernetes_io_name`            |
+| `123abc`                              | `_123abc`                           |
+
+The **final Prometheus label name** is `namePrefix + sanitize(key)` and is
+validated at startup against the label-name grammar. Names starting with
+`__` are rejected (Prometheus reserves that range).
+
+### Collision rules
+
+At startup `metadata-exporter` fails fast if any two label names inside the
+same rule would collide:
+
+- Between `labels:` entries and `flatten:` expansions.
+- Between two different `flatten:` entries (e.g. both use the same
+  `namePrefix` and share a key after sanitisation).
+
+This means your dashboards can rely on a **fixed, conflict-free label set**
+per metric, chosen at config-load time.
+
+### Miss semantics
+
+A flatten entry that resolves `path` to something other than a map (missing
+field, wrong type, etc.) is treated as a total miss: every generated label
+takes the entry's `onMissing` value. A specific key absent from a resolved
+map is also considered a miss for just that label.
+
+This preserves the same "fixed label set, empty-string on miss" behaviour as
+the rest of the config — the series always has all declared labels present.
+
+---
+
+## 6. Recipes
 
 ### 5.1 Argo CD tracking id, with fallback to the pod itself
 
@@ -301,7 +387,7 @@ rules:
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom                                               | Likely cause                                                                                        | Resolution                                                                                   |
 |-------------------------------------------------------|-----------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|

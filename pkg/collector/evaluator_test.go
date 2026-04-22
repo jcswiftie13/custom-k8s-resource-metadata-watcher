@@ -214,6 +214,161 @@ func TestCompile_InvalidJSONPath(t *testing.T) {
 	}
 }
 
+func TestCompile_FlattenExpandsAnnotations(t *testing.T) {
+	rule := &config.Rule{
+		Name:   "pod_info",
+		Anchor: "Pod",
+		Labels: map[string]config.Extract{
+			"namespace": {Path: "metadata.namespace"},
+		},
+		Flatten: []config.FlattenExtract{{
+			NamePrefix: "controller_annotation_",
+			Source:     "anchor",
+			Path:       "metadata.annotations",
+			Keys: []string{
+				"integration.test/controller-note",
+				"integration.test/missing",
+			},
+		}},
+	}
+	cr := mustCompile(t, rule)
+
+	wantOrder := []string{
+		"controller_annotation_integration_test_controller_note",
+		"controller_annotation_integration_test_missing",
+		"namespace",
+	}
+	if len(cr.LabelOrder) != len(wantOrder) {
+		t.Fatalf("LabelOrder len = %d, want %d: %+v", len(cr.LabelOrder), len(wantOrder), cr.LabelOrder)
+	}
+	for i, n := range wantOrder {
+		if cr.LabelOrder[i] != n {
+			t.Fatalf("LabelOrder[%d] = %q, want %q", i, cr.LabelOrder[i], n)
+		}
+		if cr.Labels[i].Name != n {
+			t.Fatalf("Labels[%d].Name = %q, want %q", i, cr.Labels[i].Name, n)
+		}
+	}
+
+	ev := NewEvaluator()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns",
+		Annotations: map[string]string{
+			"integration.test/controller-note": "from-fixture-deployment",
+		},
+	}}
+	m, _ := ev.ToUnstructured(pod)
+
+	values := map[string]string{}
+	for _, cl := range cr.Labels {
+		values[cl.Name] = ev.EvaluateLabel(cl, func(string) map[string]interface{} { return m })
+	}
+	if got := values["controller_annotation_integration_test_controller_note"]; got != "from-fixture-deployment" {
+		t.Fatalf("flatten hit = %q", got)
+	}
+	if got := values["controller_annotation_integration_test_missing"]; got != "" {
+		t.Fatalf("flatten miss should be empty, got %q", got)
+	}
+}
+
+func TestCompile_FlattenFromTopController(t *testing.T) {
+	rule := &config.Rule{
+		Name:   "pod_info",
+		Anchor: "Pod",
+		Relations: []config.RelationAlias{
+			{Name: "top", Via: "topController"},
+		},
+		Labels: map[string]config.Extract{
+			"namespace": {Path: "metadata.namespace"},
+		},
+		Flatten: []config.FlattenExtract{{
+			NamePrefix: "controller_annotation_",
+			Source:     "top",
+			Path:       "metadata.annotations",
+			Keys:       []string{"integration.test/controller-note"},
+		}},
+	}
+	cr := mustCompile(t, rule)
+
+	var flatten CompiledLabel
+	for _, cl := range cr.Labels {
+		if cl.Name == "controller_annotation_integration_test_controller_note" {
+			flatten = cl
+			break
+		}
+	}
+	if flatten.Name == "" {
+		t.Fatalf("flatten label not produced")
+	}
+	if flatten.Primary.Source != "topController" {
+		t.Fatalf("flatten.Primary.Source = %q, want topController", flatten.Primary.Source)
+	}
+
+	ev := NewEvaluator()
+	top := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				"integration.test/controller-note": "from-top",
+			},
+		},
+	}
+	got := ev.EvaluateLabel(flatten, func(source string) map[string]interface{} {
+		if source == "topController" {
+			return top
+		}
+		return nil
+	})
+	if got != "from-top" {
+		t.Fatalf("top flatten = %q, want from-top", got)
+	}
+}
+
+func TestCompile_FlattenOnMissingPropagates(t *testing.T) {
+	onMissing := "N/A"
+	rule := &config.Rule{
+		Name:   "pod_info",
+		Anchor: "Pod",
+		Labels: map[string]config.Extract{
+			"namespace": {Path: "metadata.namespace"},
+		},
+		Flatten: []config.FlattenExtract{{
+			NamePrefix: "pod_label_",
+			Path:       "metadata.labels",
+			Keys:       []string{"team"},
+			OnMissing:  &onMissing,
+		}},
+	}
+	cr := mustCompile(t, rule)
+	ev := NewEvaluator()
+	m, _ := ev.ToUnstructured(&corev1.Pod{})
+	for _, cl := range cr.Labels {
+		if cl.Name != "pod_label_team" {
+			continue
+		}
+		got := ev.EvaluateLabel(cl, func(string) map[string]interface{} { return m })
+		if got != "N/A" {
+			t.Fatalf("OnMissing = %q, want N/A", got)
+		}
+	}
+}
+
+func TestCompile_FlattenInvalidPath(t *testing.T) {
+	rule := &config.Rule{
+		Name:   "pod_info",
+		Anchor: "Pod",
+		Labels: map[string]config.Extract{
+			"namespace": {Path: "metadata.namespace"},
+		},
+		Flatten: []config.FlattenExtract{{
+			Path: "[",
+			Keys: []string{"x"},
+		}},
+	}
+	if _, err := Compile(rule); err == nil {
+		t.Fatal("expected invalid path error for flatten")
+	}
+}
+
 func TestCompile_ScalarTypeStringification(t *testing.T) {
 	rule := &config.Rule{
 		Name:   "deployment_info",
