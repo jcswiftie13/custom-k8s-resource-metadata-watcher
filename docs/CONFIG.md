@@ -1,41 +1,122 @@
-# metadata-exporter — Configuration Reference
+# metadata-exporter — 設定參考與設計
 
-`metadata-exporter` is a rule-driven Kubernetes metadata collector. It watches
-resources via SharedInformers and publishes per-series labels as Prometheus
-`_info` gauges (value = 1).
+`metadata-exporter` 是以設定驅動的 Kubernetes metadata 匯出器：透過 SharedInformer 快取觀察叢集資源、在快取內走訪 `ownerReferences`（不額外打 API），並將每筆時間序列的標籤以 Prometheus `_info` 風格 Gauge（值為 1）暴露。
 
-This document is the source of truth for the YAML schema.
+本文件為 **YAML 結構的權威說明**，並說明其**設計意圖**：設定如何載入、驗證、編譯成執行期結構，以及如何銜接 informer 與 Prometheus sink。
 
-- [1. Top-level structure](#1-top-level-structure)
-- [2. `watch` — scoping the informers](#2-watch--scoping-the-informers)
-- [3. `rules` — declaring metrics](#3-rules--declaring-metrics)
-- [4. Pod-level vs Container-level](#4-pod-level-vs-container-level)
-- [5. Flattening labels and annotations](#5-flattening-labels-and-annotations)
-- [6. Recipes](#6-recipes)
-- [7. Troubleshooting](#7-troubleshooting)
-- [8. Runtime internals](#8-runtime-internals)
+**實作對照（原始碼為準）**
+
+- YAML 模型、`Load`、`Validate`：`pkg/config/config.go`
+- CLI（`-config`，預設 `/etc/metadata-exporter/config.yaml`）：`cmd/main.go`
+- Path 編譯與求值：`pkg/collector/evaluator.go`、`pkg/collector/pathexpr.go`、`pkg/collector/flatten.go`
+- Collector 組裝：`pkg/collector/collector.go`
+
+若本文件與程式碼不一致，**以原始碼為準**。
 
 ---
 
-## 1. Top-level structure
+## 目錄
+
+1. [總覽與設計目標](#1-總覽與設計目標)
+2. [設定生命週期](#2-設定生命週期)
+3. [頂層結構](#3-頂層結構)
+4. [watch：限縮 informer 範圍](#4-watch限縮-informer-範圍)
+5. [rules：宣告指標](#5-rules宣告指標)
+6. [Pod 層級與容器層級](#6-pod-層級與容器層級)
+7. [展平 labels 與 annotations](#7-展平-labels-與-annotations)
+8. [範例配方](#8-範例配方)
+9. [疑難排解](#9-疑難排解)
+10. [執行期內部行為](#10-執行期內部行為)
+11. [結構與實作對照表](#11-結構與實作對照表)
+
+---
+
+## 1. 總覽與設計目標
+
+### 1.1 設定必須表達的三件事
+
+1. **Watch 拓樸** — 哪些物件會進 SharedInformer 快取（`watch`），以縮小對 apiserver 的 LIST/WATCH 量。
+2. **指標契約** — 每條 `rules[]` 對應 **一個** Prometheus metric，且在啟動時即具備 **固定標籤集合**（含 `flatten` 產生的標籤）。
+3. **取值語意** — 每個標籤如何從 anchor、`forEach` 的 `item`、owner 鏈（`ownerController`、`topController` 或具體 Kind）、或 **`relations` 別名** 取出字串。
+
+相關物件僅從 **informer 快取** 解析；exporter **不會**為走訪 owner 鏈而額外呼叫 API。
+
+### 1.2 設計原則
+
+| 原則 | 意義 |
+|------|------|
+| **宣告式** | 營運方描述指標與取值，設定內不含 Go 程式。 |
+| **儘早失敗** | 結構問題在 `Validate` 攔截；**path 語法**在 collector 建構、**`Compile`** 時才解析，錯誤則啟動失敗。 |
+| **時間序列形狀穩定** | 每條 rule 的標籤名稱於啟動時固定；缺值為空字串，不會省略標籤。 |
+| **YAML 鍵與 `json` struct tag 一致** | Go 結構使用 `json:"..."`；YAML 鍵為 **camelCase**（如 `metricPrefix`、`watch`、`rules`），與 `sigs.k8s.io/yaml` 慣例一致。 |
+| **驗證分兩階** | `Validate` **不**解析 `path` 字串；`Compile` 才對每條 `path`、`forEach`、flatten 的 `path` 做 `parsePath`。 |
+
+### 1.3 非目標
+
+- **非**完整 JSONPath：僅支援下文 [path 語法](#path-syntax) 所述子集。
+- workqueue 深度、worker 數、client QPS/burst、監聽位址等為 **`cmd/main.go` 的 CLI 旗標**，不在 YAML 內。
+
+---
+
+## 2. 設定生命週期
+
+### 2.1 設定檔來源
+
+程式僅讀取 **一份** YAML；預設路徑 `/etc/metadata-exporter/config.yaml`，可用 `-config` 覆寫（見 `cmd/main.go`）。
+
+### 2.2 載入 → 解析 → 驗證
+
+`config.Load(path)` 依序：
+
+1. `os.ReadFile` 讀取檔案。
+2. `sigs.k8s.io/yaml.Unmarshal` 填入 `*config.Config`。
+3. `cfg.Validate()`：至少一條 rule、`metricPrefix` 與各 rule 名稱組成之 Prometheus metric 名合法且不重複、每條 rule 的 `anchor`、`labels`、`relations`、`flatten` 與 `source`／`forEach` 搭配等。
+
+任一步失敗則在建立 Kubernetes client 或 informer **之前**結束程式。
+
+### 2.3 編譯規則（YAML 已通過驗證後）
+
+`collector.New(cfg, ...)` 對每個 `cfg.Rules[i]` 呼叫 `Compile(rule)`：
+
+- 將 `forEach`、各 `labels` 的 `path`、fallback 的 `path`、flatten 的 `path` 編成內部 path AST（`pkg/collector/pathexpr.go` 的 `parsePath`）。
+- **`relations` 別名在編譯期消解**：`CompiledExtract.Source` 存解析後名稱（例如別名 `top` → `topController`），執行期 `srcLookup` 只用解析後鍵（`pkg/collector/evaluator.go` 的 `compileExtract`）。
+- `flatten` 產生額外編譯後標籤，並與既有 labels 合併、重排順序。
+- 向 Prometheus sink `RegisterRule` 註冊最終 metric 名（`metricPrefix + rule.name`）與**有序**標籤集合。
+
+因此 **`path` 打錯** 可能在 `Validate` 通過後，仍於 collector 初始化時失敗。
+
+### 2.4 執行期求值（摘要）
+
+每次 reconcile：resolver 從快取組出 **chain**；各物件轉成 unstructured `map`；`EvaluateForEach` 展開 `forEach`（若省略則仍以一輪合成項目迭代，見 `pkg/collector/evaluator.go` 的 `EvaluateForEach`）；每個標籤依序：主要 path → fallbacks → `onMissing`；結果寫入 sink（例如 Prometheus 的 `ReplaceForAnchor`）。
+
+---
+
+## 3. 頂層結構
 
 ```yaml
-metricPrefix: "custom_"    # optional; prepended to every rule's name
-watch: { ... }             # optional; defaults to cluster-wide, no selectors
+metricPrefix: "custom_"    # 選填；加在每條 rule 的 name 之前
+watch: { ... }             # 選填；預設為叢集全域、無 selector
 rules:
-  - { ... }                # one entry per Prometheus metric
+  - { ... }                # 每個元素對應一個 Prometheus metric
 ```
 
-Rules are independent: each rule produces one Prometheus metric whose name is
-`metricPrefix + rule.name` (e.g. `custom_pod_info`).
+各 rule **彼此獨立**；metric 全名為 `metricPrefix + rule.name`（例如 `custom_pod_info`）。
+
+對應 `pkg/config/config.go` 的根型別 `Config`：
+
+| YAML 欄位 | 角色 |
+|-----------|------|
+| `metricPrefix` | 選填前綴；與各 `rules[].name` 組成註冊用 Prometheus metric 名稱，並受 metric 命名 regex 檢查。 |
+| `watch` | 選填 `WatchScope`：namespace 與各 Kind 的 list/watch selector。 |
+| `rules` | **必填**、非空之 `Rule` 陣列。 |
 
 ---
 
-## 2. `watch` — scoping the informers
+## 4. watch：限縮 informer 範圍
 
 ```yaml
 watch:
-  namespaces: ["prod", "staging"]   # optional; empty/omitted = cluster-wide
+  namespaces: ["prod", "staging"]   # 選填；空或省略 = 叢集全域
   selectors:
     Pod:
       labelSelector: "app.kubernetes.io/part-of=my-platform"
@@ -44,176 +125,161 @@ watch:
       labelSelector: "managed-by=argocd"
 ```
 
-### Why this matters
+### 為何重要
 
-- `labelSelector` and `fieldSelector` are forwarded to `LIST`/`WATCH` calls.
-  The apiserver's **watch cache** filters events with these predicates *before*
-  they are pushed to clients, so both the initial LIST payload and subsequent
-  watch traffic shrink.
-- `namespaces` turns each listed namespace into a scoped informer factory,
-  which queries the apiserver with namespace-restricted LIST/WATCH requests.
-- The smallest possible scope is a single object:
-  `fieldSelector: "metadata.name=my-pod"` in a specific namespace.
+- `labelSelector` 與 `fieldSelector` 會傳給 `LIST`／`WATCH`；apiserver 的 **watch cache** 會在事件下發給 client **之前**依述詞過濾，初始 LIST 與後續 watch 流量都會縮小。
+- `namespaces` 非空時，每個列出的 namespace 會建立獨立的 scoped informer factory，對 apiserver 發 namespace 限定的 LIST/WATCH。
+- 最小範圍可縮到單一物件：例如在特定 namespace 內使用 `fieldSelector: "metadata.name=my-pod"`。
 
-### `fieldSelector` whitelist (per resource)
+### 各資源 `fieldSelector` 白名單
 
-| Kind        | Allowed `fieldSelector` keys                                                                                                                             |
-|-------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Pod         | `metadata.name`, `metadata.namespace`, `spec.nodeName`, `spec.restartPolicy`, `spec.schedulerName`, `spec.serviceAccountName`, `status.phase`, `status.nominatedNodeName` |
-| ReplicaSet  | `metadata.name`, `metadata.namespace`                                                                                                                    |
-| Deployment  | `metadata.name`, `metadata.namespace`                                                                                                                    |
-| StatefulSet | `metadata.name`, `metadata.namespace`                                                                                                                    |
-| DaemonSet   | `metadata.name`, `metadata.namespace`                                                                                                                    |
+| Kind        | 允許的 `fieldSelector` 鍵 |
+|-------------|---------------------------|
+| Pod         | `metadata.name`、`metadata.namespace`、`spec.nodeName`、`spec.restartPolicy`、`spec.schedulerName`、`spec.serviceAccountName`、`status.phase`、`status.nominatedNodeName` |
+| ReplicaSet  | `metadata.name`、`metadata.namespace` |
+| Deployment  | `metadata.name`、`metadata.namespace` |
+| StatefulSet | `metadata.name`、`metadata.namespace` |
+| DaemonSet   | `metadata.name`、`metadata.namespace` |
 
-Anything outside the whitelist is rejected by the apiserver with HTTP 400.
-`metadata-exporter` issues one small `LIST` per configured selector at startup
-(dry-run) so misconfigurations fail fast.
+超出白名單會被 apiserver 以 HTTP 400 拒絕。`metadata-exporter` 啟動時會對每組設定好的 selector 做一次小型 `LIST`（dry-run），以儘早暴露錯誤。
 
-### Owner-chain "dangling selector" risk
+### Owner 鏈與「過窄的 parent selector」風險
 
-If you narrow `Pod` with a selector but leave its parents (`ReplicaSet`,
-`Deployment`, etc.) unrestricted, the owner chain still resolves. But the
-reverse is dangerous: narrowing a parent (e.g. `Deployment`) while leaving
-`Pod` unrestricted can hide the parent from our cache, turning
-`source: topController` into a miss. A startup warning is printed when the
-collector detects this pattern.
+若只縮小 `Pod` 的 selector、parent（`ReplicaSet`、`Deployment` 等）維持較寬，owner 鏈通常仍可解析。反之若 **parent** 選得很窄、**Pod** 卻很寬，可能導致 parent **不在快取中**，`source: topController` 等變成 miss；collector 偵測到此模式時會印出啟動警告。
 
-**Rule of thumb**: start broad, narrow `Pod` if needed, leave parents broader
-than the Pod selector.
+**經驗法則**：先寬後窄；需要時縮 `Pod`；parent selector 應 **寬於** Pod selector。
 
-### RBAC implications
+### RBAC 影響
 
-- `namespaces: []` or omitted → cluster-wide LIST/WATCH on all supported
-  resources (needs a `ClusterRoleBinding`, as shipped in `deploy/manifests.yaml`).
-- `namespaces: ["foo"]` → namespace-scoped LIST/WATCH (still satisfies the
-  cluster-wide RBAC). A `RoleBinding` can be substituted if you wish, but you
-  must bind it in every listed namespace.
+- `namespaces` 空或省略 → 各支援資源為叢集全域 LIST/WATCH（需 `ClusterRoleBinding`，見 `deploy/manifests.yaml`）。
+- `namespaces: ["foo"]` → namespace 範圍 LIST/WATCH（仍可由叢集層級 RBAC 滿足）。若改 `RoleBinding`，須在每個列出的 namespace 綁定。
 
-### Watch topology: cluster-wide vs per-namespace
+### Watch 拓樸：叢集全域 vs 每 namespace
 
-| Mode | When applied | Watches opened | Trade-offs |
-|------|--------------|----------------|------------|
-| cluster-wide | `watch.namespaces` omitted/empty | one per kind (~5 total) | Lightest on the apiserver. Fine-grained `labelSelector` / `fieldSelector` still shrinks each watch. |
-| per-namespace | `watch.namespaces` non-empty | `len(namespaces) × 5` | Strong isolation; useful when you need different RBAC per namespace or when `fieldSelector: metadata.name=...` scopes down to a single pod per namespace. |
+| 模式 | 觸發條件 | 開啟的 watch 量級 | 取捨 |
+|------|----------|-------------------|------|
+| 叢集全域 | `watch.namespaces` 省略或空 | 每 Kind 約一個（約 5 個） | 對 apiserver 最省；仍可對各 watch 用 `labelSelector`／`fieldSelector` 縮流。 |
+| 每 namespace | `watch.namespaces` 非空 | 約 `len(namespaces) × 5` | 隔離強；適合每 namespace 不同 RBAC，或搭配 `fieldSelector: metadata.name=...` 縮到單一 Pod。 |
 
-The active mode is printed at startup (`watch mode = cluster-wide` or
-`watch mode = per-namespace`) and is reflected in the number of informer
-factories listed in the log line. Namespace filtering happens in the
-client-go cache, so cluster-wide mode does **not** increase per-event CPU;
-it only flattens the watch fan-out against the apiserver.
+啟動日誌會印出 `watch mode = cluster-wide` 或 `per-namespace` 及 factory 數量。namespace 過濾發生在 client-go cache；叢集全域模式 **不會**因此線性增加「每次事件」的 CPU，主要影響的是對 apiserver 的 watch 扇出。
+
+**設計說明**：`watch` 只決定 **快取內有什麼**；rule 仍可引用 `topController`，但若 parent 被 selector 切掉，解析會 miss——這是 `watch` 與 `rules` 之間的**設定耦合**，schema 本身不強制檢查。
 
 ---
 
-## 3. `rules` — declaring metrics
+## 5. rules：宣告指標
 
-A rule is a single metric declaration.
+一條 rule 即一個 metric 宣告。
 
 ```yaml
 rules:
-  - name: "pod_info"       # required; metric name = metricPrefix + name
-    help: "..."            # optional; Prometheus HELP text
-    anchor: Pod            # required; Pod|Deployment|StatefulSet|DaemonSet|ReplicaSet
-    forEach: "spec.containers[*]"   # optional; expands into N series
-    relations:                      # optional; local aliases for sources
+  - name: "pod_info"       # 必填；metric 全名 = metricPrefix + name
+    help: "..."            # 選填；Prometheus HELP
+    anchor: Pod            # 必填；Pod|Deployment|StatefulSet|DaemonSet|ReplicaSet
+    forEach: "spec.containers[*]"   # 選填；展開為 N 筆 series
+    relations:                      # 選填；來源別名
       - name: top
         via: topController
-    labels:                          # required
+    labels:                          # 必填
       <label_name>:
-        source: <source>             # optional; default "anchor"
-        path: "<jsonpath>"           # required
-        fallbacks:                   # optional; tried in order after path miss
+        source: <source>             # 選填；預設 "anchor"
+        path: "<jsonpath>"           # 必填
+        fallbacks:                   # 選填；主 path miss 後依序嘗試
           - source: anchor
             path: "..."
-        onMissing: ""                # optional; default ""
+        onMissing: ""                # 選填；預設 ""
 ```
 
 ### `anchor`
 
-`anchor` identifies both the **resource whose events trigger reconciliation**
-and the **subject of each emitted series**. Supported values:
-`Pod`, `Deployment`, `StatefulSet`, `DaemonSet`, `ReplicaSet`.
+`anchor` 同時決定 **哪種資源事件會觸發 reconcile**，以及 **每筆輸出 series 的主體**。允許值：`Pod`、`Deployment`、`StatefulSet`、`DaemonSet`、`ReplicaSet`。
 
 ### `forEach`
 
-Optional JSONPath on the anchor object. When set, one series is emitted per
-element of the result array. Common uses:
+選填；為相對 anchor 的 path，評估結果為陣列時，**每個元素一筆 series**。常見用法：
 
-- `spec.containers[*]` — one row per regular container
-- `spec.initContainers[*]` — one row per init container
-- `spec.ephemeralContainers[*]` — one row per ephemeral container
+- `spec.containers[*]` — 每個一般容器一筆
+- `spec.initContainers[*]` — 每個 init 容器一筆
+- `spec.ephemeralContainers[*]` — 每個 ephemeral 容器一筆
 
-Inside a rule with `forEach`, labels can reference the current iteration
-element using `source: item`.
+有 `forEach` 時，可用 `source: item` 指到目前迭代元素。
 
-### `source` values
+**實作**：未設 `forEach` 時，`EvaluateForEach` 仍回傳單元素（含 `nil` 的 slice），讓後續管線一致（見 `pkg/collector/evaluator.go`）。
 
-| Value                                                                 | Meaning                                                                                                  |
-|-----------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
-| `anchor` *(default)*                                                  | The anchor object itself.                                                                                |
-| `item`                                                                | The current `forEach` iteration element. Only valid when `forEach` is set.                               |
-| `ownerController`                                                     | The direct `ownerReferences` controller of the anchor, if any.                                           |
-| `topController`                                                       | The deepest ancestor in the owner chain that is `Deployment`, `StatefulSet`, or `DaemonSet`.             |
-| `Pod` / `Deployment` / `StatefulSet` / `DaemonSet` / `ReplicaSet`     | The first object of that Kind encountered while walking the owner chain. If the anchor is that Kind it is returned directly. |
-| Any name declared under `relations`                                   | A local alias for one of the above.                                                                      |
+### `relations`（別名）
 
-> All "related" objects are resolved exclusively from the informer cache.
-> `metadata-exporter` does **not** issue extra API calls to walk the chain.
+每筆 `{ name, via }` 在該 rule 內新增一個合法 `source` 名稱。`Validate` 限制包括：
 
-### `path` — path expression syntax
+- `name` 不得與 builtin 或其它別名衝突。
+- `via` 須為 builtin（`anchor`、`ownerController`、`topController`）或支援的 Kind；**不可**為 `item`（`item` 僅能在有 `forEach` 時作為 label 的直接 `source`）。
 
-`path` uses a small, kubectl-inspired subset designed to cover every common
-Kubernetes metadata extraction use-case:
+編譯時會把 `source: <別名>` 改寫為 `via`（`pkg/config/config.go` 的 `Rule.ResolveRelation`）。
 
-| Construct            | Example                                                             | Notes                                               |
-|----------------------|---------------------------------------------------------------------|-----------------------------------------------------|
-| Dotted field access  | `metadata.name` · `status.phase` · `spec.nodeName`                  | Idents match `[A-Za-z_][A-Za-z0-9_-]*`.             |
-| Array wildcard       | `spec.containers[*]`                                                 | Use with `forEach` to emit one series per element.  |
-| Array index          | `spec.containers[0].image`                                           | Zero-based.                                         |
-| Map key with symbols | `metadata.annotations["argocd.argoproj.io/tracking-id"]`             | Single or double quotes.                            |
-| Leading kubectl wrap | `{.metadata.name}`                                                   | The outer `{...}` is optional.                      |
+### `source` 取值
 
-Filter expressions (`[?(@.x==y)]`) and `range`/`end` blocks are **not**
-supported — the parser is intentionally small. If you need them, open an
-issue; the default form is expressive enough for annotation/label/image/phase
-extraction.
+| 值 | 意義 |
+|----|------|
+| `anchor`（預設） | anchor 物件本身。 |
+| `item` | 目前 `forEach` 元素；**僅**在設了 `forEach` 時合法。 |
+| `ownerController` | anchor 在 `ownerReferences` 上的直接 controller（若有）。 |
+| `topController` | owner 鏈上最深、且為 `Deployment`／`StatefulSet`／`DaemonSet` 的祖先。 |
+| `Pod`／`Deployment`／… | 沿 owner 鏈走訪時**第一個**該 Kind；若 anchor 即該 Kind則直接回傳 anchor。 |
+| `relations` 宣告的 `name` | 對應 `via` 所指的上述其中一種來源。 |
 
-### `fallbacks` + `onMissing`
+> 相關物件**僅**從 informer 快取取得；**不**為走訪 owner 鏈額外打 API。
 
-For each label we evaluate:
+<a id="path-syntax"></a>
+### path 語法
 
-1. The primary `path`. An empty string, missing key, or evaluation error is
-   treated as a miss.
-2. Each entry in `fallbacks` in declaration order, stopping at the first
-   non-empty result.
-3. `onMissing` (default: empty string) is used if all of the above miss.
+類 kubectl 的小子集：
 
-`fallbacks` entries accept the same fields as the top-level extract except
-that nested `fallbacks` are not allowed.
+| 構造 | 範例 | 說明 |
+|------|------|------|
+| 點號欄位 | `metadata.name`、`status.phase`、`spec.nodeName` | 識別字樣式 `[A-Za-z_][A-Za-z0-9_-]*`。 |
+| 陣列萬用字元 | `spec.containers[*]` | 常與 `forEach` 並用，一元素一 series。 |
+| 陣列索引 | `spec.containers[0].image` | 零為基底。 |
+| 含符號的 map 鍵 | `metadata.annotations["argocd.argoproj.io/tracking-id"]` | 單雙引號皆可。 |
+| kubectl 風格外層 | `{.metadata.name}` | 外層 `{...}` 可省略。 |
 
-### Label-name rules
+**不支援** filter 表達式（如 `[?(@.x==y)]`）與 `range`／`end` 區塊——刻意維持小解析器。
 
-- Keys under `labels:` become Prometheus label names. They must match
-  `[a-zA-Z_][a-zA-Z0-9_]*` and cannot start with `__`.
-- The label set is **fixed at startup** from your config: every series for
-  a given rule carries the same label names. Missing values render as empty
-  strings rather than collapsing labels.
+### `fallbacks` 與 `onMissing`
+
+對每個標籤：
+
+1. 評估主要 `path`；空字串、缺鍵或求值錯誤視為 miss。
+2. 依序嘗試 `fallbacks` 各項，取第一個非空結果。
+3. 皆 miss 則用 `onMissing`（預設空字串）。
+
+`fallbacks` 內每一項欄位與頂層 extract 相同，但 **不可**再嵌套 `fallbacks`。
+
+### 標籤名稱規則
+
+- `labels:` 的鍵即 Prometheus 標籤名，須符合 `[a-zA-Z_][a-zA-Z0-9_]*`，且不得以 `__` 開頭。
+- 每條 rule 的標籤集合在 **啟動時固定**；缺值為空字串，不會動態刪除標籤。
+
+### 啟動時不變式（摘要）
+
+- 至少一條 rule；每條需非空 `name`、支援的 `anchor`、非空 `labels`。
+- `metricPrefix + name` 全叢集設定內唯一，且符合 Prometheus metric 命名。
+- `flatten` 產生的名稱不得與 `labels` 或其它 flatten 列衝突。
+- `relations` 的 `via` 合法、不得以 `item` 作為 `via`（詳見 `pkg/config/config.go` 的 `Validate`）。
 
 ---
 
-## 4. Pod-level vs Container-level
+## 6. Pod 層級與容器層級
 
-Both granularities coexist trivially — just declare two rules with different
-names and different (or absent) `forEach`. They become independent metrics.
+以**兩條 rule**（不同 `name`、不同或省略 `forEach`）即可同時存在兩種粒度，彼此獨立。
 
-| Desired granularity                 | `anchor`     | `forEach`                         | Resulting cardinality   |
-|-------------------------------------|--------------|-----------------------------------|-------------------------|
-| One series per Pod                  | `Pod`        | *omit*                            | 1 Pod → 1 series        |
-| One series per (Pod, container)     | `Pod`        | `spec.containers[*]`              | 1 Pod with N containers → N series |
-| One series per (Pod, initContainer) | `Pod`        | `spec.initContainers[*]`          | as above                |
-| One series per (Pod, ephemeral)     | `Pod`        | `spec.ephemeralContainers[*]`     | as above                |
-| One series per Deployment           | `Deployment` | *omit*                            | 1 Deployment → 1 series |
+| 目標粒度 | `anchor` | `forEach` | 結果基数 |
+|----------|----------|-----------|----------|
+| 每 Pod 一筆 | `Pod` | 省略 | 1 Pod → 1 series |
+| 每 (Pod, 容器) 一筆 | `Pod` | `spec.containers[*]` | N 容器 → N series |
+| init 容器 | `Pod` | `spec.initContainers[*]` | 同上 |
+| ephemeral 容器 | `Pod` | `spec.ephemeralContainers[*]` | 同上 |
+| 每 Deployment 一筆 | `Deployment` | 省略 | 1 Deployment → 1 series |
 
-Example pairing a Pod-level and container-level metric in one config:
+範例：
 
 ```yaml
 rules:
@@ -235,7 +301,7 @@ rules:
       image:     { source: item, path: "image" }
 ```
 
-Scraping `/metrics` will then expose two separate metrics:
+`/metrics` 會暴露兩個不同 metric，例如：
 
 ```
 custom_pod_info{namespace="prod",pod="api-abc",node="...",phase="Running"} 1
@@ -245,13 +311,9 @@ custom_pod_container_info{namespace="prod",pod="api-abc",container="sidecar",ima
 
 ---
 
-## 5. Flattening labels and annotations
+## 7. 展平 labels 與 annotations
 
-Sometimes a Kubernetes `metadata.annotations` or `metadata.labels` map carries
-several related values that you would like to expose as **individual
-Prometheus labels** on the same series — for example, one label per well-known
-controller annotation. `flatten:` is a declarative, **allow-list** based way
-to do that without growing `labels:` by hand.
+當 `metadata.annotations` 或 `metadata.labels` 上有多個鍵值，希望變成**同一 series 上多個 Prometheus 標籤**（例如數個眾所周知的 controller annotation），可用 `flatten:` 以 **allow-list** 宣告，避免在 `labels:` 手寫大量重複 path。
 
 ```yaml
 rules:
@@ -264,75 +326,59 @@ rules:
       pod:       { path: "metadata.name" }
     flatten:
       - namePrefix: "controller_annotation_"
-        source: top                # default "anchor"
+        source: top                # 預設為 "anchor"
         path: "metadata.annotations"
         keys:
           - "integration.test/controller-note"
           - "integration.test/owner"
-        onMissing: ""              # optional; default ""
+        onMissing: ""              # 選填；預設 ""
       - namePrefix: "pod_label_"
         path: "metadata.labels"
         keys: ["app.kubernetes.io/name"]
 ```
 
-### Schema
+### 欄位說明
 
-| Field         | Required | Default    | Meaning                                                                         |
-|---------------|----------|------------|---------------------------------------------------------------------------------|
-| `namePrefix`  | no       | `""`       | Prepended verbatim to every generated Prometheus label name.                    |
-| `source`      | no       | `"anchor"` | Same semantics as on `labels:` entries (`item` still requires `forEach`).       |
-| `path`        | yes      |            | Must resolve to a `map[string]interface{}` (typically `metadata.annotations` / `metadata.labels`). |
-| `keys`        | yes      |            | Non-empty list of map keys to extract. Keys must be unique within an entry.     |
-| `onMissing`   | no       | `""`       | Returned for any key absent from the resolved map (or when `path` misses).      |
+| 欄位 | 必填 | 預設 | 意義 |
+|------|------|------|------|
+| `namePrefix` | 否 | `""` | 接到每個產生之標籤名前（逐字元前綴）。 |
+| `source` | 否 | `"anchor"` | 與 `labels` 的 `source` 相同語意（`item` 仍須有 `forEach`）。 |
+| `path` | 是 | | 須能解析為 `map[string]interface{}`（常為 `metadata.annotations`／`metadata.labels`）。 |
+| `keys` | 是 | | 非空、同條目內鍵不可重複。 |
+| `onMissing` | 否 | `""` | 某鍵在 map 中不存在，或整段 `path` miss 時之值。 |
 
-### Name generation and sanitisation
+### 名稱產生與清理（sanitize）
 
-Prometheus label names must match `[a-zA-Z_][a-zA-Z0-9_]*`. Kubernetes
-annotation / label keys frequently use `.`, `/`, or `-`, so each `key` is run
-through a deterministic sanitiser before being prefixed:
+Prometheus 標籤須符合 `[a-zA-Z_][a-zA-Z0-9_]*`。Kubernetes 的 annotation／label 鍵常含 `.`、`/`、`-`，故每個 `key` 會經決定性清理後再接 `namePrefix`：
 
-- Every character outside `[A-Za-z0-9_]` is replaced with `_`.
-- If the first character is a digit, the result is prefixed with `_`.
+- 不在 `[A-Za-z0-9_]` 的字元改為 `_`。
+- 若首字元為數字，結果前會再加 `_`。
 
-Examples:
+| 鍵 | 清理後片段 |
+|----|------------|
+| `integration.test/controller-note` | `integration_test_controller_note` |
+| `app.kubernetes.io/name` | `app_kubernetes_io_name` |
+| `123abc` | `_123abc` |
 
-| Key                                   | Sanitised fragment                  |
-|---------------------------------------|-------------------------------------|
-| `integration.test/controller-note`    | `integration_test_controller_note`  |
-| `app.kubernetes.io/name`              | `app_kubernetes_io_name`            |
-| `123abc`                              | `_123abc`                           |
+最終標籤名為 `namePrefix + sanitize(key)`，啟動時會檢查命名規則；不得以 `__` 開頭（Prometheus 保留）。
 
-The **final Prometheus label name** is `namePrefix + sanitize(key)` and is
-validated at startup against the label-name grammar. Names starting with
-`__` are rejected (Prometheus reserves that range).
+### 碰撞規則
 
-### Collision rules
+同一 rule 內，若 `labels:` 與 `flatten:` 或不同 `flatten` 列產生相同標籤名，啟動即失敗。儀表板可假設每個 metric 的標籤集合 **固定且無衝突**。
 
-At startup `metadata-exporter` fails fast if any two label names inside the
-same rule would collide:
+### Miss 語意
 
-- Between `labels:` entries and `flatten:` expansions.
-- Between two different `flatten:` entries (e.g. both use the same
-  `namePrefix` and share a key after sanitisation).
+若 `path` 解析結果**不是 map**（缺欄位、型別錯誤等），整段 flatten 視為 total miss：該列產生的**所有**標籤皆取該列的 `onMissing`。若 map 存在但某 `key` 不存在，僅該標籤 miss。
 
-This means your dashboards can rely on a **fixed, conflict-free label set**
-per metric, chosen at config-load time.
+與其餘設定一致：**固定標籤集合**，miss 為空字串而非刪標籤。
 
-### Miss semantics
-
-A flatten entry that resolves `path` to something other than a map (missing
-field, wrong type, etc.) is treated as a total miss: every generated label
-takes the entry's `onMissing` value. A specific key absent from a resolved
-map is also considered a miss for just that label.
-
-This preserves the same "fixed label set, empty-string on miss" behaviour as
-the rest of the config — the series always has all declared labels present.
+**設計說明**：flatten 在編譯期為每個 key append path segment（`pkg/collector/flatten.go` 的 `compileFlatten`），避免在 path 字串內塞入任意 annotation 字元。
 
 ---
 
-## 6. Recipes
+## 8. 範例配方
 
-### 5.1 Argo CD tracking id, with fallback to the pod itself
+### 8.1 Argo CD tracking id，並 fallback 到 Pod 本體
 
 ```yaml
 rules:
@@ -351,7 +397,7 @@ rules:
             path: 'metadata.annotations["argocd.argoproj.io/tracking-id"]'
 ```
 
-### 5.2 Helm release name
+### 8.2 Helm release 名稱
 
 ```yaml
 rules:
@@ -370,9 +416,9 @@ rules:
         path: 'metadata.labels["helm.sh/chart"]'
 ```
 
-### 5.3 Minimising cluster load
+### 8.3 降低叢集負載
 
-Watch one namespace with a narrow label selector on Pods only:
+僅 watch 單一 namespace，並縮小 Pod：
 
 ```yaml
 watch:
@@ -382,10 +428,9 @@ watch:
       labelSelector: "app.kubernetes.io/part-of=payments"
 ```
 
-Parent resources (Deployment/StatefulSet/DaemonSet/ReplicaSet) stay unrestricted
-so owner-chain resolution keeps working.
+Parent（Deployment／StatefulSet／DaemonSet／ReplicaSet）維持較寬，以利 owner 鏈仍可取到 parent。
 
-### 5.4 Deployment-anchored metric
+### 8.4 以 Deployment 為 anchor
 
 ```yaml
 rules:
@@ -401,66 +446,62 @@ rules:
 
 ---
 
-## 7. Troubleshooting
+## 9. 疑難排解
 
-| Symptom                                               | Likely cause                                                                                        | Resolution                                                                                   |
-|-------------------------------------------------------|-----------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
-| Label always empty                                    | `path` points to a field that doesn't exist on this object; `source` not in owner chain for this anchor. | Confirm the path with `kubectl -o jsonpath='{.your.path}'`. Add a `fallbacks` entry if needed. |
-| `controller_kind`/`controller_name` empty for Static Pods | Static Pods have no owner references.                                                               | Expected; add a `fallbacks` with `source: anchor` or set `onMissing` to a sentinel.          |
-| Startup error mentioning `fieldSelector`              | Field is not in the per-resource whitelist.                                                         | Move the predicate to `labelSelector` or remove it.                                          |
-| Warning "pod selector combined with stricter parent selector ..." | Parents are filtered away; owner chain can't resolve them.                                          | Drop the parent selector or broaden it.                                                      |
-| `metrics-addr` refuses connections                    | Container port mismatch or the process crashed at config validation.                                | Check logs; the pod's readiness probe targets `/healthz`.                                    |
+| 現象 | 可能原因 | 處理方式 |
+|------|----------|----------|
+| 標籤永遠空 | `path` 在該物件上不存在；或 `source` 在此 anchor 的 owner 鏈上取不到。 | 用 `kubectl -o jsonpath='{.…}'` 確認；必要時加 `fallbacks`。 |
+| Static Pod 沒有 controller 類標籤 | Static Pod 無 owner references。 | 預期行為；可對 anchor 加 `fallbacks` 或設 `onMissing`。 |
+| 啟動錯誤提到 `fieldSelector` | 欄位不在該資源白名單。 | 改為 `labelSelector` 或移除。 |
+| 警告「pod selector combined with stricter parent selector …」 | parent 被 filter 掉，owner 鏈斷裂。 | 放寬或移除 parent 的過窄 selector。 |
+| `metrics-addr` 連不上 | 容器埠不符或程式在驗證階段即退出。 | 查日誌；readiness 通常打 `/healthz`。 |
 
 ---
 
-## 8. Runtime internals
+## 10. 執行期內部行為
 
-This section documents behaviors that do not live in the YAML schema but
-materially affect the exporter's apiserver footprint.
+以下行為**不在** YAML schema 內，但會影響對 apiserver 的負載與可觀測性。
 
-### Workqueue + worker pool
+### Workqueue 與 worker 池
 
-Every informer event produces a tiny `anchorRef = {kind, namespace, name}`
-key and pushes it onto a rate-limited `workqueue`. A pool of worker
-goroutines (size controlled by `--reconcile-workers`) drains the queue and
-runs a single `reconcile` per anchor. The queue dedupes identical keys, so
-100 Deployment updates in a second that touch the same anchors collapse
-into one reconcile each.
+每個 informer 事件會產生 `anchorRef = {kind, namespace, name}` 推入具 rate limit 的 `workqueue`；`--reconcile-workers` 支線程池 drain queue，對每個 anchor 執行一次 reconcile。相同 key 會合併，故短時間大量 parent 更新仍可能收斂為每 anchor 少量 reconcile。
 
-Self-metrics for observability:
+自監控指標例如：
 
-- `exporter_reconcile_queue_depth` (gauge) — current pending work.
-- `exporter_reconcile_total{rule,result}` (counter) — reconcile attempts.
-- `exporter_reconcile_duration_seconds` (histogram per `anchor_kind`).
+- `exporter_reconcile_queue_depth`
+- `exporter_reconcile_total{rule,result}`
+- `exporter_reconcile_duration_seconds`（依 `anchor_kind`）
 
-### Reverse parent index
+### 反向 parent 索引
 
-The naive approach to "Deployment X changed, update every Pod that ultimately
-depends on it" would scan every Pod in the namespace on each parent event.
-Instead, each successful reconcile records the UIDs of the objects walked by
-the owner chain into a `parentUID → {anchorRef}` map. Parent informer events
-look up the UID and enqueue only the affected anchors. A cache miss (cold
-start or orphaned UID) falls back to the historical namespace rescan once,
-and subsequent reconciles populate the index organically.
+成功 reconcile 後會記錄 owner 鏈上物件 UID → 影響的 `anchorRef`；parent 事件優先走索引只 requeue 相關 anchor。索引 miss（冷啟動等）時會 fallback 為同 namespace 掃描一次，之後由 reconcile 逐漸填滿索引。
 
-Routing stats are visible as:
+相關指標：`exporter_parent_index_hit_total`、`exporter_parent_index_fallback_total`。
 
-- `exporter_parent_index_hit_total` — parent events resolved via the index.
-- `exporter_parent_index_fallback_total` — cold-path namespace rescans.
+### 更新事件過濾
 
-### Update-event filter
+對每 UID 快取 `{metadata.generation, labels, annotations}` 的 digest；僅 status 變動等不影響 digest 的更新可不入隊，減少大 Pod 的無謂 reconcile。
 
-Informer `UpdateFunc` callbacks are cheap to fire but expensive to process
-when the payload is large (Pods ship with big `status` subresources). The
-collector memoises a digest of `{metadata.generation, labels, annotations}`
-per UID and short-circuits updates whose digest matches the previous
-observation. `status`-only churn (heartbeats, condition timestamps) therefore
-never reaches the workqueue.
+### Apiserver 限速
 
-### Apiserver rate limiting
+`--kube-api-qps`（預設 20）與 `--kube-api-burst`（預設 40）設定 client-go token bucket；informers 同步完成後對外 REST 通常很少，但可限制啟動 LIST 等尖峰。
 
-`--kube-api-qps` (default 20) and `--kube-api-burst` (default 40) configure
-the kubernetes client's token bucket. In practice the exporter issues almost
-no client traffic once informers have synced — most load is inbound watch
-events — but these flags let operators cap the blast radius of startup
-LISTs and owner-chain retries on huge clusters.
+---
+
+## 11. 結構與實作對照表
+
+| 概念 | 主要程式位置 |
+|------|----------------|
+| 根 `Config`、`WatchScope`、`Rule`、`Extract`、`FlattenExtract`、`RelationAlias` | `pkg/config/config.go`（`json` tag = YAML 鍵） |
+| `Load`、`Validate`、`ResolveRelation` | `pkg/config/config.go` |
+| CLI `-config` 與 `collector.New` 銜接 | `cmd/main.go` |
+| `Compile`、`CompiledRule`、標籤求值順序 | `pkg/collector/evaluator.go` |
+| Path 文法（`parsePath`、`evaluate`） | `pkg/collector/pathexpr.go` |
+| Flatten 編譯 | `pkg/collector/flatten.go` |
+| `cfg.Watch` → informers；每 rule `Compile` 與 `RegisterRule` | `pkg/collector/collector.go` |
+| 整合測設定形狀 | `test/integration/e2e/config_yaml.go` |
+| 架構長文 | `docs/METADATA_EXPORTER_DEEP_DIVE.md`、`docs/AI_REFERENCE_METADATA_EXPORTER.md` |
+
+---
+
+*本文件合併原「設定參考」與「結構設計」敘述；若程式變更請以原始碼為準。*
