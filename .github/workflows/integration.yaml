@@ -11,6 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: Create Kind cluster
         uses: helm/kind-action@v1.12.0
         with:
@@ -21,4 +26,11 @@ jobs:
           SKIP_KIND_CREATE: "1"
           KIND_CLUSTER_NAME: kind
           DOCKER_BUILD_PLATFORM: linux/amd64
-        run: ./test/integration/run.sh
+        run: make e2e
+
+      - name: Upload exporter logs on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl logs -n metadata-exporter-it -l app.kubernetes.io/name=metadata-exporter-integration --tail=500 || true
+        shell: bash

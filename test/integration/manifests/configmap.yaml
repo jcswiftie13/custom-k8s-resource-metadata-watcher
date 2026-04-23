@@ -5,11 +5,13 @@ metadata:
   labels:
     app.kubernetes.io/name: metadata-exporter-integration
 data:
+  # Default base config: cluster-wide watch.
+  # Go e2e tests rewrite this ConfigMap to switch between topology modes.
   config.yaml: |
     metricPrefix: "it_"
 
     watch:
-      namespaces: ["metadata-exporter-it"]
+      namespaces: []
       selectors:
         Pod:
           fieldSelector: "status.phase!=Succeeded"

@@ -5,10 +5,13 @@ metadata:
   labels:
     app.kubernetes.io/name: metadata-exporter-integration
 ---
+# Cluster-wide read-only access is required so tests can exercise both
+# cluster-wide and per-namespace watch topologies using the same binary.
+# The exporter is read-only (no create/update/patch/delete verbs granted).
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
-  name: metadata-exporter
+  name: metadata-exporter-integration
   labels:
     app.kubernetes.io/name: metadata-exporter-integration
 rules:
@@ -20,15 +23,16 @@ rules:
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
-  name: metadata-exporter
+  name: metadata-exporter-integration
   labels:
     app.kubernetes.io/name: metadata-exporter-integration
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: metadata-exporter
+  kind: ClusterRole
+  name: metadata-exporter-integration
 subjects:
   - kind: ServiceAccount
     name: metadata-exporter
+    namespace: metadata-exporter-it

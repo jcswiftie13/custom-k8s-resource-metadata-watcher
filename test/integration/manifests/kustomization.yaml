@@ -1,6 +1,8 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# The e2e harness applies this base once per run; Go tests then create
+# per-scenario test namespaces and fixture workloads programmatically.
 namespace: metadata-exporter-it
 
 resources:
@@ -9,4 +11,3 @@ resources:
   - configmap.yaml
   - exporter-deployment.yaml
   - exporter-service.yaml
-  - fixture-deployment.yaml
