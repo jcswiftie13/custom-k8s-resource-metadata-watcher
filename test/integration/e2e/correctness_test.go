@@ -84,6 +84,58 @@ func TestCorrectness_FixtureFlow(t *testing.T) {
 	t.Logf("parent_index_size by_parent: before=%v after=%v", preDeleteByParent, postDeleteByParent)
 }
 
+// TestCorrectness_ControllerAnnotationWithoutPodAnnotation verifies that the
+// controller-note annotation can be exported from the top controller even
+// when Pods do not carry that annotation themselves.
+func TestCorrectness_ControllerAnnotationWithoutPodAnnotation(t *testing.T) {
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpLogs(t)
+		}
+	})
+	ns := "e2e-correctness-controller-note-0"
+	createNamespaces(t, ns)
+	t.Cleanup(func() { deleteNamespaces(t, ns) })
+
+	setExporterConfig(t, clusterWideConfigYAML())
+	scaleExporter(t, 1)
+	waitForSteadyState(t, 10*time.Second)
+
+	const replicas = int32(2)
+	const controllerNote = "from-controller-only"
+	dep := createFixtureDeployment(t, ns, "fixture-controller-only", replicas, controllerNote)
+	waitForDeploymentReady(t, ns, dep.Name, 2*time.Minute)
+	waitForPodInfoMentions(t, ns, dep.Name, int(replicas), 60*time.Second)
+
+	// Assert Pods do not carry the controller-note annotation key.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cs := mustClient(t)
+	pods, err := cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
+		LabelSelector: "app.kubernetes.io/name=" + dep.Name,
+	})
+	if err != nil {
+		t.Fatalf("list fixture pods for annotation assertion: %v", err)
+	}
+	if len(pods.Items) < int(replicas) {
+		t.Fatalf("fixture pods not ready for annotation assertion: got %d, want >= %d", len(pods.Items), replicas)
+	}
+	for _, pod := range pods.Items {
+		if _, ok := pod.Annotations["integration.test/controller-note"]; ok {
+			t.Fatalf("pod %s/%s unexpectedly has integration.test/controller-note annotation", pod.Namespace, pod.Name)
+		}
+	}
+
+	// Assert metrics still expose the controller annotation value on Pod series.
+	mfs := scrapeExporterMetrics(t)
+	if got := countPodInfoSeries(mfs, ns, dep.Name); got < int(replicas) {
+		t.Fatalf("it_pod_info series for controller=%s: got %d, want >= %d", dep.Name, got, replicas)
+	}
+	if !podInfoHasAnnotation(mfs, ns, controllerNote, int(replicas)) {
+		t.Fatalf("expected it_pod_info label controller_annotation_integration_test_controller_note=%q on >=%d Pod series", controllerNote, replicas)
+	}
+}
+
 // containerInfoMatches returns true when it_pod_container_info contains at
 // least `expected` series matching the supplied container and image inside
 // the given namespace.
