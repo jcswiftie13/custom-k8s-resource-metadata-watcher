@@ -11,8 +11,9 @@ resources through `SharedInformer` caches (no extra API calls), walks
 - **Pluggable sink**: `MetadataSink` interface, with a Prometheus implementation;
   future backends (Kafka, PostgreSQL…) implement the same interface without
   touching the collector core.
-- **Scoped informers**: optionally restrict watches to specific namespaces and
-  apply per-kind label/field selectors for apiserver-side filtering.
+- **Scoped informers**: optionally restrict watches to specific namespaces, pick
+  which resource kinds to watch via `watch.kinds`, and apply per-kind
+  `labelSelector` / `fieldSelector` for apiserver-side filtering.
 
 See [docs/CONFIG.md](docs/CONFIG.md) for the full configuration reference.
 

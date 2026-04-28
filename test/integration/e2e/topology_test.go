@@ -14,8 +14,8 @@ import (
 )
 
 // watchedKinds are the plural resource names recorded by kube-apiserver in
-// `apiserver_longrunning_requests{resource=...}`. Keep this list in sync with
-// pkg/collector/listers.go: allKinds.
+// `apiserver_longrunning_requests{resource=...}`. Keep in sync with
+// pkg/config/config.go:allSupportedKindOrder when the default is to watch all kinds.
 var watchedKinds = []string{"pods", "replicasets", "deployments", "statefulsets", "daemonsets"}
 
 // TestTopology_ClusterWide verifies that the exporter opens exactly one
@@ -56,6 +56,48 @@ func TestTopology_ClusterWide(t *testing.T) {
 		}
 	}
 	assertExporterLogContains(t, "watch mode = cluster-wide")
+}
+
+// TestTopology_KindSubset verifies that watch.kinds limits which GVRs get a
+// WATCH: only pods and deployments open a connection; others do not.
+func TestTopology_KindSubset(t *testing.T) {
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpLogs(t)
+		}
+	})
+	nss := makeScenarioNamespaces(t, "top-ks", 2)
+	createNamespaces(t, nss...)
+	t.Cleanup(func() { deleteNamespaces(t, nss...) })
+
+	scaleExporter(t, 0)
+	waitForSteadyState(t, 5*time.Second)
+	baseline := watchDeltaSnapshot(t)
+
+	setExporterConfig(t, kindSubsetClusterWideConfigYAML())
+	scaleExporter(t, 1)
+	waitForSteadyState(t, 10*time.Second)
+	after := watchDeltaSnapshot(t)
+
+	delta := map[string]float64{}
+	for _, k := range watchedKinds {
+		delta[k] = after[k] - baseline[k]
+	}
+	t.Logf("kind-subset (Pod+Deployment) watch delta: %v", delta)
+
+	for _, k := range []string{"pods", "deployments"} {
+		if got := delta[k]; got != 1 {
+			t.Errorf("kind-subset: watch delta for resource=%q = %v, want 1", k, got)
+		}
+	}
+	for _, k := range []string{"replicasets", "statefulsets", "daemonsets"} {
+		if got := delta[k]; got != 0 {
+			t.Errorf("kind-subset: watch delta for resource=%q = %v, want 0", k, got)
+		}
+	}
+	assertExporterLogContains(t, "watch mode = cluster-wide")
+	// topController/ownerController rules with RS/STS/DS not watched
+	assertExporterLogContains(t, "not all parent kinds are watched")
 }
 
 // TestTopology_PerNamespace verifies that watches scale as N_ns × N_kinds

@@ -65,7 +65,7 @@ data:
     # granted by the ClusterRoleBinding above).
     watch:
       # namespaces: ["prod", "staging"]
-      selectors:
+      kinds:
         Pod:
           # Field selectors are filtered by the apiserver's watch cache
           # before events are emitted, so they reduce load even for chatty

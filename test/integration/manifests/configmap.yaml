@@ -12,9 +12,13 @@ data:
 
     watch:
       namespaces: []
-      selectors:
+      kinds:
         Pod:
           fieldSelector: "status.phase!=Succeeded"
+        ReplicaSet: {}
+        Deployment: {}
+        StatefulSet: {}
+        DaemonSet: {}
 
     rules:
       - name: "pod_info"

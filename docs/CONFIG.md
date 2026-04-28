@@ -95,7 +95,7 @@
 
 ```yaml
 metricPrefix: "custom_"    # 選填；加在每條 rule 的 name 之前
-watch: { ... }             # 選填；預設為叢集全域、無 selector
+watch: { ... }             # 選填；預設叢集全域、五種 kind 全 watch、無 selector
 rules:
   - { ... }                # 每個元素對應一個 Prometheus metric
 ```
@@ -107,7 +107,7 @@ rules:
 | YAML 欄位 | 角色 |
 |-----------|------|
 | `metricPrefix` | 選填前綴；與各 `rules[].name` 組成註冊用 Prometheus metric 名稱，並受 metric 命名 regex 檢查。 |
-| `watch` | 選填 `WatchScope`：namespace 與各 Kind 的 list/watch selector。 |
+| `watch` | 選填 `WatchScope`：namespace、要納入快取的 **Kind 集合**，以及每個 Kind 的 `labelSelector` / `fieldSelector`。 |
 | `rules` | **必填**、非空之 `Rule` 陣列。 |
 
 ---
@@ -117,7 +117,7 @@ rules:
 ```yaml
 watch:
   namespaces: ["prod", "staging"]   # 選填；空或省略 = 叢集全域
-  selectors:
+  kinds:
     Pod:
       labelSelector: "app.kubernetes.io/part-of=my-platform"
       fieldSelector: "status.phase!=Succeeded"
@@ -125,11 +125,23 @@ watch:
       labelSelector: "managed-by=argocd"
 ```
 
+`kinds` 的鍵必須是 `Pod` | `ReplicaSet` | `Deployment` | `StatefulSet` | `DaemonSet` 之一。若某 Kind **不**在 `kinds` 的 map 中，該 Kind **不**會有 SharedInformer。空物件 `Deployment: {}` 僅啟用該 kind、不加 selector。
+
+若省略 `kinds` 或留空，等同 **五種** resource 都 watch 且 **無** selector。`Validate()` 會驗證每條 `rule` 的 `anchor` 及 **顯式** 指向某 Kind 的 `source`（如 `source: Deployment` 或關聯到某 Kind 的 `relations` 別名）有列在實際 watch 的 kind 內。`source: topController`／`ownerController` 不強制要求父資源在 `kinds` 內，但若實務上沒有 watch 到鏈上需要的 kind，owner 鏈可能 miss，啟動時會有警告。
+
+**遷移（breaking）**：`watch.selectors` 已移除。仍使用舊鍵的設定在 `Load()` 時會回錯，請改為上例的 `watch.kinds` 寫法。
+
 ### 為何重要
 
 - `labelSelector` 與 `fieldSelector` 會傳給 `LIST`／`WATCH`；apiserver 的 **watch cache** 會在事件下發給 client **之前**依述詞過濾，初始 LIST 與後續 watch 流量都會縮小。
 - `namespaces` 非空時，每個列出的 namespace 會建立獨立的 scoped informer factory，對 apiserver 發 namespace 限定的 LIST/WATCH。
 - 最小範圍可縮到單一物件：例如在特定 namespace 內使用 `fieldSelector: "metadata.name=my-pod"`。
+
+### `labelSelector`／`fieldSelector`：單一字串與逗號 AND
+
+- 每個 kind 下的 `labelSelector`、`fieldSelector` 在 YAML 裡各是 **一個字串**（不是陣列）；程式會原樣帶入 Kubernetes `LIST`／`WATCH` 的 query 參數，**不**在應用程式內解析或拆段。
+- **`labelSelector`**：在標準 Kubernetes label selector 語法中，**同一字串內**以英文逗號 **`,`** 連接多個 requirement，語意為 **AND**（例如 `app.kubernetes.io/name=api,env=prod`）。需要 OR 或集合條件時，使用 set-based 等寫法，同樣寫在這一個字串裡。
+- **`fieldSelector`**：同樣為單一字串；是否允許用 **`,`** 串接多個欄位條件，**依資源種類與叢集版本由 apiserver 決定**；不合法時啟動時的 dry-run `LIST` 會失敗並回錯。
 
 ### 各資源 `fieldSelector` 白名單
 
@@ -156,14 +168,17 @@ watch:
 
 ### Watch 拓樸：叢集全域 vs 每 namespace
 
+令 `K = len(watch.kinds)` 的鍵（若 `kinds` 空或省略，則 `K = 5`）。
+
 | 模式 | 觸發條件 | 開啟的 watch 量級 | 取捨 |
 |------|----------|-------------------|------|
-| 叢集全域 | `watch.namespaces` 省略或空 | 每 Kind 約一個（約 5 個） | 對 apiserver 最省；仍可對各 watch 用 `labelSelector`／`fieldSelector` 縮流。 |
-| 每 namespace | `watch.namespaces` 非空 | 約 `len(namespaces) × 5` | 隔離強；適合每 namespace 不同 RBAC，或搭配 `fieldSelector: metadata.name=...` 縮到單一 Pod。 |
+| 叢集全域 | `watch.namespaces` 省略或空 | 每 Kind 約一個，共 `K` 路 | 對大型叢集通常最省；仍可對每個 kind 用 `labelSelector`／`fieldSelector` 縮流。 |
+| 每 namespace | `watch.namespaces` 非空 | 約 `len(namespaces) × K` 路 | 隔離強；或搭配 `fieldSelector: metadata.name=...` 等縮到單一 Pod。 |
+| 僅部分 Kind | `kinds` 只列部分 key | 約 `K`（× namespace 段數） | 降低多餘的 GVR watch；有 `topController`／`ownerController` 但缺父 kind 時 owner 鏈易 miss。 |
 
 啟動日誌會印出 `watch mode = cluster-wide` 或 `per-namespace` 及 factory 數量。namespace 過濾發生在 client-go cache；叢集全域模式 **不會**因此線性增加「每次事件」的 CPU，主要影響的是對 apiserver 的 watch 扇出。
 
-**設計說明**：`watch` 只決定 **快取內有什麼**；rule 仍可引用 `topController`，但若 parent 被 selector 切掉，解析會 miss——這是 `watch` 與 `rules` 之間的**設定耦合**，schema 本身不強制檢查。
+**設計說明**：`watch` 只決定 **快取內有什麼**；rule 仍可引用 `topController`／`ownerController`，但若 parent 被 selector 切掉或沒有 watch 該 parent Kind，解析會 miss——這是 `watch` 與 `rules` 之間的**設定耦合**；`topController` 未強制在 schema 內，但若 rule 用到了，collector 在啟動時會在缺 `ReplicaSet` / `Deployment` / `StatefulSet` / `DaemonSet` 任一者時打 **Warn** 日誌（可能 miss owner 鏈）。
 
 ---
 
@@ -423,12 +438,13 @@ rules:
 ```yaml
 watch:
   namespaces: ["prod"]
-  selectors:
+  kinds:
     Pod:
       labelSelector: "app.kubernetes.io/part-of=payments"
+    # 其他 kind 不列 = 不 watch；使用 topController 等時需自行權衡是否補上
 ```
 
-Parent（Deployment／StatefulSet／DaemonSet／ReplicaSet）維持較寬，以利 owner 鏈仍可取到 parent。
+Parent（`ReplicaSet` / `Deployment` 等）若也縮了 selector 或從 `kinds` 省略，owner 鏈易 miss，請見第 4 節「Owner 鏈」風險；通常 parent 的選擇應**寬於** Pod 或一併把需要的 kind 納入 `kinds`。
 
 ### 8.4 以 Deployment 為 anchor
 
@@ -454,6 +470,7 @@ rules:
 | Static Pod 沒有 controller 類標籤 | Static Pod 無 owner references。 | 預期行為；可對 anchor 加 `fallbacks` 或設 `onMissing`。 |
 | 啟動錯誤提到 `fieldSelector` | 欄位不在該資源白名單。 | 改為 `labelSelector` 或移除。 |
 | 警告「pod selector combined with stricter parent selector …」 | parent 被 filter 掉，owner 鏈斷裂。 | 放寬或移除 parent 的過窄 selector。 |
+| 警告「not all parent kinds are watched」 | 規則使用 `topController`／`ownerController`，但 `watch.kinds` 未納入典型 owner 鏈所要的 parent kind。 | 補上 `ReplicaSet` 等，或放寬 `kinds`；屬可預期，指標中 parent 欄位可能空。 |
 | `metrics-addr` 連不上 | 容器埠不符或程式在驗證階段即退出。 | 查日誌；readiness 通常打 `/healthz`。 |
 
 ---
@@ -493,7 +510,7 @@ rules:
 | 概念 | 主要程式位置 |
 |------|----------------|
 | 根 `Config`、`WatchScope`、`Rule`、`Extract`、`FlattenExtract`、`RelationAlias` | `pkg/config/config.go`（`json` tag = YAML 鍵） |
-| `Load`、`Validate`、`ResolveRelation` | `pkg/config/config.go` |
+| `Load`（回絕舊的 `watch.selectors`）、`Validate`、`WatchScope.EffectiveKinds`、`ResolveRelation` | `pkg/config/config.go` |
 | CLI `-config` 與 `collector.New` 銜接 | `cmd/main.go` |
 | `Compile`、`CompiledRule`、標籤求值順序 | `pkg/collector/evaluator.go` |
 | Path 文法（`parsePath`、`evaluate`） | `pkg/collector/pathexpr.go` |
