@@ -1,210 +1,146 @@
-# Integration tests: correctness & API-server burden
+# 整合測試：詳細設計與實作說明
 
-This document describes the integration test design that exercises
-`metadata-exporter` against a real Kubernetes apiserver (Kind) and validates
-two properties of the new reconcile pipeline:
+本文件是 `test/integration/` 整合測試的詳細設計文件。
+若只需要快速執行方式，請看 [`test/integration/README.md`](../test/integration/README.md)。
 
-1. **Correctness regressions** for the workqueue + reverse parent index +
-   update filter refactor introduced in the optimization plan.
-2. **API-server burden** — in particular:
-   * The number of watch connections grows with `len(kinds)` only, not with
-     namespace count, when running cluster-wide.
-   * Per-namespace mode produces exactly `N_ns × N_kinds` watches with no
-     hidden cluster-wide fallback.
-   * Idle informers do not grow watch connections over time.
-   * Burst mutations on Pods / parents collapse through workqueue dedup
-     and the update filter before reaching the apiserver.
+## 目標
 
-Memory / goroutine leak coverage is intentionally kept minimal and left to a
-follow-up soak test (see *Out of scope* at the end).
+整合測試使用 Kind 上的真實 Kubernetes API Server，驗證 `metadata-exporter` 的下列行為：
 
-## Test pyramid
+1. 指標輸出的功能正確性。
+2. `topController` 關聯鏈解析正確性。
+3. 在高頻更新下的 `reconcile` 負載控制（dedup、佇列排空、索引命中）。
+4. watch 拓樸在 cluster-wide / per-namespace 模式下的可預期性。
 
-| Layer | Status | What it covers |
-|-------|--------|----------------|
-| Unit (`go test ./pkg/...`) | Already in place | Parent index, update filter digests, workqueue dedup, sink mapping |
-| Integration (this doc)     | New             | Live informer wiring, apiserver watch count, churn behaviour, fixture correctness |
-| Soak / leak (future)       | Not in scope    | 30+ minute RSS/`go_goroutines`/index size tracking |
+## 範圍與非目標
 
-## Observability sources
+測試範圍包含：
 
-The tests read three different metric surfaces:
+- 從 Kubernetes 物件到 Prometheus 指標的端到端驗證。
+- watch 連線數在不同拓樸下的差分（delta）驗證。
+- reverse parent index 與 update filter 的回歸檢查。
 
-| Source | Endpoint | What we read |
-|--------|----------|--------------|
-| kube-apiserver | `kubectl get --raw /metrics` | `apiserver_longrunning_requests{verb="WATCH", resource=...}` — **authoritative watch connection count** |
-| exporter `/metrics` | `http://exporter:8080/metrics` | `exporter_reconcile_*`, `exporter_parent_index_*`, `exporter_update_filter_size`, `rest_client_requests_total`, `go_goroutines` |
-| exporter logs | `kubectl logs` | Startup topology log line (`watch mode = cluster-wide` / `per-namespace`) for human-readable confirmation |
+不在此套件範圍：
 
-Because `apiserver_longrunning_requests` also counts watches from the
-kubelet, kube-controller-manager, and any other controllers, we use a
-**differential measurement**: capture the baseline `before exporter is
-running`, then subtract from the steady-state reading after deployment. The
-resulting delta is the exporter's contribution.
+- 長時間 soak 或記憶體洩漏認證（例如連跑數小時）。
+- 多節點排程與跨節點抖動情境。
+- 網路故障 / 控制平面中斷的 chaos 驗證。
 
-## Harness architecture
+## 測試架構
 
-```
-test/integration/
-  run.sh                       # (slimmed) kind create + docker build + load + kubectl apply
-  manifests/                   # kustomize base: ServiceAccount, RBAC, ConfigMap, Deployments, Service
-    overlays/
-      baseline/                # no exporter (used to capture apiserver baseline)
-      cluster-wide/            # watch.namespaces = []
-      per-namespace/           # watch.namespaces = [ns-a, ns-b, ns-c]
-  e2e/                         # NEW: Go test harness, build tag `integration`
-    e2e_test.go                # TestMain: connect kubeconfig, share clientset
-    helpers/
-      cluster.go               # kubeconfig + clientset + restcfg
-      deploy.go                # apply overlay, patch ConfigMap, rollout restart
-      metrics.go               # scrape + parse /metrics via expfmt
-      wait.go                  # polling helpers with exponential backoff
-    topology_test.go           # scenarios 1-3
-    burden_test.go             # scenarios 4-5
-    correctness_test.go        # scenario 6 (subsumes the bash assertions)
+### 目錄與責任分工
+
+- [`test/integration/run.sh`](../test/integration/run.sh)：建立/重用 Kind、建 image、套 manifests、呼叫 `go test`。
+- [`test/integration/manifests/configmap.yaml`](../test/integration/manifests/configmap.yaml)：整測用規則與預設 watcher 設定。
+- [`test/integration/e2e/e2e_test.go`](../test/integration/e2e/e2e_test.go)：`TestMain` 與 kube client 初始化。
+- [`test/integration/e2e/helpers.go`](../test/integration/e2e/helpers.go)：部署、等待、scrape 指標、公用斷言工具。
+- [`test/integration/e2e/topology_test.go`](../test/integration/e2e/topology_test.go)：watch 拓樸測試。
+- [`test/integration/e2e/burden_test.go`](../test/integration/e2e/burden_test.go)：高負載與 dedup/索引行為測試。
+- [`test/integration/e2e/correctness_test.go`](../test/integration/e2e/correctness_test.go)：功能正確性測試。
+
+### 測試資料流
+
+```mermaid
+flowchart LR
+    k8s[Kubernetes 物件事件] --> informer[Exporter Informer Cache]
+    informer --> resolve[Resolver 解析 owner 鏈]
+    resolve --> eval[Rule 評估與 label 計算]
+    eval --> sink[Prometheus 指標輸出]
+    sink --> assert[整測斷言]
 ```
 
-Invocation:
+## 觀測面與量測方式
 
-```sh
-make e2e                       # == run.sh + go test -tags integration ./test/integration/e2e/...
-```
+1. `kube-apiserver /metrics`
+   - 來源：`kubectl get --raw /metrics`
+   - 用途：watch 連線數的權威來源（`apiserver_longrunning_requests`）。
+2. exporter `/metrics`
+   - 來源：helper 透過 API server proxy 讀 exporter pod 的 metrics。
+   - 用途：`it_*`、`exporter_*`、`rest_client_requests_total` 等業務與自監控指標。
+3. exporter logs
+   - 用途：失敗時快速確認 watch 模式與啟動狀態。
 
-## Scenarios
+## 目前測試案例
 
-### 1. Cluster-wide watch count is O(kinds)
+### Topology 類
 
-* **Setup**: 5 namespaces `ns-0..ns-4`, each with a pause Pod. Exporter
-  configured with `watch.namespaces: []`.
-* **Steps**:
-  1. Capture `apiserver_longrunning_requests{verb="WATCH",resource=...}`
-     baseline (exporter replicas=0).
-  2. Scale exporter to 1; wait until `/healthz` is ready and caches are
-     synced (proxy: `exporter_reconcile_total` non-zero for at least one
-     rule).
-  3. Capture watch counts; compute delta.
-* **Assertions**:
-  * Delta per kind ∈ `{pods, replicasets, deployments, statefulsets, daemonsets}` is **exactly 1**.
-  * Sum of deltas == `len(allKinds) == 5`.
-  * Exporter log contains `watch mode = cluster-wide`.
-* **Scale knob**: re-run with 10 namespaces; delta must stay at 1 per kind
-  (the linearity-in-kinds property we care about).
+- `TestTopology_ClusterWide`
+  - `watch.namespaces: []` 時，各 kind 的 watch delta 預期為 `1`。
+- `TestTopology_PerNamespace`
+  - 指定 3 個 namespace 時，各 kind watch delta 預期為 `3`。
+  - 非監看 namespace 的物件不應出現在 `it_pod_info`。
+- `TestTopology_IdleStable`
+  - 閒置區間內 `queue_depth`、`reconcile_total` 與 watch 連線不應漂移。
 
-### 2. Per-namespace watch count is N_ns × N_kinds
+### Burden 類
 
-* **Setup**: Same 5 namespaces, exporter configured with
-  `watch.namespaces: [ns-0, ns-1, ns-2]`.
-* **Assertions**:
-  * Delta per kind == 3.
-  * Total delta == 15.
-  * Pods created in `ns-3`/`ns-4` do **not** appear in `/metrics` (indirect
-    proof that no stray cluster-wide watch is running).
-  * Exporter log: `watch mode = per-namespace`, `factoriesPerKind=3`.
+- `TestBurden_BurstDedup`
+  - 建立高頻 Deployment/Pod patch 負載。
+  - 驗證 queue 最終可排空、`reconcile` 放大量受控、且 exporter 不做寫入請求。
+- `TestBurden_ParentEventViaIndex`
+  - 修改 controller annotation 後，應快速反映到所有 Pod 指標。
+  - 驗證 reverse index 命中增加且 fallback 不應異常上升。
 
-### 3. Idle watches stay stable
+### Correctness 類
 
-* **Setup**: Whichever topology was last deployed (re-use scenario 2).
-* **Steps**: Wait 60 seconds with no cluster changes.
-* **Assertions**:
-  * `exporter_reconcile_queue_depth == 0`.
-  * `exporter_reconcile_total` delta over the idle window == 0 (resync
-    period is 0, so nothing should be re-enqueued).
-  * apiserver WATCH counts unchanged — no reconnect churn.
+- `TestCorrectness_FixtureFlow`
+  - fixture 生命週期、container label、刪除後 series 回收。
+- `TestCorrectness_ControllerAnnotationWithoutPodAnnotation`
+  - 確保 annotation 來源是 controller，而非 Pod 自身 metadata。
 
-### 4. Burst updates collapse via workqueue dedup + update filter
+## 需要特別說明的「可浮動 / 可調整」機制
 
-* **Setup**: Cluster-wide exporter. Create one `Deployment` with
-  `replicas=3` in `ns-0`.
-* **Load generator** (runs for 60s):
-  * 200× `kubectl patch deployment fixture --type=merge -p '{"metadata":{"labels":{"tick":"<n>"}}}'`
-  * In parallel, on each of the 3 Pods: 50× annotation patches
-    (`metadata.annotations.tick`).
-* **Assertions**:
-  * `Δ exporter_reconcile_total{result="ok"}` ≪ `observed event count`.
-    Threshold: delta ≤ `25%` of the event count (generous to allow worker
-    pool overlap) — tune after first run.
-  * `Δ exporter_parent_index_hit_total > 0` (Deployment label patches go
-    through the reverse index).
-  * `Δ exporter_parent_index_fallback_total == 0` once steady state is
-    reached (cold path should not be re-entered).
-  * `rest_client_requests_total{verb in {POST,PUT,PATCH,DELETE}}` on the
-    exporter side remains `0` — regression guard that the exporter is
-    read-only.
-  * 30 seconds after churn ends, `exporter_reconcile_queue_depth` returns
-    to 0.
+### 1) `TestBurden_BurstDedup` 的比例門檻是可調參數
 
-### 5. Parent event routes through reverse index
+`burden_test` 不是用固定次數，而是用比例門檻評估：
 
-* **Setup**: Reuse scenario 4's Deployment.
-* **Steps**: Patch the Deployment's
-  `metadata.annotations.integration.test/controller-note` to a new value.
-* **Assertions**:
-  * Within 10 seconds, the corresponding Prometheus label
-    `controller_annotation_integration_test_controller_note` on
-    `it_pod_info{...}` reflects the new value for all three Pods.
-  * `Δ exporter_parent_index_hit_total ≥ 1`.
-  * `Δ exporter_parent_index_fallback_total == 0` during the window.
+- `enqueuesPerRule = replicas * (depPatches + podPatches)`
+- `dedupBudget = 0.40`（目前為 40%）
+- 斷言：`maxRuleDelta <= enqueuesPerRule * dedupBudget`
 
-### 6. Correctness regression (ported from bash)
+此比例在不同硬體、Kind 負載、測試機共用程度下可能有小幅波動，因此 `dedupBudget` 屬於**可調整的穩定性參數**。若 CI 偶發貼近門檻，建議先蒐集多次樣本，再小幅調整（例如 0.42 或 0.45），避免掩蓋真正回歸。
 
-* Fixture Deployment `fixture-web` with two containers appears.
-* `it_pod_info{controller_kind="Deployment",controller_name="fixture-web"}`
-  series present.
-* `it_pod_container_info{container="pause-main|pause-sidecar"}` each carry
-  the expected image tag.
-* After `kubectl delete deployment fixture-web`:
-  * All `controller_name="fixture-web"` series disappear within 60 s.
-  * `exporter_parent_index_size{direction="by_parent"}` drops (Deployment
-    UID is removed from the index when its anchors are forgotten).
+### 2) `parent_index_fallback` 在 Burden 測試中有容忍值
 
-## Small production changes required
+`TestBurden_BurstDedup` 對 `exporter_parent_index_fallback_total` 採「小幅容忍」策略（目前容忍增量 `<= 5`），原因是整測期間可能有少量背景事件；重點是避免與負載同步出現異常 spike。
 
-These are strictly additive and gated behind existing knobs:
+### 3) watch 驗證採「差分量測」，不是絕對值
 
-1. **Register client-go rest metrics** in [cmd/main.go](../cmd/main.go) so
-   `rest_client_requests_total` is exposed through the main registry. Needed
-   for scenario 4's read-only regression guard.
-2. **Expose parent index / update filter size** via two gauges in
-   [pkg/collector/metrics.go](../pkg/collector/metrics.go):
-   * `exporter_parent_index_size{direction="by_parent"|"by_anchor"}`
-   * `exporter_update_filter_size`
-   Backed by a new `Len()` method on
-   [pkg/collector/index.go](../pkg/collector/index.go) and on
-   `updateDigestCache` in [pkg/collector/collector.go](../pkg/collector/collector.go).
+Topology 測試先量 baseline（exporter scale=0），再 scale=1 量 after，最後比 `delta`。  
+這是因為 apiserver 指標本身包含系統元件的 watch，直接用絕對值容易誤判。
 
-## RBAC delta (integration only)
+### 4) 最終一致性等待（`waitFor + timeout`）是測試設計的一部分
 
-The apiserver `/metrics` endpoint is behind RBAC. Because the test driver
-(`go test`) reads `/metrics` via the user's kubeconfig (admin in Kind),
-**no extra RBAC for the exporter ServiceAccount is required**. We keep the
-existing minimal `Role` untouched. If we later decide to read apiserver
-metrics from inside the cluster, we can add a scoped `ClusterRole` with:
+整測大量使用 `waitFor` 與 timeout（例如 15s/45s/60s/90s）等待 rollout、queue 排空、指標收斂。  
+若環境較慢，應先調整等待窗口，而非直接放寬功能斷言。
 
-```yaml
-- nonResourceURLs: ["/metrics"]
-  verbs: ["get"]
-```
+### 5) queue 排空是「可觀測的完成條件」
 
-…under `test/integration/manifests/overlays/*` only, never in
-`deploy/manifests.yaml`.
+在負載測試中，`exporter_reconcile_queue_depth == 0` 代表該波事件已被消化完，之後再採樣 `reconcile_total` 才有可比性。若未排空就取樣，容易把進行中的工作誤判為回歸。
 
-## CI integration
+## 規則與 fixture 設計重點
 
-`.github/workflows/integration.yaml` will:
+整測預設規則主要驗證：
 
-1. Checkout + set up Go.
-2. `helm/kind-action` to provision Kind.
-3. `make e2e` (which internally calls `run.sh` for image build/load and then
-   `go test -tags integration -json | gotestsum --junitfile junit.xml`).
-4. Upload `junit.xml` as an artifact.
+- `it_pod_info`：每 Pod 一條 series，含 controller 資訊。
+- `it_pod_container_info`：每 `(pod, container)` 一條 series。
 
-## Out of scope (follow-up PRs)
+其中 `controller_annotation_integration_test_controller_note` 來源是  
+`top.metadata.annotations.integration.test/controller-note`，可用來明確驗證資料來源是 controller 而非 Pod。
 
-* 30-minute churn soak test tracking RSS, `go_goroutines`,
-  `exporter_parent_index_size`, `exporter_update_filter_size` for
-  monotonic growth.
-* Reconnect / backoff behaviour (`kubectl cordon` the control plane node
-  briefly, verify informers recover without re-listing everything).
-* Multi-node Kind to validate behaviour under realistic scheduling churn.
-* Audit-log based verification of per-exporter watch count (needs Kind
-  `--config` with audit policy).
+## 擴充測試時的建議
+
+1. 優先重用 `helpers.go`，避免重複等待與 scrape 邏輯。
+2. 每個 test 使用獨立 namespace/fixture，降低交互干擾。
+3. 同時驗證：
+   - Kubernetes 物件真值（API 物件是否真的改了）
+   - metrics 真值（使用者實際會看到的輸出）
+4. 若是來源邊界議題，務必加入負向斷言（例如 Pod 不應有該 annotation）。
+5. 若新增比例/閾值型斷言，請在文件中說明其目的、建議調整區間與調整時機。
+
+## 已知限制
+
+- 尚未納入長時間記憶體/協程趨勢追蹤。
+- 尚未涵蓋控制平面故障復原情境。
+- watch 歸因仍採差分法，不是單 exporter 身分歸因。
+- 目前預設以單節點 Kind 為假設。
