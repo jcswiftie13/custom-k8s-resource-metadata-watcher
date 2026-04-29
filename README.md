@@ -113,6 +113,77 @@ CI runs the same script via [.github/workflows/integration.yaml](.github/workflo
 Manifests live under [test/integration/manifests/](test/integration/manifests/)
 and the Go test harness under [test/integration/e2e/](test/integration/e2e/).
 
+### Manual informer observer
+
+If you want to inspect `client-go` watch behavior manually (instead of `go test`),
+run:
+
+```sh
+./test/integration/run_informer_test.sh
+```
+
+This starts a standalone informer process and prints every
+ADD/UPDATE/DELETE event payload summary.
+
+Use another terminal to drive changes:
+
+```sh
+NS=e2e-informer-pending-image-0
+
+kubectl -n "${NS}" apply -f test/integration/manifests/pending-pod.yaml
+kubectl -n "${NS}" get pod informer-pending-image-pod -w
+# Wait until phase becomes Running
+```
+
+Then edit `test/integration/manifests/pending-pod.yaml` (for example image tag or
+an annotation value) and apply again:
+
+```sh
+kubectl -n "${NS}" apply -f test/integration/manifests/pending-pod.yaml
+```
+
+This lets you verify watch behavior under different selectors (for example,
+whether a `status.phase=Pending` informer still receives events after a Pod has
+moved to Running).
+
+Helpful flags:
+
+- `SKIP_KIND_CREATE=1` to reuse an existing cluster/context
+- `OBSERVER_NAMESPACE=<ns>` to watch another namespace
+- `OBSERVER_SELECTOR='status.phase=Pending'` to set field selector in the script
+- `OBSERVER_KUBECONFIG=/path/to/config` to force kubeconfig
+
+Selector syntax reference (direct `go run`):
+
+```sh
+# no field filtering (watch all phases)
+--field-selector ""
+
+# common field selector examples
+--field-selector "status.phase=Pending"
+--field-selector "status.phase=Running"
+--field-selector "metadata.name=informer-pending-image-pod"
+--field-selector "spec.nodeName=kind-control-plane"
+
+# no label filtering
+--label-selector ""
+
+# common label selector examples
+--label-selector "app=informer-observer-manual"
+--label-selector "app in (informer-observer-manual,other-app)"
+--label-selector "app!=debug"
+--label-selector "app,workload"
+```
+
+Example: run observer with both selectors
+
+```sh
+go run ./test/tools/informer-observer/informer_pending_observer.go \
+  --namespace e2e-informer-pending-image-0 \
+  --field-selector "status.phase=Running" \
+  --label-selector "app=informer-observer-manual"
+```
+
 ## Project layout
 
 ```

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: informer-pending-image-pod
+  labels:
+    app: informer-observer-manual
+  annotations:
+    observer.example.com/revision: "v1"
+spec:
+  containers:
+    - name: pause-main
+      image: registry.k8s.io/pause:3.9
