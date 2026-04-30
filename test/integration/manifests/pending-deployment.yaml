@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: informer-pending-image-deployment
+  labels:
+    app: informer-observer-manual
+  annotations:
+    observer.example.com/revision: "v1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: informer-observer-manual
+      workload: deployment
+  template:
+    metadata:
+      labels:
+        app: informer-observer-manual
+        workload: deployment
+      annotations:
+        observer.example.com/revision: "v1"
+    spec:
+      containers:
+        - name: pause-main
+          image: registry.k8s.io/pause:3.9

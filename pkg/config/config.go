@@ -24,6 +24,12 @@ var supportedAnchors = map[string]struct{}{
 	"ReplicaSet":  {},
 }
 
+// allSupportedKindOrder is the fixed order used for informers, validation, and
+// log output when watch.kinds is empty (watch all) or for merging explicit kinds.
+var allSupportedKindOrder = []string{
+	"Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet",
+}
+
 // Built-in relation source names (case-sensitive).
 // Kind names are also accepted as sources (first occurrence along the owner chain).
 var builtinSources = map[string]struct{}{
@@ -51,21 +57,61 @@ type Config struct {
 	Rules []Rule `json:"rules"`
 }
 
-// WatchScope describes namespace and per-kind selector restrictions.
+// WatchScope describes which kinds to watch, optional namespace limits, and
+// per-kind list/watch filters.
 type WatchScope struct {
 	// Namespaces, if non-empty, limits informers to these namespaces; one
 	// SharedInformerFactory is created per namespace.
 	Namespaces []string `json:"namespaces,omitempty"`
 
-	// Selectors holds per-kind label/field selectors applied via
-	// WithTweakListOptions. The key is the Kind (Pod/Deployment/...).
-	Selectors map[string]KindSelector `json:"selectors,omitempty"`
+	// Kinds, if non-empty, selects which API kinds get SharedInformers. A kind
+	// is watched iff it appears as a key. Label/field selectors are optional
+	// per kind. Omitted or empty Kinds means all supported kinds with no
+	// selectors.
+	Kinds map[string]KindWatch `json:"kinds,omitempty"`
 }
 
-// KindSelector is a label/field selector pair applied to a specific kind.
-type KindSelector struct {
+// KindWatch holds per-kind list/watch options (tweakListOptions) for a single Kind.
+type KindWatch struct {
 	LabelSelector string `json:"labelSelector,omitempty"`
 	FieldSelector string `json:"fieldSelector,omitempty"`
+}
+
+// EffectiveKinds returns the kinds to watch, in a stable order. An empty
+// or nil Kinds map means every supported kind is watched.
+func (w WatchScope) EffectiveKinds() []string {
+	if len(w.Kinds) == 0 {
+		out := make([]string, len(allSupportedKindOrder))
+		copy(out, allSupportedKindOrder)
+		return out
+	}
+	var out []string
+	for _, k := range allSupportedKindOrder {
+		if _, ok := w.Kinds[k]; ok {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// EffectiveKindSet is a set view of EffectiveKinds.
+func (w WatchScope) EffectiveKindSet() map[string]struct{} {
+	eff := w.EffectiveKinds()
+	m := make(map[string]struct{}, len(eff))
+	for _, k := range eff {
+		m[k] = struct{}{}
+	}
+	return m
+}
+
+// KindWatchFor returns label/field options for a kind. In "watch all" mode
+// (empty Kinds) every kind has no selectors; in explicit mode, kinds not
+// present are not watched and the caller should not use this.
+func (w WatchScope) KindWatchFor(kind string) KindWatch {
+	if len(w.Kinds) == 0 {
+		return KindWatch{}
+	}
+	return w.Kinds[kind]
 }
 
 // Rule is one Prometheus metric declaration.
@@ -215,6 +261,13 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config %q: %w", path, err)
 	}
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("parse config %q: %w", path, err)
+	}
+	if err := rejectLegacyWatchSelectors(path, doc); err != nil {
+		return nil, err
+	}
 	cfg := &Config{}
 	if err := yaml.Unmarshal(raw, cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
@@ -223,6 +276,21 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("invalid config %q: %w", path, err)
 	}
 	return cfg, nil
+}
+
+func rejectLegacyWatchSelectors(path string, doc map[string]interface{}) error {
+	w, ok := doc["watch"]
+	if !ok || w == nil {
+		return nil
+	}
+	wmap, ok := w.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	if _, has := wmap["selectors"]; has {
+		return fmt.Errorf("config %q: watch.selectors is no longer supported; use watch.kinds (see docs/CONFIG.md)", path)
+	}
+	return nil
 }
 
 // Validate performs structural checks. The caller is expected to run a
@@ -234,10 +302,16 @@ func (c *Config) Validate() error {
 	if c.MetricPrefix != "" && !metricNameRe.MatchString(c.MetricPrefix+"x") {
 		return fmt.Errorf("metricPrefix %q is not a valid Prometheus metric name prefix", c.MetricPrefix)
 	}
+	if err := c.validateWatchKinds(); err != nil {
+		return err
+	}
 	seenMetric := map[string]struct{}{}
 	for i := range c.Rules {
 		r := &c.Rules[i]
 		if err := r.validate(); err != nil {
+			return fmt.Errorf("rules[%d] (name=%q): %w", i, r.Name, err)
+		}
+		if err := r.validateAgainstWatch(c.Watch); err != nil {
 			return fmt.Errorf("rules[%d] (name=%q): %w", i, r.Name, err)
 		}
 		metricName := c.MetricPrefix + r.Name
@@ -248,6 +322,53 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("rules[%d]: metric name %q is duplicated across rules", i, metricName)
 		}
 		seenMetric[metricName] = struct{}{}
+	}
+	return nil
+}
+
+// validateWatchKinds checks every key in watch.kinds (if any) is a supported Kind.
+func (c *Config) validateWatchKinds() error {
+	for k := range c.Watch.Kinds {
+		if _, ok := supportedAnchors[k]; !ok {
+			return fmt.Errorf("watch.kinds: unknown kind %q (allowed: Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet)", k)
+		}
+	}
+	return nil
+}
+
+// requiredWatchKinds are kinds the rule's anchor and explicit label/flatten
+// sources need to have in the informer cache (excludes ownerController/topController).
+func (r *Rule) requiredWatchKinds() map[string]struct{} {
+	out := map[string]struct{}{}
+	out[r.Anchor] = struct{}{}
+	add := func(src string) {
+		resolved := r.ResolveRelation(src)
+		switch resolved {
+		case "", "anchor", "item", "ownerController", "topController":
+			return
+		}
+		if _, ok := supportedAnchors[resolved]; ok {
+			out[resolved] = struct{}{}
+		}
+	}
+	for _, ext := range r.Labels {
+		add(ext.EffectiveSource())
+		for _, f := range ext.Fallbacks {
+			add(f.EffectiveSource())
+		}
+	}
+	for _, fl := range r.Flatten {
+		add(fl.EffectiveSource())
+	}
+	return out
+}
+
+func (r *Rule) validateAgainstWatch(w WatchScope) error {
+	eff := w.EffectiveKindSet()
+	for k := range r.requiredWatchKinds() {
+		if _, ok := eff[k]; !ok {
+			return fmt.Errorf("kind %q is required by anchor/sources but is not included in watch.kinds (effective watch set does not include it)", k)
+		}
 	}
 	return nil
 }
@@ -271,7 +392,6 @@ func (r *Rule) validate() error {
 	for k := range supportedAnchors {
 		validSources[k] = struct{}{}
 	}
-	aliasVia := map[string]string{}
 	for i, rel := range r.Relations {
 		if strings.TrimSpace(rel.Name) == "" {
 			return fmt.Errorf("relations[%d].name: required", i)
@@ -288,7 +408,6 @@ func (r *Rule) validate() error {
 			return fmt.Errorf("relations[%d]: name=%q collides with a builtin or earlier alias", i, rel.Name)
 		}
 		validSources[rel.Name] = struct{}{}
-		aliasVia[rel.Name] = rel.Via
 	}
 
 	// Validate forEach: only meaningful when the anchor has array fields.

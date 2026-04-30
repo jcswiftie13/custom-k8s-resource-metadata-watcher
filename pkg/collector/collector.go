@@ -159,6 +159,59 @@ func ruleHelp(r *config.Rule) string {
 	return fmt.Sprintf("Metadata series for anchor=%s (auto-generated).", r.Anchor)
 }
 
+func (c *Collector) logParentChainKindGaps() {
+	if !c.anyRuleUsesParentChain() {
+		return
+	}
+	en := c.informers.EnabledKindSet()
+	var missing []string
+	for _, k := range []string{"ReplicaSet", "Deployment", "StatefulSet", "DaemonSet"} {
+		if _, ok := en[k]; !ok {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	c.log.Warn(
+		"rules reference ownerController/topController but not all parent kinds are watched; owner chain resolution may miss",
+		"missingParentKinds", missing,
+		"watchedKinds", c.informers.WatchedKinds(),
+	)
+}
+
+func (c *Collector) anyRuleUsesParentChain() bool {
+	for i := range c.cfg.Rules {
+		if ruleUsesParentChain(&c.cfg.Rules[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+func ruleUsesParentChain(r *config.Rule) bool {
+	try := func(src string) bool {
+		res := r.ResolveRelation(src)
+		return res == "ownerController" || res == "topController"
+	}
+	for _, ext := range r.Labels {
+		if try(ext.EffectiveSource()) {
+			return true
+		}
+		for _, f := range ext.Fallbacks {
+			if try(f.EffectiveSource()) {
+				return true
+			}
+		}
+	}
+	for _, f := range r.Flatten {
+		if try(f.EffectiveSource()) {
+			return true
+		}
+	}
+	return false
+}
+
 // collectReadKinds returns every kind name that may be read when evaluating
 // the rule (excluding "item"/"anchor" which are not kind names).
 func collectReadKinds(r *config.Rule) map[string]struct{} {
@@ -194,6 +247,7 @@ func collectReadKinds(r *config.Rule) map[string]struct{} {
 // Start performs dry-run, launches informers, and registers event handlers.
 // Start blocks until ctx is cancelled.
 func (c *Collector) Start(ctx context.Context) error {
+	c.logParentChainKindGaps()
 	c.informers.LogDanglingSelectorWarnings()
 	if err := c.informers.DryRunSelectors(ctx); err != nil {
 		return err
@@ -250,7 +304,7 @@ func (c *Collector) processNext(ctx context.Context) bool {
 
 // registerHandlers attaches anchor + parent-kind event handlers.
 func (c *Collector) registerHandlers() {
-	for _, kind := range allKinds {
+	for _, kind := range c.informers.WatchedKinds() {
 		informers := c.informers.Informers(kind)
 		for _, inf := range informers {
 			c.attachAnchorHandler(kind, inf)
