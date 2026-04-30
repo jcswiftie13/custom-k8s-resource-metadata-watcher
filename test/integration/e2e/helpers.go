@@ -574,6 +574,19 @@ func createFixtureDeployment(t *testing.T, namespace, name string, replicas int3
 	return created
 }
 
+// listNodes returns current cluster nodes for integration assertions.
+func listNodes(t *testing.T) []corev1.Node {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cs := mustClient(t)
+	nodes, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	return nodes.Items
+}
+
 // waitForDeploymentReady blocks until the Deployment reports ready replicas
 // >= spec replicas.
 func waitForDeploymentReady(t *testing.T, namespace, name string, timeout time.Duration) {

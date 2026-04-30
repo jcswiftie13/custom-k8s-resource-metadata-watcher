@@ -46,7 +46,7 @@ func main() {
 		log.Error("load config failed", "err", err)
 		os.Exit(1)
 	}
-	log.Info("config loaded", "rules", len(cfg.Rules), "namespaces", cfg.Watch.Namespaces, "watchKinds", cfg.Watch.EffectiveKinds())
+	log.Info("config loaded", "rules", len(cfg.Rules), "watchKinds", cfg.Watch.EffectiveKinds(), "watchResources", cfg.Watch.EffectiveResources())
 
 	restCfg, err := buildRestConfig(*kubeconfig)
 	if err != nil {

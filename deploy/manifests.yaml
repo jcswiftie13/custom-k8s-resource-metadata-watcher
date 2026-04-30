@@ -26,7 +26,7 @@ metadata:
     app.kubernetes.io/name: metadata-exporter
 rules:
   - apiGroups: [""]
-    resources: ["pods"]
+    resources: ["pods", "nodes"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
@@ -64,9 +64,10 @@ data:
     # watch the whole cluster (requires cluster-wide RBAC which is already
     # granted by the ClusterRoleBinding above).
     watch:
-      # namespaces: ["prod", "staging"]
-      kinds:
-        Pod:
+      resources:
+        - kind: Pod
+          scope: Namespaced
+          # namespaces: ["prod", "staging"]
           # Field selectors are filtered by the apiserver's watch cache
           # before events are emitted, so they reduce load even for chatty
           # clusters. The Pod field-selector whitelist is:
@@ -74,6 +75,16 @@ data:
           #   spec.restartPolicy, spec.schedulerName, spec.serviceAccountName,
           #   status.phase, status.nominatedNodeName
           fieldSelector: "status.phase!=Succeeded"
+        - kind: ReplicaSet
+          scope: Namespaced
+        - kind: Deployment
+          scope: Namespaced
+        - kind: StatefulSet
+          scope: Namespaced
+        - kind: DaemonSet
+          scope: Namespaced
+        - kind: Node
+          scope: Cluster
 
     rules:
       # Per-pod series (one row per Pod).

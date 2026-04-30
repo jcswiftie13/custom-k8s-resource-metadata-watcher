@@ -45,7 +45,7 @@ go test -tags integration -v -count=1 ./test/integration/e2e/...
 
 - `TestBurden_BurstDedup` 使用「比例門檻」而非固定次數，門檻由 `dedupBudget` 控制（目前 40%）。不同執行環境可能有小幅波動，必要時可依文件建議調整。
 - 多數整測依賴 `waitFor + timeout` 的最終一致性等待。若環境較慢，先調整等待窗口，再判斷是否為功能回歸。
-- 從只支援舊的 `watch.selectors` 的執行檔切到本專案版本時，**請重建 integration image 後再** `make e2e`；`make e2e` 套入的 `test/integration/manifests/configmap.yaml` 使用新欄位 `watch.kinds`（見 [`docs/CONFIG.md`](../docs/CONFIG.md)）。
+- 從只支援舊 schema 的執行檔切到本專案版本時，**請重建 integration image 後再** `make e2e`；`make e2e` 套入的 `test/integration/manifests/configmap.yaml` 使用 `watch.resources[]`（見 [`docs/CONFIG.md`](../docs/CONFIG.md)）。
 
 ### 常用除錯指令
 

@@ -12,8 +12,9 @@ resources through `SharedInformer` caches (no extra API calls), walks
   future backends (Kafka, PostgreSQL…) implement the same interface without
   touching the collector core.
 - **Scoped informers**: optionally restrict watches to specific namespaces, pick
-  which resource kinds to watch via `watch.kinds`, and apply per-kind
-  `labelSelector` / `fieldSelector` for apiserver-side filtering.
+  which resource kinds to watch via `watch.resources[]`, declare per-resource
+  scope (`Namespaced`/`Cluster`), and apply per-kind `labelSelector` /
+  `fieldSelector` for apiserver-side filtering.
 
 See [docs/CONFIG.md](docs/CONFIG.md) for the full configuration reference.
 

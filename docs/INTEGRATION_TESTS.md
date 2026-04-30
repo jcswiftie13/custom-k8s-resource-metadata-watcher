@@ -10,7 +10,7 @@
 1. 指標輸出的功能正確性。
 2. `topController` 關聯鏈解析正確性。
 3. 在高頻更新下的 `reconcile` 負載控制（dedup、佇列排空、索引命中）。
-4. watch 拓樸在 **cluster-wide**、**per-namespace**、以及 **`watch.kinds` 僅子集** 等模式下的可預期性，與 `apiserver_longrunning_requests` 的差分一致。
+4. watch 拓樸在 **cluster-wide**、**per-namespace**、以及 **`watch.resources[]` 僅子集** 等模式下的可預期性，與 `apiserver_longrunning_requests` 的差分一致。
 
 ## 範圍與非目標
 
@@ -72,7 +72,7 @@ flowchart LR
 - `TestTopology_IdleStable`
   - 閒置區間內 `queue_depth`、`reconcile_total` 與 watch 連線不應漂移。
 - `TestTopology_KindSubset`
-  - `watch.kinds: {Pod, Deployment}`（`kindSubsetClusterWideConfigYAML`）且 cluster-wide 時，`pods` 與 `deployments` 的 WATCH 差分為 `+1`；`replicasets` / `statefulsets` / `daemonsets` 為 `0`。
+  - `watch.resources[]` 僅含 `Pod`、`Deployment`（`kindSubsetClusterWideConfigYAML`）且 cluster-wide 時，`pods` 與 `deployments` 的 WATCH 差分為 `+1`；`replicasets` / `statefulsets` / `daemonsets` / `nodes` 為 `0`。
   - 規則仍使用 `topController`，未 watch `ReplicaSet` 等父 kind 時，啟動日誌應含 `not all parent kinds are watched`（不阻斷測試斷言）。
 
 ### Burden 類

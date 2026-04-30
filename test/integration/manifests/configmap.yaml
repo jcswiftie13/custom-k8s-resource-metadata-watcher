@@ -11,14 +11,20 @@ data:
     metricPrefix: "it_"
 
     watch:
-      namespaces: []
-      kinds:
-        Pod:
+      resources:
+        - kind: Pod
+          scope: Namespaced
           fieldSelector: "status.phase!=Succeeded"
-        ReplicaSet: {}
-        Deployment: {}
-        StatefulSet: {}
-        DaemonSet: {}
+        - kind: ReplicaSet
+          scope: Namespaced
+        - kind: Deployment
+          scope: Namespaced
+        - kind: StatefulSet
+          scope: Namespaced
+        - kind: DaemonSet
+          scope: Namespaced
+        - kind: Node
+          scope: Cluster
 
     rules:
       - name: "pod_info"
@@ -68,3 +74,40 @@ data:
           controller_name:
             source: top
             path: "metadata.name"
+
+      - name: "node_info"
+        help: "Integration test: one series per Node."
+        anchor: Node
+        labels:
+          node_name:
+            path: "metadata.name"
+          system_uuid:
+            path: "status.nodeInfo.systemUUID"
+
+      - name: "node_address"
+        help: "Integration test: one series per (Node, address)."
+        anchor: Node
+        forEach: "status.addresses[*]"
+        labels:
+          node_name:
+            path: "metadata.name"
+          address_type:
+            source: item
+            path: "type"
+          address:
+            source: item
+            path: "address"
+
+      - name: "node_condition"
+        help: "Integration test: one series per (Node, condition)."
+        anchor: Node
+        forEach: "status.conditions[*]"
+        labels:
+          node_name:
+            path: "metadata.name"
+          condition:
+            source: item
+            path: "type"
+          status:
+            source: item
+            path: "status"

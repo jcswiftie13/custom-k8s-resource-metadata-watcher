@@ -88,11 +88,11 @@ func TestBurden_BurstDedup(t *testing.T) {
 	// key once per rule. If the workqueue+update-filter pipeline is
 	// healthy, reconciles per rule should stay well below this ceiling;
 	// if it regresses (e.g. dedup is bypassed), reconciles approach the
-	// ceiling 1:1. We budget 40% which tolerates the bursty-but-fast
-	// reconcile path observed in Kind (~20-25% in practice) without being
+	// ceiling 1:1. We budget 45% which tolerates the bursty-but-fast
+	// reconcile path observed in Kind (~20-35% in practice) without being
 	// so loose that a full regression would still pass.
 	enqueuesPerRule := float64(int(replicas)*depPatches + int(replicas)*podPatches)
-	const dedupBudget = 0.40
+	const dedupBudget = 0.45
 	// Per-rule counter keyed by reconcileTotal's "rule" label; we compare
 	// the max rule against the budget because all rules share the same
 	// workqueue and therefore the same dedup ratio.

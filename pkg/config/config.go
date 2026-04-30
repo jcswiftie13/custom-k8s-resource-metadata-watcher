@@ -22,12 +22,13 @@ var supportedAnchors = map[string]struct{}{
 	"StatefulSet": {},
 	"DaemonSet":   {},
 	"ReplicaSet":  {},
+	"Node":        {},
 }
 
 // allSupportedKindOrder is the fixed order used for informers, validation, and
 // log output when watch.kinds is empty (watch all) or for merging explicit kinds.
 var allSupportedKindOrder = []string{
-	"Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet",
+	"Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet", "Node",
 }
 
 // Built-in relation source names (case-sensitive).
@@ -60,36 +61,58 @@ type Config struct {
 // WatchScope describes which kinds to watch, optional namespace limits, and
 // per-kind list/watch filters.
 type WatchScope struct {
-	// Namespaces, if non-empty, limits informers to these namespaces; one
-	// SharedInformerFactory is created per namespace.
-	Namespaces []string `json:"namespaces,omitempty"`
-
-	// Kinds, if non-empty, selects which API kinds get SharedInformers. A kind
-	// is watched iff it appears as a key. Label/field selectors are optional
-	// per kind. Omitted or empty Kinds means all supported kinds with no
-	// selectors.
-	Kinds map[string]KindWatch `json:"kinds,omitempty"`
+	// Resources declares per-kind watch conditions. Empty means watch all
+	// supported resources with default scopes/selectors.
+	Resources []WatchResource `json:"resources,omitempty"`
 }
 
-// KindWatch holds per-kind list/watch options (tweakListOptions) for a single Kind.
-type KindWatch struct {
+// WatchResource holds list/watch options and scope for one resource kind.
+type WatchResource struct {
+	Kind string `json:"kind"`
+	// Scope must be "Namespaced" or "Cluster".
+	Scope string `json:"scope"`
+	// Namespaces is only valid for namespaced resources when scope=Namespaced.
+	Namespaces []string `json:"namespaces,omitempty"`
 	LabelSelector string `json:"labelSelector,omitempty"`
 	FieldSelector string `json:"fieldSelector,omitempty"`
 }
 
-// EffectiveKinds returns the kinds to watch, in a stable order. An empty
-// or nil Kinds map means every supported kind is watched.
-func (w WatchScope) EffectiveKinds() []string {
-	if len(w.Kinds) == 0 {
-		out := make([]string, len(allSupportedKindOrder))
-		copy(out, allSupportedKindOrder)
+const (
+	ScopeNamespaced = "Namespaced"
+	ScopeCluster    = "Cluster"
+)
+
+// EffectiveResources returns watched resources in stable kind order.
+// Empty Resources means every supported kind is watched with defaults.
+func (w WatchScope) EffectiveResources() []WatchResource {
+	if len(w.Resources) == 0 {
+		out := make([]WatchResource, 0, len(allSupportedKindOrder))
+		for _, k := range allSupportedKindOrder {
+			out = append(out, WatchResource{
+				Kind:  k,
+				Scope: defaultScopeForKind(k),
+			})
+		}
 		return out
 	}
-	var out []string
+	byKind := make(map[string]WatchResource, len(w.Resources))
+	for _, r := range w.Resources {
+		byKind[r.Kind] = r
+	}
+	var out []WatchResource
 	for _, k := range allSupportedKindOrder {
-		if _, ok := w.Kinds[k]; ok {
-			out = append(out, k)
+		if r, ok := byKind[k]; ok {
+			out = append(out, r)
 		}
+	}
+	return out
+}
+
+// EffectiveKinds returns the kinds to watch, in a stable order.
+func (w WatchScope) EffectiveKinds() []string {
+	var out []string
+	for _, r := range w.EffectiveResources() {
+		out = append(out, r.Kind)
 	}
 	return out
 }
@@ -104,14 +127,14 @@ func (w WatchScope) EffectiveKindSet() map[string]struct{} {
 	return m
 }
 
-// KindWatchFor returns label/field options for a kind. In "watch all" mode
-// (empty Kinds) every kind has no selectors; in explicit mode, kinds not
-// present are not watched and the caller should not use this.
-func (w WatchScope) KindWatchFor(kind string) KindWatch {
-	if len(w.Kinds) == 0 {
-		return KindWatch{}
+// ResourceFor returns the effective watch resource for a kind.
+func (w WatchScope) ResourceFor(kind string) (WatchResource, bool) {
+	for _, r := range w.EffectiveResources() {
+		if r.Kind == kind {
+			return r, true
+		}
 	}
-	return w.Kinds[kind]
+	return WatchResource{}, false
 }
 
 // Rule is one Prometheus metric declaration.
@@ -288,7 +311,13 @@ func rejectLegacyWatchSelectors(path string, doc map[string]interface{}) error {
 		return nil
 	}
 	if _, has := wmap["selectors"]; has {
-		return fmt.Errorf("config %q: watch.selectors is no longer supported; use watch.kinds (see docs/CONFIG.md)", path)
+		return fmt.Errorf("config %q: watch.selectors is no longer supported; use watch.resources (see docs/CONFIG.md)", path)
+	}
+	if _, has := wmap["kinds"]; has {
+		return fmt.Errorf("config %q: watch.kinds is no longer supported in v2; use watch.resources", path)
+	}
+	if _, has := wmap["namespaces"]; has {
+		return fmt.Errorf("config %q: watch.namespaces is no longer supported in v2; use watch.resources[].namespaces", path)
 	}
 	return nil
 }
@@ -326,11 +355,31 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// validateWatchKinds checks every key in watch.kinds (if any) is a supported Kind.
+// validateWatchKinds checks watch.resources schema and kind/scope compatibility.
 func (c *Config) validateWatchKinds() error {
-	for k := range c.Watch.Kinds {
-		if _, ok := supportedAnchors[k]; !ok {
-			return fmt.Errorf("watch.kinds: unknown kind %q (allowed: Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet)", k)
+	seen := map[string]struct{}{}
+	for i, r := range c.Watch.Resources {
+		if _, ok := supportedAnchors[r.Kind]; !ok {
+			return fmt.Errorf("watch.resources[%d].kind: unknown kind %q (allowed: Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Node)", i, r.Kind)
+		}
+		if _, dup := seen[r.Kind]; dup {
+			return fmt.Errorf("watch.resources[%d].kind: duplicated kind %q", i, r.Kind)
+		}
+		seen[r.Kind] = struct{}{}
+		if r.Scope != ScopeNamespaced && r.Scope != ScopeCluster {
+			return fmt.Errorf("watch.resources[%d].scope: must be %q or %q", i, ScopeNamespaced, ScopeCluster)
+		}
+		if r.Kind == "Node" {
+			if r.Scope != ScopeCluster {
+				return fmt.Errorf("watch.resources[%d]: kind %q must use scope=%q", i, r.Kind, ScopeCluster)
+			}
+			if len(r.Namespaces) > 0 {
+				return fmt.Errorf("watch.resources[%d]: kind %q cannot set namespaces (cluster-scoped resource)", i, r.Kind)
+			}
+			continue
+		}
+		if r.Scope == ScopeCluster && len(r.Namespaces) > 0 {
+			return fmt.Errorf("watch.resources[%d]: scope=%q cannot set namespaces", i, ScopeCluster)
 		}
 	}
 	return nil
@@ -367,7 +416,7 @@ func (r *Rule) validateAgainstWatch(w WatchScope) error {
 	eff := w.EffectiveKindSet()
 	for k := range r.requiredWatchKinds() {
 		if _, ok := eff[k]; !ok {
-			return fmt.Errorf("kind %q is required by anchor/sources but is not included in watch.kinds (effective watch set does not include it)", k)
+			return fmt.Errorf("kind %q is required by anchor/sources but is not included in watch.resources (effective watch set does not include it)", k)
 		}
 	}
 	return nil
@@ -531,4 +580,11 @@ func (r *Rule) ResolveRelation(name string) string {
 		}
 	}
 	return name
+}
+
+func defaultScopeForKind(kind string) string {
+	if kind == "Node" {
+		return ScopeCluster
+	}
+	return ScopeNamespaced
 }
