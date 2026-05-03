@@ -1,0 +1,8 @@
+# Shared Kind topology for integration tests (see test/integration/run.sh).
+# One control-plane + two workers so the cluster has three nodes total.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker

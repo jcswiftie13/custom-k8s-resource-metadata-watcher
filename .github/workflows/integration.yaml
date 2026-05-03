@@ -20,6 +20,7 @@ jobs:
         uses: helm/kind-action@v1.12.0
         with:
           wait: 300s
+          config: test/integration/kind-config.yaml
 
       - name: Run Kind integration tests
         env:

@@ -46,21 +46,11 @@ kind_provision_cleanup() {
 }
 
 if [[ -z "${SKIP_KIND_CREATE:-}" ]]; then
-  if kind get clusters 2>/dev/null | grep -qx "${KIND_CLUSTER_NAME}"; then
-    echo "error: kind cluster ${KIND_CLUSTER_NAME} already exists (set SKIP_KIND_CREATE=1 to reuse)" >&2
-    exit 1
-  fi
-
-  kind create cluster --name "${KIND_CLUSTER_NAME}" --wait 5m
-  CREATED_CLUSTER=1
+  # shellcheck source=kind_ensure_cluster.inc.sh
+  source "${SCRIPT_DIR}/kind_ensure_cluster.inc.sh"
+  kind_integration_ensure_cluster || exit 1
 else
   echo "SKIP_KIND_CREATE set: reusing existing kubeconfig context (cluster will not be deleted unless created by this script)" >&2
-fi
-
-if [[ "${CREATED_CLUSTER}" -eq 1 ]]; then
-  KUBECONFIG_IT_FILE="$(mktemp)"
-  kind get kubeconfig --name "${KIND_CLUSTER_NAME}" >"${KUBECONFIG_IT_FILE}"
-  export KUBECONFIG="${KUBECONFIG_IT_FILE}"
 fi
 
 # If executed directly (not sourced), ensure cleanup runs.

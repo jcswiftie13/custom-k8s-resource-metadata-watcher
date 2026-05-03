@@ -9,11 +9,23 @@
 #   INTEGRATION_IMAGE   image tag to build + load (default metadata-exporter:it)
 #   SKIP_KIND_CREATE    when set, use the current kubeconfig context and
 #                       neither create nor delete a Kind cluster
+#                       When unset, an existing cluster with the same name is
+#                       reused if its node count matches kind-config.yaml;
+#                       otherwise it is deleted and recreated.
 #   SKIP_CLUSTER_DELETE when set together with create, keep the cluster
 #                       after the run (useful for debugging)
 #   SKIP_GO_TEST        when set, apply manifests but do not invoke go test
 #   DOCKER_BUILD_PLATFORM  optional --platform for `docker build`
 #   GOTEST_FLAGS        additional flags passed to `go test`
+#   INTEGRATION_PATCH_NODE_EXTERNAL_IP  set to 0 to skip RFC5737 ExternalIP
+#                       patches on Node status (default: patch when not 0)
+#   INTEGRATION_PRINT_METRICS  set to 1 to print a filtered /metrics snapshot
+#                       after go test (or after manifests when SKIP_GO_TEST=1)
+#   INTEGRATION_PORT_FORWARD_METRICS  set to 1 to run kubectl port-forward to
+#                       svc/metadata-exporter after tests; requires the cluster
+#                       to be kept (SKIP_CLUSTER_DELETE=1 if this runner
+#                       created the cluster, or SKIP_KIND_CREATE with your own)
+#   INTEGRATION_METRICS_LOCAL_PORT  local port for port-forward (default 18080)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,22 +69,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ -z "${SKIP_KIND_CREATE:-}" ]]; then
-  if kind get clusters 2>/dev/null | grep -qx "${KIND_CLUSTER_NAME}"; then
-    log "error: kind cluster ${KIND_CLUSTER_NAME} already exists (delete it or set SKIP_KIND_CREATE=1 to use current kubeconfig)"
-    exit 1
-  fi
-  kind create cluster --name "${KIND_CLUSTER_NAME}" --wait 5m
-  CREATED_CLUSTER=1
-else
+# shellcheck source=kind_ensure_cluster.inc.sh
+source "${SCRIPT_DIR}/kind_ensure_cluster.inc.sh"
+
+if [[ -n "${SKIP_KIND_CREATE:-}" ]]; then
   log "SKIP_KIND_CREATE set: using current kube context (cluster will not be deleted)"
+else
+  kind_integration_ensure_cluster || exit 1
 fi
 
-if [[ "${CREATED_CLUSTER}" -eq 1 ]]; then
-  KUBECONFIG_IT_FILE="$(mktemp)"
-  kind get kubeconfig --name "${KIND_CLUSTER_NAME}" >"${KUBECONFIG_IT_FILE}"
-  export KUBECONFIG="${KUBECONFIG_IT_FILE}"
+if [[ "${INTEGRATION_PORT_FORWARD_METRICS:-0}" == "1" ]]; then
+  if [[ "${CREATED_CLUSTER}" -eq 1 ]] && [[ -z "${SKIP_CLUSTER_DELETE:-}" ]]; then
+    log "error: INTEGRATION_PORT_FORWARD_METRICS=1 requires SKIP_CLUSTER_DELETE=1 when this script creates the Kind cluster"
+    exit 1
+  fi
 fi
+
+log "waiting for all nodes to be Ready"
+kubectl wait --for=condition=Ready nodes --all --timeout=5m
+
+bash "${SCRIPT_DIR}/patch_kind_node_external_ips.sh"
 
 DOCKER_BUILD_PLATFORM="${DOCKER_BUILD_PLATFORM:-}"
 build_args=(build -t "${IMAGE}" .)
@@ -91,12 +107,64 @@ kubectl wait --for=condition=ready pod \
   -l app.kubernetes.io/name=metadata-exporter-integration \
   -n "${NS}" --timeout=120s
 
+print_filtered_metrics() {
+  local title="$1"
+  local pod raw_path
+  pod="$(kubectl get pods -n "${NS}" -l app.kubernetes.io/name=metadata-exporter-integration \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [[ -z "${pod}" ]]; then
+    log "${title}: no exporter pod found; skip snapshot"
+    return 0
+  fi
+  raw_path="/api/v1/namespaces/${NS}/pods/http:${pod}:8080/proxy/metrics"
+  log "--- ${title}: lines matching ^it_|^exporter_ ---"
+  kubectl get --raw "${raw_path}" 2>/dev/null | grep -E '^(it_|exporter_)' || true
+}
+
+run_go_tests() {
+  export E2E_REPO_ROOT="${ROOT}"
+  # shellcheck disable=SC2086
+  go test -tags integration -v -count=1 -timeout=20m ${GOTEST_FLAGS:-} ./test/integration/e2e/...
+}
+
+maybe_port_forward_metrics() {
+  local tests_exit="$1"
+  [[ "${INTEGRATION_PORT_FORWARD_METRICS:-0}" != "1" ]] && return 0
+  local port="${INTEGRATION_METRICS_LOCAL_PORT:-18080}"
+  log "starting kubectl port-forward (Ctrl+C to stop)"
+  log "  URL: http://127.0.0.1:${port}/metrics"
+  # Drop EXIT cleanup so SIGINT does not delete a cluster we intend to keep.
+  trap - EXIT
+  cleanup_pf() {
+    if [[ -n "${KUBECONFIG_IT_FILE}" ]] && [[ -f "${KUBECONFIG_IT_FILE}" ]]; then
+      rm -f "${KUBECONFIG_IT_FILE}" || true
+    fi
+    exit "${tests_exit}"
+  }
+  trap cleanup_pf INT TERM
+  kubectl port-forward -n "${NS}" "svc/metadata-exporter" "${port}:8080" || log "port-forward exited (status $?)"
+  cleanup_pf
+}
+
 if [[ -n "${SKIP_GO_TEST:-}" ]]; then
-  log "SKIP_GO_TEST set: manifests applied; exiting without running go test"
+  log "SKIP_GO_TEST set: manifests applied; skipping go test"
+  if [[ "${INTEGRATION_PRINT_METRICS:-0}" == "1" ]]; then
+    print_filtered_metrics "INTEGRATION_PRINT_METRICS snapshot"
+  fi
+  maybe_port_forward_metrics 0
   exit 0
 fi
 
 log "running integration go tests"
-export E2E_REPO_ROOT="${ROOT}"
-# shellcheck disable=SC2086
-go test -tags integration -v -count=1 -timeout=20m ${GOTEST_FLAGS:-} ./test/integration/e2e/...
+go_test_rc=0
+run_go_tests || go_test_rc=$?
+
+if [[ "${INTEGRATION_PRINT_METRICS:-0}" == "1" ]]; then
+  print_filtered_metrics "INTEGRATION_PRINT_METRICS snapshot"
+elif [[ "${go_test_rc}" -ne 0 ]]; then
+  print_filtered_metrics "filtered /metrics after test failure"
+fi
+
+maybe_port_forward_metrics "${go_test_rc}"
+
+exit "${go_test_rc}"

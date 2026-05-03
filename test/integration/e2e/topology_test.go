@@ -201,9 +201,14 @@ func TestTopology_IdleStable(t *testing.T) {
 
 	// Reconcile counter should stay near-flat. With Node watched, kubelet-driven
 	// heartbeat/condition updates can trigger a tiny amount of background reconcile.
-	const maxIdleReconcileDelta = 5.0
+	// Extra nodes increase baseline node churn slightly (multi-node Kind).
+	nodeCount := len(listNodes(t))
+	if nodeCount < 1 {
+		nodeCount = 1
+	}
+	maxIdleReconcileDelta := 5.0 + 2.0*float64(nodeCount-1)
 	if diff := reconcileAfter - reconcileBefore; diff > maxIdleReconcileDelta {
-		t.Errorf("idle: reconcile_total moved by %v over idle window; expected <= %v", diff, maxIdleReconcileDelta)
+		t.Errorf("idle: reconcile_total moved by %v over idle window; expected <= %v (nodes=%d)", diff, maxIdleReconcileDelta, nodeCount)
 	}
 
 	// Watch connections should be identical across the idle window.

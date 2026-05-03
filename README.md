@@ -5,6 +5,10 @@ resources through `SharedInformer` caches (no extra API calls), walks
 `ownerReferences` via the cache, and publishes per-series labels as Prometheus
 `_info` gauges — in the same style as `kube-state-metrics`.
 
+- **Informer updates, kube-state-metrics style**: every `Update` that advances
+  `resourceVersion` can enqueue reconcile work (no client-side metadata digest
+  filter); narrow `watch.resources` and rules when you need to cap CPU.
+
 - **Config-driven**: declare every Prometheus metric in YAML using standard
   kubectl-style JSONPath.
 - **Zero extra API calls**: owner-chain resolution uses only cached listers.
@@ -58,7 +62,6 @@ you right-size the workqueue:
 - `exporter_reconcile_duration_seconds` — reconcile latency histogram per anchor kind.
 - `exporter_parent_index_hit_total` / `exporter_parent_index_fallback_total` — parent-event routing stats.
 - `exporter_parent_index_size{direction}` — reverse-index map sizes (by_parent / by_anchor), useful for leak detection.
-- `exporter_update_filter_size` — cached metadata-digest count used by the update-event filter.
 - `rest_client_requests_total{code,method,host}` + `rest_client_request_duration_seconds{verb,host}` — standard client-go metrics, handy for spotting apiserver pressure.
 
 Deploy to a cluster:

@@ -18,9 +18,9 @@ import (
 )
 
 // TestBurden_BurstDedup fires a storm of metadata patches at a Deployment
-// and its Pods. The workqueue + update filter should collapse the storm
-// into a dramatically smaller number of reconcile invocations, and the
-// exporter must not issue any writes against the apiserver.
+// and its Pods. The workqueue should collapse the storm into a dramatically
+// smaller number of reconcile invocations, and the exporter must not issue
+// any writes against the apiserver.
 func TestBurden_BurstDedup(t *testing.T) {
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -85,7 +85,7 @@ func TestBurden_BurstDedup(t *testing.T) {
 	// The per-rule enqueue upper-bound is the real regression signal: every
 	// Deployment patch fans out through the parent index to each owned Pod
 	// (replicas enqueues per rule), and every Pod patch enqueues its own
-	// key once per rule. If the workqueue+update-filter pipeline is
+	// key once per rule. If the workqueue dedup pipeline is
 	// healthy, reconciles per rule should stay well below this ceiling;
 	// if it regresses (e.g. dedup is bypassed), reconciles approach the
 	// ceiling 1:1. We budget 45% which tolerates the bursty-but-fast

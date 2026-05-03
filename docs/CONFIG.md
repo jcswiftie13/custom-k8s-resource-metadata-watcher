@@ -500,9 +500,9 @@ rules:
 
 相關指標：`exporter_parent_index_hit_total`、`exporter_parent_index_fallback_total`。
 
-### 更新事件過濾
+### Informer Update 與 reconcile（對齊 kube-state-metrics）
 
-對每 UID 快取 `{metadata.generation, labels, annotations}` 的 digest；僅 status 變動等不影響 digest 的更新可不入隊，減少大 Pod 的無謂 reconcile。
+對 `SharedInformer` 的 **`Update`**：若 **`resourceVersion` 與舊物件相同**（重複投递）則略過 enqueue；只要 RV 遞進（含 **僅 `status` 變更**），就會入隊並從 cache 重算指標，**不做** metadata-only 的 digest 過濾。需要壓低本機 reconcile 頻率時，請縮小 `watch.resources`／selector 與規則數量。
 
 ### Apiserver 限速
 

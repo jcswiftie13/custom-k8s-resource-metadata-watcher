@@ -22,24 +22,64 @@ func TestCorrectness_NodeMetrics(t *testing.T) {
 	scaleExporter(t, 1)
 	waitForSteadyState(t, 10*time.Second)
 
-	node := pickNodeForMetricsTest(t)
-	internalIPs, externalIPs := nodeIPs(node)
-	if len(internalIPs) == 0 {
-		t.Fatalf("node %q has no InternalIP; cannot validate internal_ip metric", node.Name)
+	wantCount := len(listNodes(t))
+	if wantCount == 0 {
+		t.Fatalf("cluster has no nodes")
 	}
-	if len(node.Status.Conditions) == 0 {
-		t.Fatalf("node %q has no conditions; cannot validate condition/status metrics", node.Name)
-	}
+
+	// Re-apply ExternalIP patches: kubelet may have removed addresses added at
+	// cluster bring-up before earlier tests (e.g. burden) finish.
+	patchKindNodeExternalIPs(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	if err := waitFor(ctx, 2*time.Second, func(ctx context.Context) (bool, error) {
+		cur := listNodes(t)
+		if len(cur) != wantCount {
+			return false, nil
+		}
 		mfs := scrapeExporterMetrics(t)
-		return hasNodeInfo(mfs, node.Name, node.Status.NodeInfo.SystemUUID) &&
-			hasNodeAddress(mfs, node.Name, "InternalIP", internalIPs) &&
-			hasNodeCondition(mfs, node.Name, node.Status.Conditions), nil
+		for i := range cur {
+			if !nodeReadyInMetrics(mfs, &cur[i]) {
+				return false, nil
+			}
+		}
+		return true, nil
 	}); err != nil {
-		t.Fatalf("node metrics did not converge for node=%q: %v", node.Name, err)
+		t.Fatalf("node metrics did not converge for all %d nodes: %v", wantCount, err)
+	}
+
+	finalNodes := listNodes(t)
+	if len(finalNodes) != wantCount {
+		t.Fatalf("node count changed: had %d, now %d", wantCount, len(finalNodes))
+	}
+	for i := range finalNodes {
+		assertNodeMetricsExported(t, &finalNodes[i])
+	}
+}
+
+func nodeReadyInMetrics(mfs map[string]*dto.MetricFamily, n *corev1.Node) bool {
+	internalIPs, externalIPs := nodeIPs(n)
+	if len(internalIPs) == 0 || len(externalIPs) == 0 || len(n.Status.Conditions) == 0 {
+		return false
+	}
+	return hasNodeInfo(mfs, n.Name, n.Status.NodeInfo.SystemUUID) &&
+		hasNodeAddress(mfs, n.Name, "InternalIP", internalIPs) &&
+		hasNodeAddress(mfs, n.Name, "ExternalIP", externalIPs) &&
+		hasNodeCondition(mfs, n.Name, n.Status.Conditions)
+}
+
+func assertNodeMetricsExported(t *testing.T, node *corev1.Node) {
+	t.Helper()
+	internalIPs, externalIPs := nodeIPs(node)
+	if len(internalIPs) == 0 {
+		t.Fatalf("node %q has no InternalIP", node.Name)
+	}
+	if len(externalIPs) == 0 {
+		t.Fatalf("node %q has no ExternalIP in API (integration runner should patch RFC5737 addresses)", node.Name)
+	}
+	if len(node.Status.Conditions) == 0 {
+		t.Fatalf("node %q has no conditions", node.Name)
 	}
 
 	mfs := scrapeExporterMetrics(t)
@@ -49,40 +89,12 @@ func TestCorrectness_NodeMetrics(t *testing.T) {
 	if !hasNodeAddress(mfs, node.Name, "InternalIP", internalIPs) {
 		t.Fatalf("it_node_address missing InternalIP for node_name=%q", node.Name)
 	}
-	if len(externalIPs) > 0 {
-		if !hasNodeAddress(mfs, node.Name, "ExternalIP", externalIPs) {
-			t.Fatalf("it_node_address missing ExternalIP for node_name=%q", node.Name)
-		}
-	} else {
-		t.Logf("node %q has no ExternalIP in API; skip strict external_ip assertion", node.Name)
+	if !hasNodeAddress(mfs, node.Name, "ExternalIP", externalIPs) {
+		t.Fatalf("it_node_address missing ExternalIP for node_name=%q", node.Name)
 	}
 	if !hasNodeCondition(mfs, node.Name, node.Status.Conditions) {
 		t.Fatalf("it_node_condition missing expected (condition,status) pair for node_name=%q", node.Name)
 	}
-}
-
-func pickNodeForMetricsTest(t *testing.T) *corev1.Node {
-	t.Helper()
-	nodes := listNodes(t)
-	if len(nodes) == 0 {
-		t.Fatalf("cluster has no nodes")
-	}
-	for i := range nodes {
-		n := &nodes[i]
-		if hasAddressType(n, corev1.NodeInternalIP) {
-			return n
-		}
-	}
-	return &nodes[0]
-}
-
-func hasAddressType(node *corev1.Node, typ corev1.NodeAddressType) bool {
-	for _, a := range node.Status.Addresses {
-		if a.Type == typ {
-			return true
-		}
-	}
-	return false
 }
 
 func nodeIPs(node *corev1.Node) (internal []string, external []string) {
