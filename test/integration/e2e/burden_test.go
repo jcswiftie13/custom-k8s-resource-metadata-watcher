@@ -30,6 +30,7 @@ func TestBurden_BurstDedup(t *testing.T) {
 	ns := "e2e-burst-0"
 	createNamespaces(t, ns)
 	t.Cleanup(func() { deleteNamespaces(t, ns) })
+	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), snapMetricsBurdenBurst) })
 
 	// Cluster-wide topology keeps the test insensitive to namespace count.
 	setExporterConfig(t, clusterWideConfigYAML())
@@ -136,6 +137,7 @@ func TestBurden_ParentEventViaIndex(t *testing.T) {
 	ns := "e2e-parent-0"
 	createNamespaces(t, ns)
 	t.Cleanup(func() { deleteNamespaces(t, ns) })
+	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), snapMetricsBurdenParentIndex) })
 
 	setExporterConfig(t, clusterWideConfigYAML())
 	scaleExporter(t, 1)

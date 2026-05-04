@@ -30,7 +30,7 @@
 
 ### 目錄與責任分工
 
-- [`test/integration/run.sh`](../test/integration/run.sh)：建立或銜接 Kind（[`kind_ensure_cluster.inc.sh`](../test/integration/kind_ensure_cluster.inc.sh) 比對現有同名 cluster 節點數與 [`kind-config.yaml`](../test/integration/kind-config.yaml)，一致則重用，否則刪後重建）、等待節點 Ready、[patch ExternalIP](../test/integration/patch_kind_node_external_ips.sh)、建 image、套 manifests、呼叫 `go test`；可選列印 metrics 或 port-forward（見 `test/integration/README.md`）。
+- [`test/integration/run.sh`](../test/integration/run.sh)：建立或銜接 Kind（[`kind_ensure_cluster.inc.sh`](../test/integration/kind_ensure_cluster.inc.sh) 比對現有同名 cluster 節點數與 [`kind-config.yaml`](../test/integration/kind-config.yaml)，一致則重用，否則刪後重建）、等待節點 Ready、[patch ExternalIP](../test/integration/patch_kind_node_external_ips.sh)、建 image、套 manifests、呼叫 `go test`；可選 `INTEGRATION_PORT_FORWARD_METRICS` 於測試後前景 port-forward。metrics 快照列印由 Go 整測依 `INTEGRATION_PRINT_METRICS` 在各測試結束時輸出（見 `test/integration/README.md`）。
 - [`test/integration/kind-config.yaml`](../test/integration/kind-config.yaml)：整測用 Kind 拓樸（預設 1 control-plane + 2 worker）。
 - [`test/integration/manifests/configmap.yaml`](../test/integration/manifests/configmap.yaml)：整測用規則與預設 watcher 設定。
 - [`test/integration/e2e/e2e_test.go`](../test/integration/e2e/e2e_test.go)：`TestMain` 與 kube client 初始化。
@@ -62,8 +62,8 @@ flowchart LR
 3. exporter logs
    - 用途：失敗時快速確認 watch 模式與啟動狀態。
 
-4. （可選）除錯時的 stdout metrics / port-forward  
-   - 由 `run.sh` 在 `go test` 之後依 `INTEGRATION_PRINT_METRICS`、`INTEGRATION_PORT_FORWARD_METRICS` 等環境變數觸發；細節見 [`test/integration/README.md`](../test/integration/README.md)。
+4. （可選）除錯時的 metrics 列印 / port-forward  
+   - 設 `INTEGRATION_PRINT_METRICS=1` 時，每支與 metrics 相關的整測在結束時透過 `t.Log` 印出 exporter `/metrics` 中**與該測試相關的指標名稱**（白名單）對應的樣本列，而非整份 exposition。由 Go 測試讀取該 env。`INTEGRATION_PORT_FORWARD_METRICS` 仍由 `run.sh` 在測試後處理。細節見 [`test/integration/README.md`](../test/integration/README.md)。
 
 ## 目前測試案例
 

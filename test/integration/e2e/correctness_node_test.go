@@ -17,6 +17,7 @@ func TestCorrectness_NodeMetrics(t *testing.T) {
 			dumpLogs(t)
 		}
 	})
+	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), snapMetricsCorrectnessNode) })
 
 	setExporterConfig(t, clusterWideConfigYAML())
 	scaleExporter(t, 1)
