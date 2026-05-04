@@ -31,6 +31,7 @@ func TestTopology_ClusterWide(t *testing.T) {
 	nss := makeScenarioNamespaces(t, "top-cw", 5)
 	createNamespaces(t, nss...)
 	t.Cleanup(func() { deleteNamespaces(t, nss...) })
+	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), nil) })
 
 	// 1) Scale the exporter down so our baseline excludes its watches.
 	scaleExporter(t, 0)
@@ -69,6 +70,7 @@ func TestTopology_KindSubset(t *testing.T) {
 	nss := makeScenarioNamespaces(t, "top-ks", 2)
 	createNamespaces(t, nss...)
 	t.Cleanup(func() { deleteNamespaces(t, nss...) })
+	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), nil) })
 
 	scaleExporter(t, 0)
 	waitForSteadyState(t, 5*time.Second)
@@ -114,6 +116,7 @@ func TestTopology_PerNamespace(t *testing.T) {
 	all := append(append([]string{}, watched...), unwatched...)
 	createNamespaces(t, all...)
 	t.Cleanup(func() { deleteNamespaces(t, all...) })
+	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), snapMetricsTopologyPerNamespace) })
 
 	// Baseline without exporter.
 	scaleExporter(t, 0)
@@ -177,6 +180,7 @@ func TestTopology_IdleStable(t *testing.T) {
 			dumpLogs(t)
 		}
 	})
+	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), snapMetricsTopologyIdle) })
 	// Ensure the exporter is running cluster-wide and quiet.
 	setExporterConfig(t, clusterWideConfigYAML())
 	scaleExporter(t, 1)
