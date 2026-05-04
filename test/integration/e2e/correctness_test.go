@@ -27,6 +27,7 @@ func TestCorrectness_FixtureFlow(t *testing.T) {
 	ns := "e2e-correctness-0"
 	createNamespaces(t, ns)
 	t.Cleanup(func() { deleteNamespaces(t, ns) })
+	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), snapMetricsCorrectnessFixtureFlow) })
 
 	setExporterConfig(t, clusterWideConfigYAML())
 	scaleExporter(t, 1)
@@ -96,6 +97,7 @@ func TestCorrectness_ControllerAnnotationWithoutPodAnnotation(t *testing.T) {
 	ns := "e2e-correctness-controller-note-0"
 	createNamespaces(t, ns)
 	t.Cleanup(func() { deleteNamespaces(t, ns) })
+	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), snapMetricsCorrectnessControllerAnnotation) })
 
 	setExporterConfig(t, clusterWideConfigYAML())
 	scaleExporter(t, 1)

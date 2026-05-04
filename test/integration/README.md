@@ -40,7 +40,7 @@ go test -tags integration -v -count=1 ./test/integration/e2e/...
 - `SKIP_CLUSTER_DELETE=1`：測試後保留 cluster（僅對 runner 建立的 cluster 生效）
 - `SKIP_GO_TEST=1`：只套 manifests，不跑 `go test`
 - `INTEGRATION_PATCH_NODE_EXTERNAL_IP=0`：跳過對 Node `status.addresses` 的 ExternalIP patch（`SKIP_KIND_CREATE=1` 且不想改動既有 Node 時建議）。若關閉 patch 且 Node API 沒有 `ExternalIP`，`TestCorrectness_NodeMetrics` 會失敗
-- `INTEGRATION_PRINT_METRICS=1`：`go test` 結束後（或 `SKIP_GO_TEST=1` 且 exporter 已就緒時）列印過濾後的 `/metrics`（`it_` / `exporter_` 開頭列）；測試失敗時即使未設也會列印一次快照
+- `INTEGRATION_PRINT_METRICS=1`：每支與 metrics 相關的測試結束時，在 `t.Log` 列印該測試**事先指定的 exporter 指標名稱**之樣本列（非整份 `/metrics`）。僅斷言 kube-apiserver `/metrics` 的測試不會列印 exporter 快照。需搭配 `go test -v` 才會在 stdout 看見。未設則不列印
 - `INTEGRATION_PORT_FORWARD_METRICS=1`：測試結束後前景執行 `kubectl port-forward` 至 exporter Service（本機預設埠 `INTEGRATION_METRICS_LOCAL_PORT`，預設 `18080`）。若 cluster 由此腳本建立，必須同時設 `SKIP_CLUSTER_DELETE=1`，否則腳本會拒絕執行
 - `DOCKER_BUILD_PLATFORM=linux/amd64`：傳給 `docker build --platform`
 - `GOTEST_FLAGS='-run TestCorrectness_'`：附加到 `go test` 的額外參數

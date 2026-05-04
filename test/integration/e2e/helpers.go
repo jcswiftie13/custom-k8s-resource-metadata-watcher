@@ -319,19 +319,11 @@ func exporterPodName(t *testing.T) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cs := mustClient(t)
-	pods, err := cs.CoreV1().Pods(exporterNamespace).List(ctx, metav1.ListOptions{
-		LabelSelector: "app.kubernetes.io/name=metadata-exporter-integration",
-	})
+	pod, err := exporterPodNameErr(ctx, cs)
 	if err != nil {
-		t.Fatalf("list exporter pods: %v", err)
+		t.Fatalf("exporter pod: %v", err)
 	}
-	for _, p := range pods.Items {
-		if isPodReady(&p) {
-			return p.Name
-		}
-	}
-	t.Fatalf("no ready exporter pod found (have %d pods)", len(pods.Items))
-	return ""
+	return pod
 }
 
 func isPodReady(p *corev1.Pod) bool {
@@ -347,15 +339,8 @@ func isPodReady(p *corev1.Pod) bool {
 // /metrics scraping
 // ---------------------------------------------------------------------------
 
-// scrapeExporterMetrics returns the parsed MetricFamilies served by the
-// exporter. We reach /metrics over the API-server's pod-proxy so the tests
-// do not need to run kubectl port-forward in the background.
-func scrapeExporterMetrics(t *testing.T) map[string]*dto.MetricFamily {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	pod := exporterPodName(t)
-	cs := mustClient(t)
+// fetchExporterMetricsRawCore GETs the exporter /metrics text for a known pod name.
+func fetchExporterMetricsRawCore(ctx context.Context, cs kubernetes.Interface, pod string) ([]byte, error) {
 	// Use the `http:` scheme prefix + the *numeric* container port so the
 	// apiserver proxies cleartext HTTP to the exporter (:8080 serves plain
 	// HTTP). Using the port *name* ("metrics") here makes the apiserver's
@@ -368,7 +353,123 @@ func scrapeExporterMetrics(t *testing.T) map[string]*dto.MetricFamily {
 		Name(fmt.Sprintf("http:%s:8080", pod)).
 		SubResource("proxy").
 		Suffix("metrics")
-	body, err := req.DoRaw(ctx)
+	return req.DoRaw(ctx)
+}
+
+// exporterPodNameErr returns a ready exporter pod name or an error (no t.Fatal).
+func exporterPodNameErr(ctx context.Context, cs kubernetes.Interface) (string, error) {
+	pods, err := cs.CoreV1().Pods(exporterNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app.kubernetes.io/name=metadata-exporter-integration",
+	})
+	if err != nil {
+		return "", err
+	}
+	for _, p := range pods.Items {
+		if isPodReady(&p) {
+			return p.Name, nil
+		}
+	}
+	return "", fmt.Errorf("no ready exporter pod found (have %d pods)", len(pods.Items))
+}
+
+// fetchExporterMetricsRaw returns the raw /metrics body or a non-fatal error.
+func fetchExporterMetricsRaw(t *testing.T) ([]byte, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cs := mustClient(t)
+	pod, err := exporterPodNameErr(ctx, cs)
+	if err != nil {
+		return nil, err
+	}
+	return fetchExporterMetricsRawCore(ctx, cs, pod)
+}
+
+// promMetricNameFromDataLine returns the metric name from a Prometheus text
+// exposition sample line, or "" for comments, blanks, and non-sample lines.
+func promMetricNameFromDataLine(line string) string {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return ""
+	}
+	if i := strings.IndexByte(line, '{'); i > 0 {
+		return line[:i]
+	}
+	if i := strings.IndexByte(line, ' '); i > 0 {
+		return line[:i]
+	}
+	return line
+}
+
+// printExporterMetricsSnapshotIfEnabled logs only sample lines whose metric
+// name is in metricNames when INTEGRATION_PRINT_METRICS=1. An empty
+// metricNames skips scraping (e.g. tests that only assert apiserver metrics).
+// Failures are logged and never fail the test.
+func printExporterMetricsSnapshotIfEnabled(t *testing.T, title string, metricNames []string) {
+	t.Helper()
+	if os.Getenv("INTEGRATION_PRINT_METRICS") != "1" {
+		return
+	}
+	if len(metricNames) == 0 {
+		t.Logf("--- %s: INTEGRATION_PRINT_METRICS snapshot skipped (no exporter metric filter for this test) ---", title)
+		return
+	}
+	allow := make(map[string]struct{}, len(metricNames))
+	for _, n := range metricNames {
+		allow[n] = struct{}{}
+	}
+	body, err := fetchExporterMetricsRaw(t)
+	if err != nil {
+		t.Logf("metrics snapshot (%s): scrape failed: %v", title, err)
+		return
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(string(body), "\n") {
+		name := promMetricNameFromDataLine(line)
+		if name == "" {
+			continue
+		}
+		if _, ok := allow[name]; ok {
+			b.WriteString(strings.TrimRight(line, "\r"))
+			b.WriteByte('\n')
+		}
+	}
+	filtered := strings.TrimSuffix(b.String(), "\n")
+	if filtered == "" {
+		t.Logf("--- %s: filtered exporter /metrics (names=%v): no matching sample lines ---", title, metricNames)
+		return
+	}
+	t.Logf("--- %s: filtered exporter /metrics (names=%v) ---\n%s", title, metricNames, filtered)
+}
+
+// snapMetrics* are allowlists for printExporterMetricsSnapshotIfEnabled when
+// INTEGRATION_PRINT_METRICS=1: only sample lines for these metric names are logged.
+var (
+	snapMetricsCorrectnessFixtureFlow          = []string{"it_pod_info", "it_pod_container_info", "exporter_parent_index_size"}
+	snapMetricsCorrectnessControllerAnnotation = []string{"it_pod_info"}
+	snapMetricsCorrectnessNode                  = []string{"it_node_info", "it_node_address", "it_node_condition"}
+	snapMetricsBurdenBurst                       = []string{
+		"exporter_reconcile_total",
+		"exporter_reconcile_queue_depth",
+		"exporter_parent_index_hit_total",
+		"exporter_parent_index_fallback_total",
+		"rest_client_requests_total",
+	}
+	snapMetricsBurdenParentIndex = []string{
+		"it_pod_info",
+		"exporter_parent_index_hit_total",
+		"exporter_parent_index_fallback_total",
+	}
+	snapMetricsTopologyPerNamespace = []string{"it_pod_info"}
+	snapMetricsTopologyIdle         = []string{"exporter_reconcile_total", "exporter_reconcile_queue_depth"}
+)
+
+// scrapeExporterMetrics returns the parsed MetricFamilies served by the
+// exporter. We reach /metrics over the API-server's pod-proxy so the tests
+// do not need to run kubectl port-forward in the background.
+func scrapeExporterMetrics(t *testing.T) map[string]*dto.MetricFamily {
+	t.Helper()
+	body, err := fetchExporterMetricsRaw(t)
 	if err != nil {
 		t.Fatalf("scrape exporter /metrics via pod proxy: %v", err)
 	}
