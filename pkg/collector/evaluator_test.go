@@ -214,22 +214,19 @@ func TestCompile_InvalidJSONPath(t *testing.T) {
 	}
 }
 
-func TestCompile_FlattenExpandsAnnotations(t *testing.T) {
+func TestCompile_LabelsWithQuotedAnnotationPaths(t *testing.T) {
 	rule := &config.Rule{
 		Name:   "pod_info",
 		Anchor: "Pod",
 		Labels: map[string]config.Extract{
+			"controller_annotation_integration_test_controller_note": {
+				Path: `metadata.annotations["integration.test/controller-note"]`,
+			},
+			"controller_annotation_integration_test_missing": {
+				Path: `metadata.annotations["integration.test/missing"]`,
+			},
 			"namespace": {Path: "metadata.namespace"},
 		},
-		Flatten: []config.FlattenExtract{{
-			NamePrefix: "controller_annotation_",
-			Source:     "anchor",
-			Path:       "metadata.annotations",
-			Keys: []string{
-				"integration.test/controller-note",
-				"integration.test/missing",
-			},
-		}},
 	}
 	cr := mustCompile(t, rule)
 
@@ -264,14 +261,14 @@ func TestCompile_FlattenExpandsAnnotations(t *testing.T) {
 		values[cl.Name] = ev.EvaluateLabel(cl, func(string) map[string]interface{} { return m })
 	}
 	if got := values["controller_annotation_integration_test_controller_note"]; got != "from-fixture-deployment" {
-		t.Fatalf("flatten hit = %q", got)
+		t.Fatalf("annotation label hit = %q", got)
 	}
 	if got := values["controller_annotation_integration_test_missing"]; got != "" {
-		t.Fatalf("flatten miss should be empty, got %q", got)
+		t.Fatalf("missing key should be empty, got %q", got)
 	}
 }
 
-func TestCompile_FlattenFromTopController(t *testing.T) {
+func TestCompile_LabelFromTopControllerViaRelation(t *testing.T) {
 	rule := &config.Rule{
 		Name:   "pod_info",
 		Anchor: "Pod",
@@ -279,29 +276,27 @@ func TestCompile_FlattenFromTopController(t *testing.T) {
 			{Name: "top", Via: "topController"},
 		},
 		Labels: map[string]config.Extract{
+			"controller_annotation_integration_test_controller_note": {
+				Source: "top",
+				Path:   `metadata.annotations["integration.test/controller-note"]`,
+			},
 			"namespace": {Path: "metadata.namespace"},
 		},
-		Flatten: []config.FlattenExtract{{
-			NamePrefix: "controller_annotation_",
-			Source:     "top",
-			Path:       "metadata.annotations",
-			Keys:       []string{"integration.test/controller-note"},
-		}},
 	}
 	cr := mustCompile(t, rule)
 
-	var flatten CompiledLabel
+	var noteLabel CompiledLabel
 	for _, cl := range cr.Labels {
 		if cl.Name == "controller_annotation_integration_test_controller_note" {
-			flatten = cl
+			noteLabel = cl
 			break
 		}
 	}
-	if flatten.Name == "" {
-		t.Fatalf("flatten label not produced")
+	if noteLabel.Name == "" {
+		t.Fatalf("expected controller annotation label")
 	}
-	if flatten.Primary.Source != "topController" {
-		t.Fatalf("flatten.Primary.Source = %q, want topController", flatten.Primary.Source)
+	if noteLabel.Primary.Source != "topController" {
+		t.Fatalf("Primary.Source = %q, want topController", noteLabel.Primary.Source)
 	}
 
 	ev := NewEvaluator()
@@ -312,31 +307,29 @@ func TestCompile_FlattenFromTopController(t *testing.T) {
 			},
 		},
 	}
-	got := ev.EvaluateLabel(flatten, func(source string) map[string]interface{} {
+	got := ev.EvaluateLabel(noteLabel, func(source string) map[string]interface{} {
 		if source == "topController" {
 			return top
 		}
 		return nil
 	})
 	if got != "from-top" {
-		t.Fatalf("top flatten = %q, want from-top", got)
+		t.Fatalf("topController label = %q, want from-top", got)
 	}
 }
 
-func TestCompile_FlattenOnMissingPropagates(t *testing.T) {
+func TestCompile_LabelOnMissingForMissingMapKey(t *testing.T) {
 	onMissing := "N/A"
 	rule := &config.Rule{
 		Name:   "pod_info",
 		Anchor: "Pod",
 		Labels: map[string]config.Extract{
 			"namespace": {Path: "metadata.namespace"},
+			"pod_label_team": {
+				Path:      `metadata.labels["team"]`,
+				OnMissing: &onMissing,
+			},
 		},
-		Flatten: []config.FlattenExtract{{
-			NamePrefix: "pod_label_",
-			Path:       "metadata.labels",
-			Keys:       []string{"team"},
-			OnMissing:  &onMissing,
-		}},
 	}
 	cr := mustCompile(t, rule)
 	ev := NewEvaluator()
@@ -352,20 +345,17 @@ func TestCompile_FlattenOnMissingPropagates(t *testing.T) {
 	}
 }
 
-func TestCompile_FlattenInvalidPath(t *testing.T) {
+func TestCompile_InvalidPathOnQuotedSubscriptLabel(t *testing.T) {
 	rule := &config.Rule{
 		Name:   "pod_info",
 		Anchor: "Pod",
 		Labels: map[string]config.Extract{
 			"namespace": {Path: "metadata.namespace"},
+			"bad":       {Path: "["},
 		},
-		Flatten: []config.FlattenExtract{{
-			Path: "[",
-			Keys: []string{"x"},
-		}},
 	}
 	if _, err := Compile(rule); err == nil {
-		t.Fatal("expected invalid path error for flatten")
+		t.Fatal("expected invalid path error")
 	}
 }
 

@@ -8,7 +8,7 @@
 
 - YAML 模型、`Load`、`Validate`：`pkg/config/config.go`
 - CLI（`-config`，預設 `/etc/metadata-exporter/config.yaml`）：`cmd/main.go`
-- Path 編譯與求值：`pkg/collector/evaluator.go`、`pkg/collector/pathexpr.go`、`pkg/collector/flatten.go`
+- Path 編譯與求值：`pkg/collector/evaluator.go`、`pkg/collector/pathexpr.go`
 - Collector 組裝：`pkg/collector/collector.go`
 
 若本文件與程式碼不一致，**以原始碼為準**。
@@ -23,7 +23,7 @@
 4. [watch：限縮 informer 範圍](#4-watch限縮-informer-範圍)
 5. [rules：宣告指標](#5-rules宣告指標)
 6. [Pod 層級與容器層級](#6-pod-層級與容器層級)
-7. [展平 labels 與 annotations](#7-展平-labels-與-annotations)
+7. [以 labels 讀取 annotations 與 labels 鍵](#7-以-labels-讀取-annotations-與-labels-鍵)
 8. [範例配方](#8-範例配方)
 9. [疑難排解](#9-疑難排解)
 10. [執行期內部行為](#10-執行期內部行為)
@@ -36,7 +36,7 @@
 ### 1.1 設定必須表達的三件事
 
 1. **Watch 拓樸** — 哪些物件會進 SharedInformer 快取（`watch`），以縮小對 apiserver 的 LIST/WATCH 量。
-2. **指標契約** — 每條 `rules[]` 對應 **一個** Prometheus metric，且在啟動時即具備 **固定標籤集合**（含 `flatten` 產生的標籤）。
+2. **指標契約** — 每條 `rules[]` 對應 **一個** Prometheus metric，且在啟動時即具備 **固定標籤集合**（全部由 `labels` 宣告）。
 3. **取值語意** — 每個標籤如何從 anchor、`forEach` 的 `item`、owner 鏈（`ownerController`、`topController` 或具體 Kind）、或 **`relations` 別名** 取出字串。
 
 相關物件僅從 **informer 快取** 解析；exporter **不會**為走訪 owner 鏈而額外呼叫 API。
@@ -49,7 +49,7 @@
 | **儘早失敗** | 結構問題在 `Validate` 攔截；**path 語法**在 collector 建構、**`Compile`** 時才解析，錯誤則啟動失敗。 |
 | **時間序列形狀穩定** | 每條 rule 的標籤名稱於啟動時固定；缺值為空字串，不會省略標籤。 |
 | **YAML 鍵與 `json` struct tag 一致** | Go 結構使用 `json:"..."`；YAML 鍵為 **camelCase**（如 `metricPrefix`、`watch`、`rules`），與 `sigs.k8s.io/yaml` 慣例一致。 |
-| **驗證分兩階** | `Validate` **不**解析 `path` 字串；`Compile` 才對每條 `path`、`forEach`、flatten 的 `path` 做 `parsePath`。 |
+| **驗證分兩階** | `Validate` **不**解析 `path` 字串；`Compile` 才對每條 `path` 與 `forEach` 做 `parsePath`。 |
 
 ### 1.3 非目標
 
@@ -70,7 +70,7 @@
 
 1. `os.ReadFile` 讀取檔案。
 2. `sigs.k8s.io/yaml.Unmarshal` 填入 `*config.Config`。
-3. `cfg.Validate()`：至少一條 rule、`metricPrefix` 與各 rule 名稱組成之 Prometheus metric 名合法且不重複、每條 rule 的 `anchor`、`labels`、`relations`、`flatten` 與 `source`／`forEach` 搭配等。
+3. `cfg.Validate()`：至少一條 rule、`metricPrefix` 與各 rule 名稱組成之 Prometheus metric 名合法且不重複、每條 rule 的 `anchor`、`labels`、`relations` 與 `source`／`forEach` 搭配等。
 
 任一步失敗則在建立 Kubernetes client 或 informer **之前**結束程式。
 
@@ -78,10 +78,9 @@
 
 `collector.New(cfg, ...)` 對每個 `cfg.Rules[i]` 呼叫 `Compile(rule)`：
 
-- 將 `forEach`、各 `labels` 的 `path`、fallback 的 `path`、flatten 的 `path` 編成內部 path AST（`pkg/collector/pathexpr.go` 的 `parsePath`）。
+- 將 `forEach`、各 `labels` 的 `path`、fallback 的 `path` 編成內部 path AST（`pkg/collector/pathexpr.go` 的 `parsePath`）。
 - **`relations` 別名在編譯期消解**：`CompiledExtract.Source` 存解析後名稱（例如別名 `top` → `topController`），執行期 `srcLookup` 只用解析後鍵（`pkg/collector/evaluator.go` 的 `compileExtract`）。
-- `flatten` 產生額外編譯後標籤，並與既有 labels 合併、重排順序。
-- 向 Prometheus sink `RegisterRule` 註冊最終 metric 名（`metricPrefix + rule.name`）與**有序**標籤集合。
+- 向 Prometheus sink `RegisterRule` 註冊最終 metric 名（`metricPrefix + rule.name`）與**有序**標籤集合（依標籤名字典序）。
 
 因此 **`path` 打錯** 可能在 `Validate` 通過後，仍於 collector 初始化時失敗。
 
@@ -134,7 +133,7 @@ watch:
 
 若省略 `resources` 或留空，等同 watch 全部支援 kind（含 `Node`）且無 selector。`Validate()` 會驗證每條 `rule` 的 `anchor` 及顯式 Kind source 有列在有效 watch set 內。
 
-**遷移（breaking）**：`watch.selectors`、`watch.kinds`、`watch.namespaces` 均已移除。請改用 `watch.resources[]`。
+設定檔僅支援本文件所述欄位；`watch.selectors`、`watch.kinds`、`watch.namespaces` 等舊鍵**不**在 `WatchScope` schema 內，出現時會與其它未知 YAML 鍵一併在反序列化時被忽略。請使用 `watch.resources[]`。
 
 ### 為何重要
 
@@ -173,13 +172,13 @@ watch:
 
 ### Watch 拓樸：叢集全域 vs 每 namespace
 
-令 `K = len(watch.kinds)` 的鍵（若 `kinds` 空或省略，則 `K = 5`）。
+令 `R = len(watch.resources)`（若 `resources` 省略或空，程式會展開為**全部**支援 kind，見上文「若省略 `resources`」）。
 
-| 模式 | 觸發條件 | 開啟的 watch 量級 | 取捨 |
-|------|----------|-------------------|------|
-| 叢集全域 | `watch.namespaces` 省略或空 | 每 Kind 約一個，共 `K` 路 | 對大型叢集通常最省；仍可對每個 kind 用 `labelSelector`／`fieldSelector` 縮流。 |
-| 每 namespace | `watch.namespaces` 非空 | 約 `len(namespaces) × K` 路 | 隔離強；或搭配 `fieldSelector: metadata.name=...` 等縮到單一 Pod。 |
-| 僅部分 Kind | `kinds` 只列部分 key | 約 `K`（× namespace 段數） | 降低多餘的 GVR watch；有 `topController`／`ownerController` 但缺父 kind 時 owner 鏈易 miss。 |
+| 模式 | 觸發條件 | 開啟的 watch 量級（概念） | 取捨 |
+|------|----------|---------------------------|------|
+| 叢集全域 | 各 `WatchResource` 為 `scope: Cluster`，或 namespaced 資源未設 `namespaces` | 每個列入的 kind 約一路 informer | 對大型叢集通常最省；可對每個 kind 用 `labelSelector`／`fieldSelector` 縮流。 |
+| 每 namespace | `scope: Namespaced` 且 `namespaces` 非空 | 約 `len(namespaces) ×`（該列所涵蓋之 kind 數） | 隔離強；可搭配 `fieldSelector: metadata.name=...` 等縮到單一 Pod。 |
+| 僅部分 Kind | `resources` 只列部分 kind | 路數隨列出的 kind 變少 | 降低多餘 GVR watch；有 `topController`／`ownerController` 但未 watch 父 kind 時 owner 鏈易 miss。 |
 
 啟動日誌會印出 `watch mode = cluster-wide` 或 `per-namespace` 及 factory 數量。namespace 過濾發生在 client-go cache；叢集全域模式 **不會**因此線性增加「每次事件」的 CPU，主要影響的是對 apiserver 的 watch 扇出。
 
@@ -212,7 +211,7 @@ rules:
 
 ### `anchor`
 
-`anchor` 同時決定 **哪種資源事件會觸發 reconcile**，以及 **每筆輸出 series 的主體**。允許值：`Pod`、`Deployment`、`StatefulSet`、`DaemonSet`、`ReplicaSet`。
+`anchor` 同時決定 **哪種資源事件會觸發 reconcile**，以及 **每筆輸出 series 的主體**。允許值：`Pod`、`Deployment`、`StatefulSet`、`DaemonSet`、`ReplicaSet`、`Node`。
 
 ### `forEach`
 
@@ -282,7 +281,7 @@ rules:
 
 - 至少一條 rule；每條需非空 `name`、支援的 `anchor`、非空 `labels`。
 - `metricPrefix + name` 全叢集設定內唯一，且符合 Prometheus metric 命名。
-- `flatten` 產生的名稱不得與 `labels` 或其它 flatten 列衝突。
+- 同一 rule 內 `labels` 的鍵不得重複（由 map 結構保證）。
 - `relations` 的 `via` 合法、不得以 `item` 作為 `via`（詳見 `pkg/config/config.go` 的 `Validate`）。
 
 ---
@@ -331,9 +330,9 @@ custom_pod_container_info{namespace="prod",pod="api-abc",container="sidecar",ima
 
 ---
 
-## 7. 展平 labels 與 annotations
+## 7. 以 labels 讀取 annotations 與 labels 鍵
 
-當 `metadata.annotations` 或 `metadata.labels` 上有多個鍵值，希望變成**同一 series 上多個 Prometheus 標籤**（例如數個眾所周知的 controller annotation），可用 `flatten:` 以 **allow-list** 宣告，避免在 `labels:` 手寫大量重複 path。
+當要把 `metadata.annotations` 或 `metadata.labels` 裡**特定鍵**暴露成 Prometheus 標籤時，在 `labels:` 底下為每個鍵寫一條 `Extract`，並用 [path 語法](#path-syntax) 的**引號下標**指向該 K8s 鍵（與其它 label 完全相同，無額外 schema）。
 
 ```yaml
 rules:
@@ -344,55 +343,17 @@ rules:
     labels:
       namespace: { path: "metadata.namespace" }
       pod:       { path: "metadata.name" }
-    flatten:
-      - namePrefix: "controller_annotation_"
-        source: top                # 預設為 "anchor"
-        path: "metadata.annotations"
-        keys:
-          - "integration.test/controller-note"
-          - "integration.test/owner"
-        onMissing: ""              # 選填；預設 ""
-      - namePrefix: "pod_label_"
-        path: "metadata.labels"
-        keys: ["app.kubernetes.io/name"]
+      controller_annotation_integration_test_controller_note:
+        source: top
+        path: 'metadata.annotations["integration.test/controller-note"]'
+      controller_annotation_integration_test_owner:
+        source: top
+        path: 'metadata.annotations["integration.test/owner"]'
+      pod_label_app_kubernetes_io_name:
+        path: 'metadata.labels["app.kubernetes.io/name"]'
 ```
 
-### 欄位說明
-
-| 欄位 | 必填 | 預設 | 意義 |
-|------|------|------|------|
-| `namePrefix` | 否 | `""` | 接到每個產生之標籤名前（逐字元前綴）。 |
-| `source` | 否 | `"anchor"` | 與 `labels` 的 `source` 相同語意（`item` 仍須有 `forEach`）。 |
-| `path` | 是 | | 須能解析為 `map[string]interface{}`（常為 `metadata.annotations`／`metadata.labels`）。 |
-| `keys` | 是 | | 非空、同條目內鍵不可重複。 |
-| `onMissing` | 否 | `""` | 某鍵在 map 中不存在，或整段 `path` miss 時之值。 |
-
-### 名稱產生與清理（sanitize）
-
-Prometheus 標籤須符合 `[a-zA-Z_][a-zA-Z0-9_]*`。Kubernetes 的 annotation／label 鍵常含 `.`、`/`、`-`，故每個 `key` 會經決定性清理後再接 `namePrefix`：
-
-- 不在 `[A-Za-z0-9_]` 的字元改為 `_`。
-- 若首字元為數字，結果前會再加 `_`。
-
-| 鍵 | 清理後片段 |
-|----|------------|
-| `integration.test/controller-note` | `integration_test_controller_note` |
-| `app.kubernetes.io/name` | `app_kubernetes_io_name` |
-| `123abc` | `_123abc` |
-
-最終標籤名為 `namePrefix + sanitize(key)`，啟動時會檢查命名規則；不得以 `__` 開頭（Prometheus 保留）。
-
-### 碰撞規則
-
-同一 rule 內，若 `labels:` 與 `flatten:` 或不同 `flatten` 列產生相同標籤名，啟動即失敗。儀表板可假設每個 metric 的標籤集合 **固定且無衝突**。
-
-### Miss 語意
-
-若 `path` 解析結果**不是 map**（缺欄位、型別錯誤等），整段 flatten 視為 total miss：該列產生的**所有**標籤皆取該列的 `onMissing`。若 map 存在但某 `key` 不存在，僅該標籤 miss。
-
-與其餘設定一致：**固定標籤集合**，miss 為空字串而非刪標籤。
-
-**設計說明**：flatten 在編譯期為每個 key append path segment（`pkg/collector/flatten.go` 的 `compileFlatten`），避免在 path 字串內塞入任意 annotation 字元。
+Prometheus 標籤名須符合 `[a-zA-Z_][a-zA-Z0-9_]*` 且不得以 `__` 開頭；請在 YAML 裡**自行選擇**合法的 `labels` 鍵名（上例採描述性蛇形命名）。某條 `path` miss 時行為與其它 label 相同：走 `fallbacks` 與 `onMissing`，不會從 series 上移除該標籤。
 
 ---
 
@@ -442,14 +403,15 @@ rules:
 
 ```yaml
 watch:
-  namespaces: ["prod"]
-  kinds:
-    Pod:
+  resources:
+    - kind: Pod
+      scope: Namespaced
+      namespaces: ["prod"]
       labelSelector: "app.kubernetes.io/part-of=payments"
     # 其他 kind 不列 = 不 watch；使用 topController 等時需自行權衡是否補上
 ```
 
-Parent（`ReplicaSet` / `Deployment` 等）若也縮了 selector 或從 `kinds` 省略，owner 鏈易 miss，請見第 4 節「Owner 鏈」風險；通常 parent 的選擇應**寬於** Pod 或一併把需要的 kind 納入 `kinds`。
+Parent（`ReplicaSet` / `Deployment` 等）若也縮了 selector 或從 `resources` 省略，owner 鏈易 miss，請見第 4 節「Owner 鏈」風險；通常 parent 的選擇應**寬於** Pod 或一併把需要的 kind 納入 `resources`。
 
 ### 8.4 以 Deployment 為 anchor
 
@@ -475,7 +437,7 @@ rules:
 | Static Pod 沒有 controller 類標籤 | Static Pod 無 owner references。 | 預期行為；可對 anchor 加 `fallbacks` 或設 `onMissing`。 |
 | 啟動錯誤提到 `fieldSelector` | 欄位不在該資源白名單。 | 改為 `labelSelector` 或移除。 |
 | 警告「pod selector combined with stricter parent selector …」 | parent 被 filter 掉，owner 鏈斷裂。 | 放寬或移除 parent 的過窄 selector。 |
-| 警告「not all parent kinds are watched」 | 規則使用 `topController`／`ownerController`，但 `watch.kinds` 未納入典型 owner 鏈所要的 parent kind。 | 補上 `ReplicaSet` 等，或放寬 `kinds`；屬可預期，指標中 parent 欄位可能空。 |
+| 警告「not all parent kinds are watched」 | 規則使用 `topController`／`ownerController`，但 `watch.resources` 未納入典型 owner 鏈所要的 parent kind。 | 補上 `ReplicaSet` 等，或放寬 selector；屬可預期，指標中 parent 欄位可能空。 |
 | `metrics-addr` 連不上 | 容器埠不符或程式在驗證階段即退出。 | 查日誌；readiness 通常打 `/healthz`。 |
 
 ---
@@ -514,12 +476,11 @@ rules:
 
 | 概念 | 主要程式位置 |
 |------|----------------|
-| 根 `Config`、`WatchScope`、`Rule`、`Extract`、`FlattenExtract`、`RelationAlias` | `pkg/config/config.go`（`json` tag = YAML 鍵） |
-| `Load`（回絕舊的 `watch.selectors`）、`Validate`、`WatchScope.EffectiveKinds`、`ResolveRelation` | `pkg/config/config.go` |
+| 根 `Config`、`WatchScope`、`Rule`、`Extract`、`RelationAlias` | `pkg/config/config.go`（`json` tag = YAML 鍵） |
+| `Load`、`Validate`、`WatchScope.EffectiveKinds`、`ResolveRelation` | `pkg/config/config.go` |
 | CLI `-config` 與 `collector.New` 銜接 | `cmd/main.go` |
 | `Compile`、`CompiledRule`、標籤求值順序 | `pkg/collector/evaluator.go` |
 | Path 文法（`parsePath`、`evaluate`） | `pkg/collector/pathexpr.go` |
-| Flatten 編譯 | `pkg/collector/flatten.go` |
 | `cfg.Watch` → informers；每 rule `Compile` 與 `RegisterRule` | `pkg/collector/collector.go` |
 | 整合測設定形狀 | `test/integration/e2e/config_yaml.go` |
 | 架構長文 | `docs/METADATA_EXPORTER_DEEP_DIVE.md`、`docs/AI_REFERENCE_METADATA_EXPORTER.md` |

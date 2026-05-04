@@ -158,90 +158,6 @@ type Rule struct {
 
 	// Labels maps Prometheus label name -> Extract producing its value.
 	Labels map[string]Extract `json:"labels"`
-
-	// Flatten expands map-valued fields (e.g. metadata.annotations or
-	// metadata.labels) into a fixed set of additional Prometheus labels
-	// using an explicit allow-list of keys. Each entry contributes
-	// len(Keys) synthetic labels on top of Labels.
-	Flatten []FlattenExtract `json:"flatten,omitempty"`
-}
-
-// FlattenExtract declares an allow-list of keys to pull out of a map-valued
-// path on a given source, producing one Prometheus label per key. The
-// resulting label names are formed as NamePrefix + SanitizeLabelName(key),
-// and must not collide with any entry in Rule.Labels or other flatten
-// expansions within the same rule.
-type FlattenExtract struct {
-	// NamePrefix is prepended verbatim to every generated label name.
-	// Defaults to "". The final name must still satisfy the Prometheus
-	// label-name grammar ([a-zA-Z_][a-zA-Z0-9_]*) and must not start
-	// with "__".
-	NamePrefix string `json:"namePrefix,omitempty"`
-
-	// Source names the object to evaluate Path against. Defaults to
-	// "anchor". Follows the same rules as Extract.Source.
-	Source string `json:"source,omitempty"`
-
-	// Path must resolve to a map[string]interface{} (e.g.
-	// "metadata.annotations" or "metadata.labels"). Paths that resolve
-	// to anything else are treated as a total miss and OnMissing is used.
-	Path string `json:"path"`
-
-	// Keys is the non-empty list of map keys to extract. Keys may contain
-	// characters that are illegal in Prometheus label names (e.g. '.',
-	// '/', '-'); those are replaced with '_' when forming the label name.
-	Keys []string `json:"keys"`
-
-	// OnMissing is returned when a key is absent. When nil, the empty
-	// string is used (consistent with the existing Extract semantics).
-	OnMissing *string `json:"onMissing,omitempty"`
-}
-
-// EffectiveSource returns the source name after applying the "anchor" default.
-func (f FlattenExtract) EffectiveSource() string {
-	if f.Source == "" {
-		return "anchor"
-	}
-	return f.Source
-}
-
-// OnMissingValue returns the configured fallback string (defaulting to "").
-func (f FlattenExtract) OnMissingValue() string {
-	if f.OnMissing == nil {
-		return ""
-	}
-	return *f.OnMissing
-}
-
-// SanitizeLabelName coerces an arbitrary string into a valid Prometheus
-// label name. Any character outside [A-Za-z0-9_] is replaced with '_', and
-// if the first rune is not a letter or underscore (e.g. it is a digit, or
-// a symbol that was just rewritten to '_' but happened to be a digit) the
-// result is prefixed with '_'. Callers are still expected to prepend a
-// namePrefix and re-check against promLabelNameRe.
-func SanitizeLabelName(s string) string {
-	if s == "" {
-		return ""
-	}
-	out := make([]rune, 0, len(s)+1)
-	first := true
-	for _, r := range s {
-		legal := r == '_' ||
-			(r >= 'a' && r <= 'z') ||
-			(r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9')
-		if !legal {
-			r = '_'
-		}
-		if first {
-			if r >= '0' && r <= '9' {
-				out = append(out, '_')
-			}
-			first = false
-		}
-		out = append(out, r)
-	}
-	return string(out)
 }
 
 // RelationAlias gives a short local name to a source.
@@ -284,13 +200,6 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config %q: %w", path, err)
 	}
-	var doc map[string]interface{}
-	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		return nil, fmt.Errorf("parse config %q: %w", path, err)
-	}
-	if err := rejectLegacyWatchSelectors(path, doc); err != nil {
-		return nil, err
-	}
 	cfg := &Config{}
 	if err := yaml.Unmarshal(raw, cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
@@ -299,27 +208,6 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("invalid config %q: %w", path, err)
 	}
 	return cfg, nil
-}
-
-func rejectLegacyWatchSelectors(path string, doc map[string]interface{}) error {
-	w, ok := doc["watch"]
-	if !ok || w == nil {
-		return nil
-	}
-	wmap, ok := w.(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	if _, has := wmap["selectors"]; has {
-		return fmt.Errorf("config %q: watch.selectors is no longer supported; use watch.resources (see docs/CONFIG.md)", path)
-	}
-	if _, has := wmap["kinds"]; has {
-		return fmt.Errorf("config %q: watch.kinds is no longer supported in v2; use watch.resources", path)
-	}
-	if _, has := wmap["namespaces"]; has {
-		return fmt.Errorf("config %q: watch.namespaces is no longer supported in v2; use watch.resources[].namespaces", path)
-	}
-	return nil
 }
 
 // Validate performs structural checks. The caller is expected to run a
@@ -385,7 +273,7 @@ func (c *Config) validateWatchKinds() error {
 	return nil
 }
 
-// requiredWatchKinds are kinds the rule's anchor and explicit label/flatten
+// requiredWatchKinds are kinds the rule's anchor and explicit label
 // sources need to have in the informer cache (excludes ownerController/topController).
 func (r *Rule) requiredWatchKinds() map[string]struct{} {
 	out := map[string]struct{}{}
@@ -405,9 +293,6 @@ func (r *Rule) requiredWatchKinds() map[string]struct{} {
 		for _, f := range ext.Fallbacks {
 			add(f.EffectiveSource())
 		}
-	}
-	for _, fl := range r.Flatten {
-		add(fl.EffectiveSource())
 	}
 	return out
 }
@@ -469,7 +354,6 @@ func (r *Rule) validate() error {
 	}
 
 	hasForEach := r.ForEach != ""
-	seenLabelName := make(map[string]struct{}, len(r.Labels)+len(r.Flatten))
 	for name, extract := range r.Labels {
 		if !promLabelNameRe.MatchString(name) {
 			return fmt.Errorf("labels[%q]: invalid Prometheus label name (must match [a-zA-Z_][a-zA-Z0-9_]*)", name)
@@ -480,53 +364,6 @@ func (r *Rule) validate() error {
 		if err := extract.validate(validSources, hasForEach); err != nil {
 			return fmt.Errorf("labels[%q]: %w", name, err)
 		}
-		seenLabelName[name] = struct{}{}
-	}
-
-	for i, f := range r.Flatten {
-		if err := f.validate(validSources, hasForEach); err != nil {
-			return fmt.Errorf("flatten[%d]: %w", i, err)
-		}
-		for j, key := range f.Keys {
-			name := f.NamePrefix + SanitizeLabelName(key)
-			if !promLabelNameRe.MatchString(name) {
-				return fmt.Errorf("flatten[%d].keys[%d]: key %q produces invalid Prometheus label name %q", i, j, key, name)
-			}
-			if strings.HasPrefix(name, "__") {
-				return fmt.Errorf("flatten[%d].keys[%d]: key %q produces label name %q starting with __ (reserved)", i, j, key, name)
-			}
-			if _, dup := seenLabelName[name]; dup {
-				return fmt.Errorf("flatten[%d].keys[%d]: key %q produces label name %q that collides with an existing label", i, j, key, name)
-			}
-			seenLabelName[name] = struct{}{}
-		}
-	}
-	return nil
-}
-
-func (f FlattenExtract) validate(validSources map[string]struct{}, forEachActive bool) error {
-	src := f.EffectiveSource()
-	if _, ok := validSources[src]; !ok {
-		return fmt.Errorf("source %q is not recognised", src)
-	}
-	if src == "item" && !forEachActive {
-		return fmt.Errorf("source=item requires forEach on the rule")
-	}
-	if strings.TrimSpace(f.Path) == "" {
-		return fmt.Errorf("path: required")
-	}
-	if len(f.Keys) == 0 {
-		return fmt.Errorf("keys: at least one key is required")
-	}
-	seenKey := make(map[string]struct{}, len(f.Keys))
-	for i, k := range f.Keys {
-		if strings.TrimSpace(k) == "" {
-			return fmt.Errorf("keys[%d]: must be a non-empty string", i)
-		}
-		if _, dup := seenKey[k]; dup {
-			return fmt.Errorf("keys[%d]: duplicated key %q", i, k)
-		}
-		seenKey[k] = struct{}{}
 	}
 	return nil
 }

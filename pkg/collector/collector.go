@@ -194,11 +194,6 @@ func ruleUsesParentChain(r *config.Rule) bool {
 			}
 		}
 	}
-	for _, f := range r.Flatten {
-		if try(f.EffectiveSource()) {
-			return true
-		}
-	}
 	return false
 }
 
@@ -227,9 +222,6 @@ func collectReadKinds(r *config.Rule) map[string]struct{} {
 		for _, f := range ext.Fallbacks {
 			addSource(f.EffectiveSource())
 		}
-	}
-	for _, fl := range r.Flatten {
-		addSource(fl.EffectiveSource())
 	}
 	return out
 }

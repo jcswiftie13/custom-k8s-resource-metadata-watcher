@@ -43,7 +43,7 @@ func TestCorrectness_FixtureFlow(t *testing.T) {
 	if got := countPodInfoSeries(mfs, ns, dep.Name); got < int(replicas) {
 		t.Fatalf("it_pod_info series for controller=%s: got %d, want >= %d", dep.Name, got, replicas)
 	}
-	// Assert the flattened annotation label is present.
+	// Assert the controller annotation label is present.
 	if !podInfoHasAnnotation(mfs, ns, "from-fixture-deployment", int(replicas)) {
 		t.Errorf("controller_annotation_integration_test_controller_note label missing on it_pod_info in ns=%s", ns)
 	}
