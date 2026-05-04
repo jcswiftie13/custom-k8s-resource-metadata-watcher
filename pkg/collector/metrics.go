@@ -14,17 +14,15 @@ type selfMetrics struct {
 	parentFallback   prometheus.Counter
 	parentIndexed    prometheus.Counter
 	parentIndexSize  prometheus.Collector
-	updateFilterSize prometheus.GaugeFunc
 }
 
 // sizeProviders bundles the "current map size" callbacks the gauges need.
 // Splitting them out keeps newSelfMetrics independent of the collector
 // struct's internal layout.
 type sizeProviders struct {
-	queueDepth       func() float64
-	parentByParent   func() float64
-	parentByAnchor   func() float64
-	updateFilterSize func() float64
+	queueDepth     func() float64
+	parentByParent func() float64
+	parentByAnchor func() float64
 }
 
 // newSelfMetrics registers the collector self-metrics against the supplied
@@ -63,10 +61,6 @@ func newSelfMetrics(reg prometheus.Registerer, sp sizeProviders) *selfMetrics {
 				"by_anchor": sp.parentByAnchor,
 			},
 		),
-		updateFilterSize: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-			Name: "exporter_update_filter_size",
-			Help: "Current number of cached metadata digests used by the update-event filter.",
-		}, sp.updateFilterSize),
 	}
 	if reg != nil {
 		reg.MustRegister(
@@ -76,7 +70,6 @@ func newSelfMetrics(reg prometheus.Registerer, sp sizeProviders) *selfMetrics {
 			m.parentFallback,
 			m.parentIndexed,
 			m.parentIndexSize,
-			m.updateFilterSize,
 		)
 	}
 	return m

@@ -16,7 +16,7 @@ import (
 // watchedKinds are the plural resource names recorded by kube-apiserver in
 // `apiserver_longrunning_requests{resource=...}`. Keep in sync with
 // pkg/config/config.go:allSupportedKindOrder when the default is to watch all kinds.
-var watchedKinds = []string{"pods", "replicasets", "deployments", "statefulsets", "daemonsets"}
+var watchedKinds = []string{"pods", "replicasets", "deployments", "statefulsets", "daemonsets", "nodes"}
 
 // TestTopology_ClusterWide verifies that the exporter opens exactly one
 // WATCH per kind regardless of how many namespaces exist in the cluster.
@@ -58,7 +58,7 @@ func TestTopology_ClusterWide(t *testing.T) {
 	assertExporterLogContains(t, "watch mode = cluster-wide")
 }
 
-// TestTopology_KindSubset verifies that watch.kinds limits which GVRs get a
+// TestTopology_KindSubset verifies that watch.resources limits which GVRs get a
 // WATCH: only pods and deployments open a connection; others do not.
 func TestTopology_KindSubset(t *testing.T) {
 	t.Cleanup(func() {
@@ -90,7 +90,7 @@ func TestTopology_KindSubset(t *testing.T) {
 			t.Errorf("kind-subset: watch delta for resource=%q = %v, want 1", k, got)
 		}
 	}
-	for _, k := range []string{"replicasets", "statefulsets", "daemonsets"} {
+	for _, k := range []string{"replicasets", "statefulsets", "daemonsets", "nodes"} {
 		if got := delta[k]; got != 0 {
 			t.Errorf("kind-subset: watch delta for resource=%q = %v, want 0", k, got)
 		}
@@ -101,7 +101,7 @@ func TestTopology_KindSubset(t *testing.T) {
 }
 
 // TestTopology_PerNamespace verifies that watches scale as N_ns × N_kinds
-// when watch.namespaces lists specific namespaces, and that namespaces
+// when watch.resources includes per-kind namespaces, and that namespaces
 // outside the list are not observed.
 func TestTopology_PerNamespace(t *testing.T) {
 	t.Cleanup(func() {
@@ -138,8 +138,12 @@ func TestTopology_PerNamespace(t *testing.T) {
 
 	wantPerKind := float64(len(watched))
 	for _, k := range watchedKinds {
-		if got := delta[k]; got != wantPerKind {
-			t.Errorf("per-namespace: watch delta for resource=%q = %v, want %v", k, got, wantPerKind)
+		want := wantPerKind
+		if k == "nodes" {
+			want = 1
+		}
+		if got := delta[k]; got != want {
+			t.Errorf("per-namespace: watch delta for resource=%q = %v, want %v", k, got, want)
 		}
 	}
 
@@ -195,9 +199,16 @@ func TestTopology_IdleStable(t *testing.T) {
 		t.Errorf("idle: expected queue depth 0, got %v", depth)
 	}
 
-	// Reconcile counter must not have moved (resync period is 0).
-	if diff := reconcileAfter - reconcileBefore; diff != 0 {
-		t.Errorf("idle: reconcile_total moved by %v over idle window; expected 0", diff)
+	// Reconcile counter should stay near-flat. With Node watched, kubelet-driven
+	// heartbeat/condition updates can trigger a tiny amount of background reconcile.
+	// Extra nodes increase baseline node churn slightly (multi-node Kind).
+	nodeCount := len(listNodes(t))
+	if nodeCount < 1 {
+		nodeCount = 1
+	}
+	maxIdleReconcileDelta := 5.0 + 2.0*float64(nodeCount-1)
+	if diff := reconcileAfter - reconcileBefore; diff > maxIdleReconcileDelta {
+		t.Errorf("idle: reconcile_total moved by %v over idle window; expected <= %v (nodes=%d)", diff, maxIdleReconcileDelta, nodeCount)
 	}
 
 	// Watch connections should be identical across the idle window.

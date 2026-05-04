@@ -130,7 +130,7 @@ func findControllerRef(refs []metav1.OwnerReference) *metav1.OwnerReference {
 
 func isSupportedKind(kind string) bool {
 	switch kind {
-	case "Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet":
+	case "Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet", "Node":
 		return true
 	}
 	return false
@@ -149,6 +149,8 @@ func kindOf(obj runtime.Object) string {
 		return "StatefulSet"
 	case *appsv1.DaemonSet:
 		return "DaemonSet"
+	case *corev1.Node:
+		return "Node"
 	}
 	return ""
 }

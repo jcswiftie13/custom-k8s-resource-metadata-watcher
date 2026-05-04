@@ -3,7 +3,6 @@ package collector
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"strings"
 	"sync"
@@ -13,7 +12,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -68,10 +66,6 @@ type Collector struct {
 	// parent events to exactly the anchors that observed them last.
 	parents *parentIndex
 
-	// updateFilter caches metadata digests per object UID so identical
-	// Update events become no-ops before they reach the queue.
-	updateFilter *updateDigestCache
-
 	workers int
 	metrics *selfMetrics
 
@@ -99,7 +93,6 @@ func New(cfg *config.Config, client kubernetes.Interface, s sink.MetadataSink, l
 		rulesByReadKind: map[string][]*CompiledRule{},
 		metricNames:     map[string]string{},
 		parents:         newParentIndex(),
-		updateFilter:    newUpdateDigestCache(),
 		workers:         workers,
 	}
 
@@ -117,9 +110,6 @@ func New(cfg *config.Config, client kubernetes.Interface, s sink.MetadataSink, l
 		parentByAnchor: func() float64 {
 			_, byAnchor := c.parents.Len()
 			return float64(byAnchor)
-		},
-		updateFilterSize: func() float64 {
-			return float64(c.updateFilter.Len())
 		},
 	})
 
@@ -350,7 +340,7 @@ func (c *Collector) attachAnchorHandler(kind string, inf cache.SharedIndexInform
 				return
 			}
 			oldO, _ := asRuntimeObject(oldObj)
-			if oldO != nil && !c.updateFilter.Changed(oldO, newO) {
+			if oldO != nil && !updateEnqueueCandidate(oldO, newO) {
 				return
 			}
 			c.enqueueObject(newO, kind)
@@ -371,7 +361,6 @@ func (c *Collector) attachAnchorHandler(kind string, inf cache.SharedIndexInform
 			}
 			ref := anchorRef{AnchorKind: kind, Namespace: m.GetNamespace(), Name: m.GetName()}
 			c.parents.Forget(ref)
-			c.updateFilter.Forget(m.GetUID())
 			anchorKey := NamespaceName(o)
 			for _, rule := range c.byAnchor[kind] {
 				c.sink.ReplaceForAnchor(c.metricNames[rule.Rule.Name], anchorKey, nil)
@@ -388,7 +377,7 @@ func (c *Collector) attachParentHandler(kind string, inf cache.SharedIndexInform
 	if !has || len(rules) == 0 {
 		return
 	}
-	dispatch := func(obj interface{}, filtered bool) {
+	dispatch := func(obj interface{}) {
 		o, ok := asRuntimeObject(obj)
 		if !ok {
 			if ts, isTombstone := obj.(cache.DeletedFinalStateUnknown); isTombstone {
@@ -401,9 +390,6 @@ func (c *Collector) attachParentHandler(kind string, inf cache.SharedIndexInform
 		meta, ok := metaAccessor(o)
 		if !ok {
 			return
-		}
-		if filtered {
-			c.updateFilter.Forget(meta.GetUID()) // not a direct-anchor object; keep cache small
 		}
 		// Index lookup first.
 		if refs, hit := c.parents.AnchorsFor(meta.GetUID()); hit {
@@ -439,19 +425,19 @@ func (c *Collector) attachParentHandler(kind string, inf cache.SharedIndexInform
 		}
 	}
 	_, _ = inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) { dispatch(obj, false) },
+		AddFunc: func(obj interface{}) { dispatch(obj) },
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			newO, ok := asRuntimeObject(newObj)
 			if !ok {
 				return
 			}
 			oldO, _ := asRuntimeObject(oldObj)
-			if oldO != nil && !c.updateFilter.Changed(oldO, newO) {
+			if oldO != nil && !updateEnqueueCandidate(oldO, newO) {
 				return
 			}
-			dispatch(newObj, true)
+			dispatch(newObj)
 		},
-		DeleteFunc: func(obj interface{}) { dispatch(obj, true) },
+		DeleteFunc: func(obj interface{}) { dispatch(obj) },
 	})
 }
 
@@ -579,104 +565,19 @@ func asRuntimeObject(obj interface{}) (runtime.Object, bool) {
 	return nil, false
 }
 
-// updateDigestCache memoises a digest over the fields the collector actually
-// reads (metadata.generation, labels, annotations). Update events whose
-// digest matches the previous value skip the reconcile pipeline entirely.
-type updateDigestCache struct {
-	mu sync.Mutex
-	m  map[types.UID]uint64
-}
-
-func newUpdateDigestCache() *updateDigestCache {
-	return &updateDigestCache{m: map[types.UID]uint64{}}
-}
-
-// Changed returns true when the observed metadata digest differs from the
-// previously cached one, or when no cached entry exists. The new digest is
-// stored on the way out so subsequent events can compare against it.
-func (u *updateDigestCache) Changed(oldObj, newObj runtime.Object) bool {
+// updateEnqueueCandidate reports whether an informer Update should enqueue
+// work. Identical resourceVersion pairs are skipped so duplicate relist
+// deliveries do not churn the queue; any real apiserver revision bump
+// (including status-only) enqueues, matching kube-state-metrics semantics.
+func updateEnqueueCandidate(oldObj, newObj runtime.Object) bool {
+	if oldObj == nil {
+		return true
+	}
 	oldMeta, okOld := metaAccessor(oldObj)
 	newMeta, okNew := metaAccessor(newObj)
 	if !okOld || !okNew {
 		return true
 	}
-	if oldMeta.GetResourceVersion() == newMeta.GetResourceVersion() {
-		return false
-	}
-	digest := metaDigest(newMeta)
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	prev, had := u.m[newMeta.GetUID()]
-	u.m[newMeta.GetUID()] = digest
-	if !had {
-		return true
-	}
-	return prev != digest
+	return oldMeta.GetResourceVersion() != newMeta.GetResourceVersion()
 }
 
-// Forget removes the cached digest for a UID. Called on delete events to
-// prevent unbounded growth across the process lifetime.
-func (u *updateDigestCache) Forget(uid types.UID) {
-	if uid == "" {
-		return
-	}
-	u.mu.Lock()
-	delete(u.m, uid)
-	u.mu.Unlock()
-}
-
-// Len returns the number of cached digests. Exposed for leak-detection
-// gauges in integration tests.
-func (u *updateDigestCache) Len() int {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return len(u.m)
-}
-
-// metaDigest hashes the fields that can affect the rendered label set:
-// metadata.generation (catches spec-affecting changes cheaply), metadata
-// labels, and metadata annotations. Status-only changes (e.g. a heartbeat
-// update on a Node) are intentionally ignored because the collector never
-// reads them.
-func metaDigest(m metav1.Object) uint64 {
-	h := fnv.New64a()
-	var buf [20]byte
-	gen := m.GetGeneration()
-	for i := 0; i < 8; i++ {
-		buf[i] = byte(gen >> (i * 8))
-	}
-	_, _ = h.Write(buf[:8])
-	writeMap(h, m.GetLabels())
-	_, _ = h.Write([]byte{0})
-	writeMap(h, m.GetAnnotations())
-	return h.Sum64()
-}
-
-func writeMap(h interface{ Write([]byte) (int, error) }, kv map[string]string) {
-	keys := make([]string, 0, len(kv))
-	for k := range kv {
-		keys = append(keys, k)
-	}
-	sortStrings(keys)
-	for _, k := range keys {
-		_, _ = h.Write([]byte(k))
-		_, _ = h.Write([]byte{'='})
-		_, _ = h.Write([]byte(kv[k]))
-		_, _ = h.Write([]byte{'\n'})
-	}
-}
-
-func sortStrings(s []string) {
-	// Avoid an extra import for a trivial insertion sort (cache keys are a
-	// handful of entries in practice).
-	for i := 1; i < len(s); i++ {
-		j := i
-		for j > 0 && s[j-1] > s[j] {
-			s[j-1], s[j] = s[j], s[j-1]
-			j--
-		}
-	}
-}
-
-// metav1 unused-import guard.
-var _ = metav1.ObjectMeta{}

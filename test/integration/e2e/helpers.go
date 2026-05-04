@@ -109,6 +109,31 @@ func repoRootFromEnv() (string, error) {
 	return "", fmt.Errorf("go.mod not found starting from %s", wd)
 }
 
+// patchKindNodeExternalIPs runs test/integration/patch_kind_node_external_ips.sh
+// so each Node's status has an RFC5737 ExternalIP. Kind's kubelet may overwrite
+// status.addresses after the runner's initial patch (run.sh); call this again
+// immediately before assertions that require ExternalIP in the API and metrics.
+func patchKindNodeExternalIPs(t *testing.T) {
+	t.Helper()
+	root := shared.repoRoot
+	if root == "" {
+		var err error
+		root, err = repoRootFromEnv()
+		if err != nil {
+			t.Fatalf("repo root for patch script: %v", err)
+		}
+	}
+	script := filepath.Join(root, "test/integration/patch_kind_node_external_ips.sh")
+	cmd := exec.Command("bash", script)
+	cmd.Env = os.Environ()
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("patch_kind_node_external_ips.sh: %v\n%s", err, out.String())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Namespace lifecycle
 // ---------------------------------------------------------------------------
@@ -572,6 +597,19 @@ func createFixtureDeployment(t *testing.T, namespace, name string, replicas int3
 		t.Fatalf("create deployment %s/%s: %v", namespace, name, err)
 	}
 	return created
+}
+
+// listNodes returns current cluster nodes for integration assertions.
+func listNodes(t *testing.T) []corev1.Node {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cs := mustClient(t)
+	nodes, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	return nodes.Items
 }
 
 // waitForDeploymentReady blocks until the Deployment reports ready replicas

@@ -369,12 +369,10 @@ func TestValidate_FlattenItemSourceRequiresForEach(t *testing.T) {
 	}
 }
 
-func TestValidate_RejectsUnknownKindInWatchKinds(t *testing.T) {
+func TestValidate_RejectsUnknownKindInWatchResources(t *testing.T) {
 	c := &Config{
 		Watch: WatchScope{
-			Kinds: map[string]KindWatch{
-				"Job": {},
-			},
+			Resources: []WatchResource{{Kind: "Job", Scope: ScopeNamespaced}},
 		},
 		Rules: []Rule{{
 			Name:   "pod_info",
@@ -386,16 +384,14 @@ func TestValidate_RejectsUnknownKindInWatchKinds(t *testing.T) {
 	}
 	err := c.Validate()
 	if err == nil || !strings.Contains(err.Error(), "unknown kind") {
-		t.Fatalf("expected unknown kind in watch.kinds, got: %v", err)
+		t.Fatalf("expected unknown kind in watch.resources, got: %v", err)
 	}
 }
 
-func TestValidate_RejectsAnchorMissingFromWatchKinds(t *testing.T) {
+func TestValidate_RejectsAnchorMissingFromWatchResources(t *testing.T) {
 	c := &Config{
 		Watch: WatchScope{
-			Kinds: map[string]KindWatch{
-				"Pod": {},
-			},
+			Resources: []WatchResource{{Kind: "Pod", Scope: ScopeNamespaced}},
 		},
 		Rules: []Rule{{
 			Name:   "dep_info",
@@ -406,17 +402,15 @@ func TestValidate_RejectsAnchorMissingFromWatchKinds(t *testing.T) {
 		}},
 	}
 	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "not included in watch.kinds") {
-		t.Fatalf("expected anchor not in watch.kinds error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "not included in watch.resources") {
+		t.Fatalf("expected anchor not in watch.resources error, got: %v", err)
 	}
 }
 
-func TestValidate_RejectsExplicitKindSourceMissingFromWatchKinds(t *testing.T) {
+func TestValidate_RejectsExplicitKindSourceMissingFromWatchResources(t *testing.T) {
 	c := &Config{
 		Watch: WatchScope{
-			Kinds: map[string]KindWatch{
-				"Pod": {},
-			},
+			Resources: []WatchResource{{Kind: "Pod", Scope: ScopeNamespaced}},
 		},
 		Rules: []Rule{{
 			Name:   "pod_info",
@@ -428,7 +422,7 @@ func TestValidate_RejectsExplicitKindSourceMissingFromWatchKinds(t *testing.T) {
 		}},
 	}
 	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "not included in watch.kinds") {
+	if err == nil || !strings.Contains(err.Error(), "not included in watch.resources") {
 		t.Fatalf("expected required kind error, got: %v", err)
 	}
 }
@@ -436,9 +430,7 @@ func TestValidate_RejectsExplicitKindSourceMissingFromWatchKinds(t *testing.T) {
 func TestValidate_AllowsTopControllerWithSubsetWatchKinds(t *testing.T) {
 	c := &Config{
 		Watch: WatchScope{
-			Kinds: map[string]KindWatch{
-				"Pod": {},
-			},
+			Resources: []WatchResource{{Kind: "Pod", Scope: ScopeNamespaced}},
 		},
 		Rules: []Rule{{
 			Name:   "pod_info",
@@ -457,7 +449,7 @@ func TestValidate_AllowsTopControllerWithSubsetWatchKinds(t *testing.T) {
 	}
 }
 
-func TestValidate_DefaultsEmptyWatchKindsToAllSupported(t *testing.T) {
+func TestValidate_DefaultsEmptyWatchResourcesToAllSupported(t *testing.T) {
 	c := &Config{
 		Rules: []Rule{{
 			Name:   "pod_info",
@@ -471,19 +463,19 @@ func TestValidate_DefaultsEmptyWatchKindsToAllSupported(t *testing.T) {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	eff := c.Watch.EffectiveKinds()
-	if len(eff) != 5 {
-		t.Fatalf("EffectiveKinds: got len %d, want 5", len(eff))
+	if len(eff) != 6 {
+		t.Fatalf("EffectiveKinds: got len %d, want 6", len(eff))
 	}
 }
 
 func TestWatchScope_EffectiveKinds_ExplicitOrder(t *testing.T) {
 	w := WatchScope{
-		Kinds: map[string]KindWatch{
-			"Deployment":  {},
-			"Pod":           {FieldSelector: "status.phase=Running"},
-			"ReplicaSet":    {},
-			"StatefulSet":   {},
-			"DaemonSet":     {},
+		Resources: []WatchResource{
+			{Kind: "Deployment", Scope: ScopeNamespaced},
+			{Kind: "Pod", Scope: ScopeNamespaced, FieldSelector: "status.phase=Running"},
+			{Kind: "ReplicaSet", Scope: ScopeNamespaced},
+			{Kind: "StatefulSet", Scope: ScopeNamespaced},
+			{Kind: "DaemonSet", Scope: ScopeNamespaced},
 		},
 	}
 	got := w.EffectiveKinds()
@@ -514,6 +506,45 @@ rules:
 	_, err := Load(p)
 	if err == nil || !strings.Contains(err.Error(), "watch.selectors is no longer supported") {
 		t.Fatalf("Load: want legacy selectors error, got %v", err)
+	}
+}
+
+func TestLoad_RejectsLegacyWatchKinds(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "cfg.yaml")
+	content := `metricPrefix: "x_"
+watch:
+  kinds:
+    Pod: {}
+rules:
+  - name: "a"
+    anchor: Pod
+    labels:
+      n: { path: "metadata.namespace" }
+`
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	_, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "watch.kinds is no longer supported") {
+		t.Fatalf("Load: want legacy kinds error, got %v", err)
+	}
+}
+
+func TestValidate_NodeMustBeClusterScoped(t *testing.T) {
+	c := &Config{
+		Watch: WatchScope{
+			Resources: []WatchResource{{Kind: "Node", Scope: ScopeNamespaced}},
+		},
+		Rules: []Rule{{
+			Name:   "node_info",
+			Anchor: "Node",
+			Labels: map[string]Extract{"name": {Path: "metadata.name"}},
+		}},
+	}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "must use scope") {
+		t.Fatalf("expected node cluster-scope validation error, got: %v", err)
 	}
 }
 

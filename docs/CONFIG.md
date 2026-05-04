@@ -107,7 +107,7 @@ rules:
 | YAML 欄位 | 角色 |
 |-----------|------|
 | `metricPrefix` | 選填前綴；與各 `rules[].name` 組成註冊用 Prometheus metric 名稱，並受 metric 命名 regex 檢查。 |
-| `watch` | 選填 `WatchScope`：namespace、要納入快取的 **Kind 集合**，以及每個 Kind 的 `labelSelector` / `fieldSelector`。 |
+| `watch` | 選填 `WatchScope`：以 `watch.resources[]` 宣告每個 Kind 的 scope、namespace 與 selector。 |
 | `rules` | **必填**、非空之 `Rule` 陣列。 |
 
 ---
@@ -116,20 +116,25 @@ rules:
 
 ```yaml
 watch:
-  namespaces: ["prod", "staging"]   # 選填；空或省略 = 叢集全域
-  kinds:
-    Pod:
+  resources:
+    - kind: Pod
+      scope: Namespaced
+      namespaces: ["prod", "staging"]   # 可省略，省略代表此 kind cluster-wide
       labelSelector: "app.kubernetes.io/part-of=my-platform"
       fieldSelector: "status.phase!=Succeeded"
-    Deployment:
+    - kind: Deployment
+      scope: Namespaced
+      namespaces: ["prod", "staging"]
       labelSelector: "managed-by=argocd"
+    - kind: Node
+      scope: Cluster
 ```
 
-`kinds` 的鍵必須是 `Pod` | `ReplicaSet` | `Deployment` | `StatefulSet` | `DaemonSet` 之一。若某 Kind **不**在 `kinds` 的 map 中，該 Kind **不**會有 SharedInformer。空物件 `Deployment: {}` 僅啟用該 kind、不加 selector。
+`resources[].kind` 必須是 `Pod` | `ReplicaSet` | `Deployment` | `StatefulSet` | `DaemonSet` | `Node`。若某 Kind 不在 `resources` 中，該 Kind 不會建立 SharedInformer。
 
-若省略 `kinds` 或留空，等同 **五種** resource 都 watch 且 **無** selector。`Validate()` 會驗證每條 `rule` 的 `anchor` 及 **顯式** 指向某 Kind 的 `source`（如 `source: Deployment` 或關聯到某 Kind 的 `relations` 別名）有列在實際 watch 的 kind 內。`source: topController`／`ownerController` 不強制要求父資源在 `kinds` 內，但若實務上沒有 watch 到鏈上需要的 kind，owner 鏈可能 miss，啟動時會有警告。
+若省略 `resources` 或留空，等同 watch 全部支援 kind（含 `Node`）且無 selector。`Validate()` 會驗證每條 `rule` 的 `anchor` 及顯式 Kind source 有列在有效 watch set 內。
 
-**遷移（breaking）**：`watch.selectors` 已移除。仍使用舊鍵的設定在 `Load()` 時會回錯，請改為上例的 `watch.kinds` 寫法。
+**遷移（breaking）**：`watch.selectors`、`watch.kinds`、`watch.namespaces` 均已移除。請改用 `watch.resources[]`。
 
 ### 為何重要
 
@@ -495,9 +500,9 @@ rules:
 
 相關指標：`exporter_parent_index_hit_total`、`exporter_parent_index_fallback_total`。
 
-### 更新事件過濾
+### Informer Update 與 reconcile（對齊 kube-state-metrics）
 
-對每 UID 快取 `{metadata.generation, labels, annotations}` 的 digest；僅 status 變動等不影響 digest 的更新可不入隊，減少大 Pod 的無謂 reconcile。
+對 `SharedInformer` 的 **`Update`**：若 **`resourceVersion` 與舊物件相同**（重複投递）則略過 enqueue；只要 RV 遞進（含 **僅 `status` 變更**），就會入隊並從 cache 重算指標，**不做** metadata-only 的 digest 過濾。需要壓低本機 reconcile 頻率時，請縮小 `watch.resources`／selector 與規則數量。
 
 ### Apiserver 限速
 

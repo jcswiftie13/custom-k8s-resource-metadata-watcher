@@ -23,7 +23,7 @@ import (
 // allowing per-kind label/field selectors without cross-contamination.
 //
 // The empty-string namespace represents cluster-wide scope (used when
-// Config.Watch.Namespaces is empty).
+// watch.resources chooses cluster-wide or namespaced scopes per kind).
 type ScopedInformers struct {
 	client   kubernetes.Interface
 	log      *slog.Logger
@@ -31,9 +31,8 @@ type ScopedInformers struct {
 	watch    config.WatchScope
 	kinds    []string
 	kindSet  map[string]struct{}
-	selector map[string]config.KindWatch // per watched kind (resolved KindWatch)
-
-	// factories[namespace][kind] -> SharedInformerFactory tweaked for that kind.
+	selector map[string]config.WatchResource // per watched kind (resolved resource watch)
+	// factories[kind][namespaceKey] -> SharedInformerFactory tweaked for that kind/scope.
 	factories map[string]map[string]informers.SharedInformerFactory
 
 	// Kind-specific typed informers/listers, keyed by namespace. Absent for unwatched kinds.
@@ -42,17 +41,18 @@ type ScopedInformers struct {
 	depInformers map[string]cache.SharedIndexInformer
 	stsInformers map[string]cache.SharedIndexInformer
 	dsInformers  map[string]cache.SharedIndexInformer
+	nodeInformers map[string]cache.SharedIndexInformer
 
 	podListers map[string]corelisters.PodLister
 	rsListers  map[string]appslisters.ReplicaSetLister
 	depListers map[string]appslisters.DeploymentLister
 	stsListers map[string]appslisters.StatefulSetLister
 	dsListers  map[string]appslisters.DaemonSetLister
+	nodeListers map[string]corelisters.NodeLister
 
-	// When true, namespace "" is the only lister key for cluster-scoped mode.
-	clusterWide bool
-
-	namespaces []string
+	// kindClusterWide indicates namespace key handling per kind.
+	kindClusterWide map[string]bool
+	kindNamespaces  map[string][]string
 }
 
 // NewScopedInformers constructs factories for every (namespace, kind) using
@@ -63,30 +63,45 @@ func NewScopedInformers(client kubernetes.Interface, w config.WatchScope, log *s
 	if log == nil {
 		log = slog.Default()
 	}
-	namespaces := w.Namespaces
-	clusterWide := len(namespaces) == 0
-	if len(namespaces) == 0 {
-		namespaces = []string{""}
-	}
 	kinds := w.EffectiveKinds()
-	selector := make(map[string]config.KindWatch, len(kinds))
+	selector := make(map[string]config.WatchResource, len(kinds))
 	ks := make(map[string]struct{}, len(kinds))
+	kindClusterWide := make(map[string]bool, len(kinds))
+	kindNamespaces := make(map[string][]string, len(kinds))
 	for _, k := range kinds {
+		res, _ := w.ResourceFor(k)
 		ks[k] = struct{}{}
-		selector[k] = w.KindWatchFor(k)
+		selector[k] = res
+		if res.Scope == config.ScopeCluster || k == "Node" {
+			kindClusterWide[k] = true
+			kindNamespaces[k] = []string{""}
+			continue
+		}
+		if len(res.Namespaces) == 0 {
+			kindClusterWide[k] = true
+			kindNamespaces[k] = []string{""}
+		} else {
+			kindClusterWide[k] = false
+			kindNamespaces[k] = append([]string(nil), res.Namespaces...)
+		}
 	}
-	if clusterWide {
+	perNamespaceKinds := 0
+	for _, kind := range kinds {
+		if !kindClusterWide[kind] {
+			perNamespaceKinds++
+		}
+	}
+	if perNamespaceKinds == 0 {
 		log.Info("watch mode = cluster-wide",
 			"factoriesPerKind", 1,
 			"watchKinds", kinds,
 		)
 	} else {
 		log.Info("watch mode = per-namespace",
-			"namespaces", namespaces,
-			"factoriesPerKind", len(namespaces),
 			"watchKinds", kinds,
 		)
 	}
+	log.Info("watch resources configured", "resources", w.EffectiveResources())
 	si := &ScopedInformers{
 		client:       client,
 		log:          log,
@@ -100,18 +115,20 @@ func NewScopedInformers(client kubernetes.Interface, w config.WatchScope, log *s
 		depInformers: map[string]cache.SharedIndexInformer{},
 		stsInformers: map[string]cache.SharedIndexInformer{},
 		dsInformers:  map[string]cache.SharedIndexInformer{},
+		nodeInformers: map[string]cache.SharedIndexInformer{},
 		podListers:   map[string]corelisters.PodLister{},
 		rsListers:    map[string]appslisters.ReplicaSetLister{},
 		depListers:   map[string]appslisters.DeploymentLister{},
 		stsListers:   map[string]appslisters.StatefulSetLister{},
 		dsListers:    map[string]appslisters.DaemonSetLister{},
-		clusterWide:  clusterWide,
-		namespaces:   namespaces,
+		nodeListers:  map[string]corelisters.NodeLister{},
+		kindClusterWide: kindClusterWide,
+		kindNamespaces:  kindNamespaces,
 	}
 
-	for _, ns := range namespaces {
-		perKind := make(map[string]informers.SharedInformerFactory, len(kinds))
-		for _, kind := range kinds {
+	for _, kind := range kinds {
+		perNS := make(map[string]informers.SharedInformerFactory, len(kindNamespaces[kind]))
+		for _, ns := range kindNamespaces[kind] {
 			sel := selector[kind]
 			opts := []informers.SharedInformerOption{
 				informers.WithTweakListOptions(func(o *metav1.ListOptions) {
@@ -126,12 +143,11 @@ func NewScopedInformers(client kubernetes.Interface, w config.WatchScope, log *s
 			if ns != "" {
 				opts = append(opts, informers.WithNamespace(ns))
 			}
-			perKind[kind] = informers.NewSharedInformerFactoryWithOptions(client, 0, opts...)
+			perNS[ns] = informers.NewSharedInformerFactoryWithOptions(client, 0, opts...)
 		}
-		si.factories[ns] = perKind
-
-		for _, kind := range kinds {
-			f := perKind[kind]
+		si.factories[kind] = perNS
+		for _, ns := range kindNamespaces[kind] {
+			f := perNS[ns]
 			switch kind {
 			case "Pod":
 				si.podInformers[ns] = f.Core().V1().Pods().Informer()
@@ -148,6 +164,9 @@ func NewScopedInformers(client kubernetes.Interface, w config.WatchScope, log *s
 			case "DaemonSet":
 				si.dsInformers[ns] = f.Apps().V1().DaemonSets().Informer()
 				si.dsListers[ns] = f.Apps().V1().DaemonSets().Lister()
+			case "Node":
+				si.nodeInformers[ns] = f.Core().V1().Nodes().Informer()
+				si.nodeListers[ns] = f.Core().V1().Nodes().Lister()
 			}
 		}
 	}
@@ -176,13 +195,13 @@ func (s *ScopedInformers) EnabledKindSet() map[string]struct{} {
 
 // Start launches all informers and waits for initial cache sync.
 func (s *ScopedInformers) Start(ctx context.Context) error {
-	for _, perKind := range s.factories {
-		for _, f := range perKind {
+	for _, perNS := range s.factories {
+		for _, f := range perNS {
 			f.Start(ctx.Done())
 		}
 	}
-	for ns, perKind := range s.factories {
-		for kind, f := range perKind {
+	for kind, perNS := range s.factories {
+		for ns, f := range perNS {
 			synced := f.WaitForCacheSync(ctx.Done())
 			for typ, ok := range synced {
 				if !ok {
@@ -197,12 +216,12 @@ func (s *ScopedInformers) Start(ctx context.Context) error {
 // DryRunSelectors issues one small List per (namespace, kind) that has any
 // selector configured, so bad field selectors are rejected on startup.
 func (s *ScopedInformers) DryRunSelectors(ctx context.Context) error {
-	for _, ns := range s.namespaces {
-		for _, kind := range s.kinds {
-			sel, ok := s.selector[kind]
-			if !ok || (sel.LabelSelector == "" && sel.FieldSelector == "") {
-				continue
-			}
+	for _, kind := range s.kinds {
+		sel, ok := s.selector[kind]
+		if !ok || (sel.LabelSelector == "" && sel.FieldSelector == "") {
+			continue
+		}
+		for _, ns := range s.kindNamespaces[kind] {
 			opts := metav1.ListOptions{
 				LabelSelector: sel.LabelSelector,
 				FieldSelector: sel.FieldSelector,
@@ -220,6 +239,8 @@ func (s *ScopedInformers) DryRunSelectors(ctx context.Context) error {
 				_, err = s.client.AppsV1().StatefulSets(ns).List(ctx, opts)
 			case "DaemonSet":
 				_, err = s.client.AppsV1().DaemonSets(ns).List(ctx, opts)
+			case "Node":
+				_, err = s.client.CoreV1().Nodes().List(ctx, opts)
 			}
 			if err != nil {
 				return fmt.Errorf("dry-run list %s in ns=%q with selector %+v: %w", kind, ns, sel, err)
@@ -235,7 +256,7 @@ func (s *ScopedInformers) Get(kind, namespace, name string) (runtime.Object, err
 	if !s.HasKind(kind) {
 		return nil, notFoundf("kind %q is not watched", kind)
 	}
-	nsKey := s.nsKey(namespace)
+	nsKey := s.nsKey(kind, namespace)
 	switch kind {
 	case "Pod":
 		l, ok := s.podListers[nsKey]
@@ -267,14 +288,20 @@ func (s *ScopedInformers) Get(kind, namespace, name string) (runtime.Object, err
 			return nil, notFoundf("daemonset lister for ns=%q missing", namespace)
 		}
 		return l.DaemonSets(namespace).Get(name)
+	case "Node":
+		l, ok := s.nodeListers[nsKey]
+		if !ok {
+			return nil, notFoundf("node lister missing")
+		}
+		return l.Get(name)
 	}
 	return nil, fmt.Errorf("unsupported kind %q", kind)
 }
 
 // nsKey chooses the appropriate factory key for a namespace. If the
 // collector is cluster-wide ("") we always use the "" factory.
-func (s *ScopedInformers) nsKey(namespace string) string {
-	if s.clusterWide {
+func (s *ScopedInformers) nsKey(kind, namespace string) string {
+	if s.kindClusterWide[kind] || kind == "Node" {
 		return ""
 	}
 	return namespace
@@ -315,6 +342,12 @@ func (s *ScopedInformers) Informers(kind string) []cache.SharedIndexInformer {
 				out = append(out, v)
 			}
 		}
+	case "Node":
+		for _, v := range s.nodeInformers {
+			if v != nil {
+				out = append(out, v)
+			}
+		}
 	}
 	return out
 }
@@ -326,7 +359,7 @@ func (s *ScopedInformers) ListAllPods(namespace string) ([]*corev1.Pod, error) {
 		return nil, nil
 	}
 	var out []*corev1.Pod
-	nsKey := s.nsKey(namespace)
+	nsKey := s.nsKey("Pod", namespace)
 	l, ok := s.podListers[nsKey]
 	if !ok {
 		return nil, nil
@@ -346,7 +379,7 @@ func (s *ScopedInformers) ListAll(kind string) []runtime.Object {
 		return nil
 	}
 	var out []runtime.Object
-	for nsKey := range s.factories {
+	for _, nsKey := range s.kindNamespaces[kind] {
 		switch kind {
 		case "Pod":
 			if l, ok := s.podListers[nsKey]; ok {
@@ -378,6 +411,13 @@ func (s *ScopedInformers) ListAll(kind string) []runtime.Object {
 			}
 		case "DaemonSet":
 			if l, ok := s.dsListers[nsKey]; ok {
+				items, _ := l.List(labels.Everything())
+				for _, it := range items {
+					out = append(out, it)
+				}
+			}
+		case "Node":
+			if l, ok := s.nodeListers[nsKey]; ok {
 				items, _ := l.List(labels.Everything())
 				for _, it := range items {
 					out = append(out, it)
