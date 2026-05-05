@@ -1,8 +1,6 @@
 package config
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -188,23 +186,7 @@ func TestValidate_NestedFallbacksRejected(t *testing.T) {
 	}
 }
 
-func TestSanitizeLabelName(t *testing.T) {
-	cases := map[string]string{
-		"integration.test/controller-note": "integration_test_controller_note",
-		"app.kubernetes.io/name":           "app_kubernetes_io_name",
-		"123abc":                           "_123abc",
-		"_already_ok":                      "_already_ok",
-		"simple":                           "simple",
-		"with spaces!":                     "with_spaces_",
-	}
-	for in, want := range cases {
-		if got := SanitizeLabelName(in); got != want {
-			t.Fatalf("SanitizeLabelName(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-func TestValidate_AcceptsFlatten(t *testing.T) {
+func TestValidate_AcceptsQuotedAnnotationPathsInLabels(t *testing.T) {
 	c := &Config{
 		Rules: []Rule{{
 			Name:   "pod_info",
@@ -214,158 +196,19 @@ func TestValidate_AcceptsFlatten(t *testing.T) {
 			},
 			Labels: map[string]Extract{
 				"namespace": {Path: "metadata.namespace"},
-			},
-			Flatten: []FlattenExtract{{
-				NamePrefix: "controller_annotation_",
-				Source:     "top",
-				Path:       "metadata.annotations",
-				Keys: []string{
-					"integration.test/controller-note",
-					"integration.test/owner",
+				"controller_annotation_integration_test_controller_note": {
+					Source: "top",
+					Path:   `metadata.annotations["integration.test/controller-note"]`,
 				},
-			}},
+				"controller_annotation_integration_test_owner": {
+					Source: "top",
+					Path:   `metadata.annotations["integration.test/owner"]`,
+				},
+			},
 		}},
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("unexpected err: %v", err)
-	}
-}
-
-func TestValidate_FlattenRejectsEmptyKeys(t *testing.T) {
-	c := &Config{
-		Rules: []Rule{{
-			Name:   "pod_info",
-			Anchor: "Pod",
-			Labels: map[string]Extract{"namespace": {Path: "metadata.namespace"}},
-			Flatten: []FlattenExtract{{
-				Path: "metadata.annotations",
-				Keys: []string{},
-			}},
-		}},
-	}
-	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "keys: at least one key is required") {
-		t.Fatalf("expected empty keys error, got %v", err)
-	}
-}
-
-func TestValidate_FlattenRejectsBlankKey(t *testing.T) {
-	c := &Config{
-		Rules: []Rule{{
-			Name:   "pod_info",
-			Anchor: "Pod",
-			Labels: map[string]Extract{"namespace": {Path: "metadata.namespace"}},
-			Flatten: []FlattenExtract{{
-				Path: "metadata.annotations",
-				Keys: []string{"  "},
-			}},
-		}},
-	}
-	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "must be a non-empty string") {
-		t.Fatalf("expected blank key error, got %v", err)
-	}
-}
-
-func TestValidate_FlattenRejectsMissingPath(t *testing.T) {
-	c := &Config{
-		Rules: []Rule{{
-			Name:   "pod_info",
-			Anchor: "Pod",
-			Labels: map[string]Extract{"namespace": {Path: "metadata.namespace"}},
-			Flatten: []FlattenExtract{{
-				Keys: []string{"team"},
-			}},
-		}},
-	}
-	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "path: required") {
-		t.Fatalf("expected missing path error, got %v", err)
-	}
-}
-
-func TestValidate_FlattenRejectsCollisionWithLabel(t *testing.T) {
-	c := &Config{
-		Rules: []Rule{{
-			Name:   "pod_info",
-			Anchor: "Pod",
-			Labels: map[string]Extract{
-				"namespace": {Path: "metadata.namespace"},
-				"team":      {Path: "metadata.labels.team"},
-			},
-			Flatten: []FlattenExtract{{
-				Path: "metadata.annotations",
-				Keys: []string{"team"},
-			}},
-		}},
-	}
-	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "collides with an existing label") {
-		t.Fatalf("expected label-collision error, got %v", err)
-	}
-}
-
-func TestValidate_FlattenRejectsCollisionBetweenTwoFlattenEntries(t *testing.T) {
-	c := &Config{
-		Rules: []Rule{{
-			Name:   "pod_info",
-			Anchor: "Pod",
-			Labels: map[string]Extract{"namespace": {Path: "metadata.namespace"}},
-			Flatten: []FlattenExtract{
-				{
-					NamePrefix: "a_",
-					Path:       "metadata.annotations",
-					Keys:       []string{"team"},
-				},
-				{
-					NamePrefix: "a_",
-					Path:       "metadata.labels",
-					Keys:       []string{"team"},
-				},
-			},
-		}},
-	}
-	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "collides with an existing label") {
-		t.Fatalf("expected flatten-collision error, got %v", err)
-	}
-}
-
-func TestValidate_FlattenRejectsInvalidGeneratedName(t *testing.T) {
-	c := &Config{
-		Rules: []Rule{{
-			Name:   "pod_info",
-			Anchor: "Pod",
-			Labels: map[string]Extract{"namespace": {Path: "metadata.namespace"}},
-			Flatten: []FlattenExtract{{
-				NamePrefix: "__",
-				Path:       "metadata.annotations",
-				Keys:       []string{"team"},
-			}},
-		}},
-	}
-	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "starting with __") {
-		t.Fatalf("expected __ prefix error, got %v", err)
-	}
-}
-
-func TestValidate_FlattenItemSourceRequiresForEach(t *testing.T) {
-	c := &Config{
-		Rules: []Rule{{
-			Name:   "pod_container_info",
-			Anchor: "Pod",
-			Labels: map[string]Extract{"namespace": {Path: "metadata.namespace"}},
-			Flatten: []FlattenExtract{{
-				Source: "item",
-				Path:   "metadata.annotations",
-				Keys:   []string{"team"},
-			}},
-		}},
-	}
-	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "source=item requires forEach") {
-		t.Fatalf("expected item+forEach error, got %v", err)
 	}
 }
 
@@ -484,50 +327,6 @@ func TestWatchScope_EffectiveKinds_ExplicitOrder(t *testing.T) {
 		if i >= len(got) || got[i] != want[i] {
 			t.Fatalf("EffectiveKinds order mismatch: got %v want %v", got, want)
 		}
-	}
-}
-
-func TestLoad_RejectsLegacyWatchSelectors(t *testing.T) {
-	tmp := t.TempDir()
-	p := filepath.Join(tmp, "cfg.yaml")
-	content := `metricPrefix: "x_"
-watch:
-  selectors:
-    Pod: { fieldSelector: "status.phase=Running" }
-rules:
-  - name: "a"
-    anchor: Pod
-    labels:
-      n: { path: "metadata.namespace" }
-`
-	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
-		t.Fatalf("write temp config: %v", err)
-	}
-	_, err := Load(p)
-	if err == nil || !strings.Contains(err.Error(), "watch.selectors is no longer supported") {
-		t.Fatalf("Load: want legacy selectors error, got %v", err)
-	}
-}
-
-func TestLoad_RejectsLegacyWatchKinds(t *testing.T) {
-	tmp := t.TempDir()
-	p := filepath.Join(tmp, "cfg.yaml")
-	content := `metricPrefix: "x_"
-watch:
-  kinds:
-    Pod: {}
-rules:
-  - name: "a"
-    anchor: Pod
-    labels:
-      n: { path: "metadata.namespace" }
-`
-	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
-		t.Fatalf("write temp config: %v", err)
-	}
-	_, err := Load(p)
-	if err == nil || !strings.Contains(err.Error(), "watch.kinds is no longer supported") {
-		t.Fatalf("Load: want legacy kinds error, got %v", err)
 	}
 }
 

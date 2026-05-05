@@ -29,12 +29,9 @@ rules:
       controller_name:
         source: top
         path: "metadata.name"
-    flatten:
-      - namePrefix: "controller_annotation_"
+      controller_annotation_integration_test_controller_note:
         source: top
-        path: "metadata.annotations"
-        keys:
-          - "integration.test/controller-note"
+        path: 'metadata.annotations["integration.test/controller-note"]'
 
   - name: "pod_container_info"
     help: "Integration test: one series per (Pod, container)."
@@ -119,12 +116,9 @@ rules:
       controller_name:
         source: top
         path: "metadata.name"
-    flatten:
-      - namePrefix: "controller_annotation_"
+      controller_annotation_integration_test_controller_note:
         source: top
-        path: "metadata.annotations"
-        keys:
-          - "integration.test/controller-note"
+        path: 'metadata.annotations["integration.test/controller-note"]'
 
   - name: "pod_container_info"
     help: "Integration test: one series per (Pod, container)."

@@ -85,15 +85,6 @@ func Compile(rule *config.Rule) (*CompiledRule, error) {
 			OnMissing: ext.OnMissingValue(),
 		}
 	}
-
-	flattenLabels, err := compileFlatten(rule)
-	if err != nil {
-		return nil, err
-	}
-	if len(flattenLabels) > 0 {
-		cr.Labels = append(cr.Labels, flattenLabels...)
-		cr.LabelOrder, cr.Labels = reorderLabels(cr.Labels)
-	}
 	return cr, nil
 }
 
