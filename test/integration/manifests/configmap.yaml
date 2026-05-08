@@ -30,9 +30,6 @@ data:
       - name: "pod_info"
         help: "Integration test: one series per Pod."
         anchor: Pod
-        relations:
-          - name: top
-            via: topController
         labels:
           namespace:
             path: "metadata.namespace"
@@ -41,22 +38,19 @@ data:
           phase:
             path: "status.phase"
           controller_kind:
-            source: top
+            source: topController
             path: "kind"
           controller_name:
-            source: top
+            source: topController
             path: "metadata.name"
           controller_annotation_integration_test_controller_note:
-            source: top
+            source: topController
             path: 'metadata.annotations["integration.test/controller-note"]'
 
       - name: "pod_container_info"
         help: "Integration test: one series per (Pod, container)."
         anchor: Pod
         forEach: "spec.containers[*]"
-        relations:
-          - name: top
-            via: topController
         labels:
           namespace:
             path: "metadata.namespace"
@@ -69,7 +63,7 @@ data:
             source: item
             path: "image"
           controller_name:
-            source: top
+            source: topController
             path: "metadata.name"
 
       - name: "node_info"

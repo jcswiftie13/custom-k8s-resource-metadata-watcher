@@ -146,10 +146,9 @@ func TestEvaluator_FallbacksAndOnMissing(t *testing.T) {
 	ev := NewEvaluator()
 
 	cases := []struct {
-		name    string
-		pod     *corev1.Pod
-		want    string
-		skipOnM bool
+		name string
+		pod  *corev1.Pod
+		want string
 	}{
 		{
 			name: "primary hits",
@@ -268,16 +267,13 @@ func TestCompile_LabelsWithQuotedAnnotationPaths(t *testing.T) {
 	}
 }
 
-func TestCompile_LabelFromTopControllerViaRelation(t *testing.T) {
+func TestCompile_LabelFromTopController(t *testing.T) {
 	rule := &config.Rule{
 		Name:   "pod_info",
 		Anchor: "Pod",
-		Relations: []config.RelationAlias{
-			{Name: "top", Via: "topController"},
-		},
 		Labels: map[string]config.Extract{
 			"controller_annotation_integration_test_controller_note": {
-				Source: "top",
+				Source: "topController",
 				Path:   `metadata.annotations["integration.test/controller-note"]`,
 			},
 			"namespace": {Path: "metadata.namespace"},
@@ -370,12 +366,155 @@ func TestCompile_ScalarTypeStringification(t *testing.T) {
 	cr := mustCompile(t, rule)
 	ev := NewEvaluator()
 	replicas := int32(3)
-	// Minimal unstructured input shaped like a Deployment
 	input := map[string]interface{}{
 		"spec": map[string]interface{}{"replicas": replicas},
 	}
 	got := ev.EvaluateLabel(cr.Labels[0], func(string) map[string]interface{} { return input })
 	if got != "3" {
 		t.Fatalf("expected '3', got %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// expandLabels (dynamic label name) coverage
+// ---------------------------------------------------------------------------
+
+func TestEvaluator_ExpandLabels_FlattensAndSanitisesKeys(t *testing.T) {
+	rule := &config.Rule{
+		Name:   "pod_meta",
+		Anchor: "Pod",
+		Labels: map[string]config.Extract{
+			"namespace": {Path: "metadata.namespace"},
+		},
+		ExpandLabels: []config.ExpandLabel{
+			{Path: "metadata.labels", Prefix: "label_"},
+		},
+	}
+	cr := mustCompile(t, rule)
+	ev := NewEvaluator()
+
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Labels: map[string]string{
+			"app.kubernetes.io/name": "api",
+			"team":                   "payments",
+			"with-dashes/and.dots":   "v",
+		},
+	}}
+	m, _ := ev.ToUnstructured(pod)
+
+	srcLookup := func(s string) map[string]interface{} {
+		if s == "anchor" {
+			return m
+		}
+		return nil
+	}
+	out := ev.EvaluateExpand(cr.Expands[0], srcLookup)
+	if got, want := out["label_app_kubernetes_io_name"], "api"; got != want {
+		t.Fatalf("label_app_kubernetes_io_name = %q, want %q (full=%v)", got, want, out)
+	}
+	if got, want := out["label_team"], "payments"; got != want {
+		t.Fatalf("label_team = %q, want %q", got, want)
+	}
+	if got, want := out["label_with_dashes_and_dots"], "v"; got != want {
+		t.Fatalf("label_with_dashes_and_dots = %q, want %q (full=%v)", got, want, out)
+	}
+}
+
+func TestEvaluator_ExpandLabels_AllowDeny(t *testing.T) {
+	rule := &config.Rule{
+		Name:   "pod_meta",
+		Anchor: "Pod",
+		Labels: map[string]config.Extract{
+			"namespace": {Path: "metadata.namespace"},
+		},
+		ExpandLabels: []config.ExpandLabel{
+			{
+				Path:   "metadata.labels",
+				Prefix: "label_",
+				Allow:  []string{"team", "app"},
+				Deny:   []string{"team"}, // deny wins
+			},
+		},
+	}
+	cr := mustCompile(t, rule)
+	ev := NewEvaluator()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Labels: map[string]string{"team": "x", "app": "y", "extra": "z"},
+	}}
+	m, _ := ev.ToUnstructured(pod)
+	out := ev.EvaluateExpand(cr.Expands[0], func(string) map[string]interface{} { return m })
+	if _, has := out["label_team"]; has {
+		t.Fatalf("team should be denied, got %v", out)
+	}
+	if got := out["label_app"]; got != "y" {
+		t.Fatalf("label_app = %q, want y", got)
+	}
+	if _, has := out["label_extra"]; has {
+		t.Fatalf("extra should be filtered (not in allow), got %v", out)
+	}
+}
+
+func TestEvaluator_ExpandLabels_MaxKeysCapsLexicographically(t *testing.T) {
+	rule := &config.Rule{
+		Name:   "pod_meta",
+		Anchor: "Pod",
+		ExpandLabels: []config.ExpandLabel{
+			{Path: "metadata.annotations", Prefix: "annotation_", MaxKeys: 2},
+		},
+	}
+	cr := mustCompile(t, rule)
+	ev := NewEvaluator()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{"a": "1", "b": "2", "c": "3"},
+	}}
+	m, _ := ev.ToUnstructured(pod)
+	out := ev.EvaluateExpand(cr.Expands[0], func(string) map[string]interface{} { return m })
+	if len(out) != 2 {
+		t.Fatalf("MaxKeys=2 should cap output to 2, got %d (full=%v)", len(out), out)
+	}
+	if _, has := out["annotation_a"]; !has {
+		t.Fatalf("expected annotation_a in capped output, got %v", out)
+	}
+	if _, has := out["annotation_b"]; !has {
+		t.Fatalf("expected annotation_b in capped output, got %v", out)
+	}
+	if _, has := out["annotation_c"]; has {
+		t.Fatalf("annotation_c should have been dropped by MaxKeys, got %v", out)
+	}
+}
+
+func TestEvaluator_ExpandLabels_EmptyMapYieldsNoOutput(t *testing.T) {
+	rule := &config.Rule{
+		Name:   "pod_meta",
+		Anchor: "Pod",
+		ExpandLabels: []config.ExpandLabel{
+			{Path: "metadata.labels", Prefix: "label_"},
+		},
+	}
+	cr := mustCompile(t, rule)
+	ev := NewEvaluator()
+	pod := &corev1.Pod{}
+	m, _ := ev.ToUnstructured(pod)
+	out := ev.EvaluateExpand(cr.Expands[0], func(string) map[string]interface{} { return m })
+	if len(out) != 0 {
+		t.Fatalf("expected empty output for absent map, got %v", out)
+	}
+}
+
+func TestSanitizeLabelKey(t *testing.T) {
+	cases := map[string]string{
+		"":                     "_",
+		"app":                  "app",
+		"app.kubernetes.io":    "app_kubernetes_io",
+		"team/owner":           "team_owner",
+		"with-dashes":          "with_dashes",
+		"123":                  "123",
+		"a/b.c-d_e":            "a_b_c_d_e",
+		"upper.CASE_Mixed/123": "upper_CASE_Mixed_123",
+	}
+	for in, want := range cases {
+		if got := sanitizeLabelKey(in); got != want {
+			t.Errorf("sanitizeLabelKey(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

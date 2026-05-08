@@ -7,15 +7,14 @@ import (
 )
 
 // sharedRulesYAML is the integration test rule set for cluster-wide and
-// per-namespace topologies.
+// per-namespace topologies. The "controller_*" labels exercise the
+// owner-chain (Pod -> ReplicaSet -> Deployment via topController) under the
+// new custom-collector / scrape-time architecture.
 const sharedRulesYAML = `
 rules:
   - name: "pod_info"
     help: "Integration test: one series per Pod."
     anchor: Pod
-    relations:
-      - name: top
-        via: topController
     labels:
       namespace:
         path: "metadata.namespace"
@@ -24,22 +23,19 @@ rules:
       phase:
         path: "status.phase"
       controller_kind:
-        source: top
+        source: topController
         path: "kind"
       controller_name:
-        source: top
+        source: topController
         path: "metadata.name"
       controller_annotation_integration_test_controller_note:
-        source: top
+        source: topController
         path: 'metadata.annotations["integration.test/controller-note"]'
 
   - name: "pod_container_info"
     help: "Integration test: one series per (Pod, container)."
     anchor: Pod
     forEach: "spec.containers[*]"
-    relations:
-      - name: top
-        via: topController
     labels:
       namespace:
         path: "metadata.namespace"
@@ -52,7 +48,7 @@ rules:
         source: item
         path: "image"
       controller_name:
-        source: top
+        source: topController
         path: "metadata.name"
 
   - name: "node_info"
@@ -100,9 +96,6 @@ rules:
   - name: "pod_info"
     help: "Integration test: one series per Pod."
     anchor: Pod
-    relations:
-      - name: top
-        via: topController
     labels:
       namespace:
         path: "metadata.namespace"
@@ -111,22 +104,19 @@ rules:
       phase:
         path: "status.phase"
       controller_kind:
-        source: top
+        source: topController
         path: "kind"
       controller_name:
-        source: top
+        source: topController
         path: "metadata.name"
       controller_annotation_integration_test_controller_note:
-        source: top
+        source: topController
         path: 'metadata.annotations["integration.test/controller-note"]'
 
   - name: "pod_container_info"
     help: "Integration test: one series per (Pod, container)."
     anchor: Pod
     forEach: "spec.containers[*]"
-    relations:
-      - name: top
-        via: topController
     labels:
       namespace:
         path: "metadata.namespace"
@@ -139,7 +129,7 @@ rules:
         source: item
         path: "image"
       controller_name:
-        source: top
+        source: topController
         path: "metadata.name"
 `
 
@@ -169,6 +159,53 @@ watch:
     - kind: Deployment
       scope: Cluster
 ` + podRulesYAML
+}
+
+// dynamicMetadataConfigYAML is a minimal config dedicated to dynamic
+// expandLabels coverage in e2e tests. It keeps one Pod rule and one Node rule
+// with fixed identity labels plus dynamic labels/annotations flattening.
+func dynamicMetadataConfigYAML() string {
+	return `metricPrefix: "it_"
+
+watch:
+  resources:
+    - kind: Pod
+      scope: Namespaced
+      fieldSelector: "status.phase!=Succeeded"
+    - kind: Node
+      scope: Cluster
+
+rules:
+  - name: "pod_dynamic_metadata"
+    help: "Integration test: dynamic pod metadata labels."
+    anchor: Pod
+    labels:
+      namespace:
+        path: "metadata.namespace"
+      pod:
+        path: "metadata.name"
+    expandLabels:
+      - source: anchor
+        path: "metadata.labels"
+        prefix: "label_"
+      - source: anchor
+        path: "metadata.annotations"
+        prefix: "annotation_"
+
+  - name: "node_dynamic_metadata"
+    help: "Integration test: dynamic node metadata labels."
+    anchor: Node
+    labels:
+      node_name:
+        path: "metadata.name"
+    expandLabels:
+      - source: anchor
+        path: "metadata.labels"
+        prefix: "label_"
+      - source: anchor
+        path: "metadata.annotations"
+        prefix: "annotation_"
+`
 }
 
 // renderConfigYAML emits the full exporter config body. When namespaces is

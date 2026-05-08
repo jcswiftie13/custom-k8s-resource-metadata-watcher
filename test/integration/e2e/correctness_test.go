@@ -4,20 +4,23 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // TestCorrectness_FixtureFlow ports the original bash-based smoke test to
 // Go. It creates a Deployment with two containers and asserts the expected
 // series + labels; then deletes the Deployment and asserts the series
-// disappear within 60 seconds. It also checks that
-// exporter_parent_index_size drops after deletion, which is our regression
-// guard against the reverse-index leak.
+// disappear within 60 seconds. It also checks that exporter_anchor_count
+// for pod_info reflects the cluster shrinking after the Deployment is
+// deleted, which is our regression guard against stale series in the
+// scrape-time custom collector.
 func TestCorrectness_FixtureFlow(t *testing.T) {
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -58,8 +61,9 @@ func TestCorrectness_FixtureFlow(t *testing.T) {
 		t.Errorf("expected %d it_pod_container_info series for container=pause-sidecar with pause:3.10", replicas)
 	}
 
-	// Capture by_parent size before deletion so we can assert it drops.
-	preDeleteByParent, _ := gaugeValue(mfs, "exporter_parent_index_size", withLabels(map[string]string{"direction": "by_parent"}))
+	// Capture anchor count before deletion so we can verify that scrape
+	// output reflects the cluster shrinking after the Deployment dies.
+	preAnchorCount, _ := gaugeValue(mfs, "exporter_anchor_count", withLabels(map[string]string{"rule": "pod_info", "kind": "Pod"}))
 
 	// Delete the Deployment and wait for propagation.
 	deleteFixtureDeployment(t, ns, dep.Name)
@@ -73,16 +77,15 @@ func TestCorrectness_FixtureFlow(t *testing.T) {
 		t.Fatalf("it_pod_info series for deleted controller did not disappear: %v", err)
 	}
 
-	// parent index should have forgotten the Deployment's UID. We allow
-	// a small slack because the exporter might still have live entries for
-	// other namespaces/controllers, but the by_parent count must not
-	// monotonically grow past the pre-delete snapshot.
+	// Anchor count for Pods should drop (this controller's pods are gone)
+	// or at worst stay the same; it must never grow strictly because of a
+	// delete.
 	m := scrapeExporterMetrics(t)
-	postDeleteByParent, _ := gaugeValue(m, "exporter_parent_index_size", withLabels(map[string]string{"direction": "by_parent"}))
-	if postDeleteByParent > preDeleteByParent {
-		t.Errorf("parent index grew after delete: before=%v after=%v", preDeleteByParent, postDeleteByParent)
+	postAnchorCount, _ := gaugeValue(m, "exporter_anchor_count", withLabels(map[string]string{"rule": "pod_info", "kind": "Pod"}))
+	if postAnchorCount > preAnchorCount {
+		t.Errorf("anchor count grew after delete: before=%v after=%v", preAnchorCount, postAnchorCount)
 	}
-	t.Logf("parent_index_size by_parent: before=%v after=%v", preDeleteByParent, postDeleteByParent)
+	t.Logf("anchor_count pod_info/Pod: before=%v after=%v", preAnchorCount, postAnchorCount)
 }
 
 // TestCorrectness_ControllerAnnotationWithoutPodAnnotation verifies that the
@@ -138,6 +141,135 @@ func TestCorrectness_ControllerAnnotationWithoutPodAnnotation(t *testing.T) {
 	}
 }
 
+func TestCorrectness_PodDynamicLabelsExpanded(t *testing.T) {
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpLogs(t)
+		}
+	})
+
+	ns := "e2e-dynamic-pod-labels-0"
+	createNamespaces(t, ns)
+	t.Cleanup(func() { deleteNamespaces(t, ns) })
+
+	setExporterConfig(t, dynamicMetadataConfigYAML())
+	scaleExporter(t, 1)
+	waitForSteadyState(t, 10*time.Second)
+
+	pod := createPausePod(t, ns, "dynamic-pod-labels",
+		map[string]string{
+			"app.kubernetes.io/name":      "web",
+			"integration.test/extra-label": "blue",
+		},
+		nil,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := waitFor(ctx, 2*time.Second, func(ctx context.Context) (bool, error) {
+		mfs := scrapeExporterMetrics(t)
+		return metricHasExactLabels(mfs, "it_pod_dynamic_metadata", map[string]string{
+			"namespace":                        ns,
+			"pod":                              pod.Name,
+			"label_app_kubernetes_io_name":     "web",
+			"label_integration_test_extra_label": "blue",
+		}), nil
+	}); err != nil {
+		t.Fatalf("dynamic pod label expansion did not converge: %v", err)
+	}
+}
+
+func TestCorrectness_PodDynamicAnnotationsMutation(t *testing.T) {
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpLogs(t)
+		}
+	})
+
+	ns := "e2e-dynamic-pod-annotations-0"
+	createNamespaces(t, ns)
+	t.Cleanup(func() { deleteNamespaces(t, ns) })
+
+	setExporterConfig(t, dynamicMetadataConfigYAML())
+	scaleExporter(t, 1)
+	waitForSteadyState(t, 10*time.Second)
+
+	pod := createPausePod(t, ns, "dynamic-pod-annotations", nil, map[string]string{
+		"integration.test/anno-a": "value-a",
+	})
+
+	ctxInit, cancelInit := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancelInit()
+
+	if err := waitFor(ctxInit, 2*time.Second, func(ctx context.Context) (bool, error) {
+		body, err := fetchExporterMetricsRaw(t)
+		if err != nil {
+			// exporter rollout/restart 窗口：pod 存在但尚未 Ready，交給 waitFor 重試
+			if strings.Contains(err.Error(), "no ready exporter pod found") {
+				return false, nil
+			}
+			return false, err
+		}
+		mfs := parsePromText(t, body)
+		return metricHasExactLabels(mfs, "it_pod_dynamic_metadata", map[string]string{
+			"namespace":                     ns,
+			"pod":                           pod.Name,
+			"annotation_integration_test_anno_a": "value-a",
+		}), nil
+	}); err != nil {
+		t.Fatalf("initial dynamic pod annotation did not appear: %v", err)
+	}
+
+	cs := mustClient(t)
+	patchBody, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				"integration.test/anno-a": nil,
+				"integration.test/anno-b": "value-b",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal patch body: %v", err)
+	}
+	ctxPatch, cancelPatch := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelPatch()
+	if _, err := cs.CoreV1().Pods(ns).Patch(ctxPatch, pod.Name, types.MergePatchType, patchBody, metav1.PatchOptions{}); err != nil {
+		t.Fatalf("patch pod annotations: %v", err)
+	}
+
+	ctxMutate, cancelMutate := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancelMutate()
+	if err := waitFor(ctxMutate, 2*time.Second, func(ctx context.Context) (bool, error) {
+		body, err := fetchExporterMetricsRaw(t)
+		if err != nil {
+			// exporter rollout/restart 窗口：pod 存在但尚未 Ready，交給 waitFor 重試
+			if strings.Contains(err.Error(), "no ready exporter pod found") {
+				return false, nil
+			}
+			return false, err
+		}
+		mfs := parsePromText(t, body)
+		hasNew := metricHasExactLabels(mfs, "it_pod_dynamic_metadata", map[string]string{
+			"namespace":                     ns,
+			"pod":                           pod.Name,
+			"annotation_integration_test_anno_b": "value-b",
+		})
+		hasOld := metricHasLabelValue(mfs, "it_pod_dynamic_metadata", map[string]string{
+			"namespace": ns,
+			"pod":       pod.Name,
+		}, "annotation_integration_test_anno_a", "value-a")
+		return hasNew && !hasOld, nil
+	}); err != nil {
+		t.Fatalf("dynamic pod annotation mutation did not converge: %v", err)
+	}
+
+	mfs := scrapeExporterMetrics(t)
+	if errs := counterValue(mfs, "exporter_collect_total", withLabels(map[string]string{"result": "error"})); errs > 0 {
+		t.Fatalf("collector errors observed after dynamic annotation mutation: %v", errs)
+	}
+}
+
 // containerInfoMatches returns true when it_pod_container_info contains at
 // least `expected` series matching the supplied container and image inside
 // the given namespace.
@@ -166,4 +298,46 @@ func deleteFixtureDeployment(t *testing.T, ns, name string) {
 	if err != nil && !apierrors.IsNotFound(err) {
 		t.Fatalf("delete fixture deployment %s/%s: %v", ns, name, err)
 	}
+}
+
+func metricHasExactLabels(mfs map[string]*dto.MetricFamily, metric string, want map[string]string) bool {
+	mf, ok := mfs[metric]
+	if !ok {
+		return false
+	}
+	for _, m := range mf.GetMetric() {
+		got := labelsOf(m)
+		matched := true
+		for k, v := range want {
+			if got[k] != v {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+func metricHasLabelValue(mfs map[string]*dto.MetricFamily, metric string, base map[string]string, key, value string) bool {
+	mf, ok := mfs[metric]
+	if !ok {
+		return false
+	}
+	for _, m := range mf.GetMetric() {
+		got := labelsOf(m)
+		baseMatched := true
+		for k, v := range base {
+			if got[k] != v {
+				baseMatched = false
+				break
+			}
+		}
+		if baseMatched && got[key] == value {
+			return true
+		}
+	}
+	return false
 }

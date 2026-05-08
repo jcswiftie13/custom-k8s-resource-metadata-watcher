@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	clientscheme "k8s.io/client-go/kubernetes/scheme"
@@ -12,23 +13,28 @@ import (
 )
 
 // CompiledRule pre-compiles every path expression in a rule so that
-// evaluation per event touches only the cache and does zero parsing work.
+// evaluation per scrape touches only the cache and does zero parsing work.
 type CompiledRule struct {
 	Rule *config.Rule
 
 	// ForEach is nil when the rule does not expand into sub-items.
 	ForEach *parsedPath
 
-	// LabelOrder is the canonical order of label names (sorted) used for
-	// series key construction and when emitting values to the sink.
+	// LabelOrder is the canonical order of fixed label names (sorted) used
+	// when assembling the per-series label vector. ExpandLabels add
+	// additional, dynamic label names that are computed at scrape time.
 	LabelOrder []string
 
-	// Labels is LabelOrder-aligned with LabelOrder; each entry holds the
-	// compiled extracts for its label.
+	// Labels is LabelOrder-aligned; each entry holds the compiled extracts
+	// for its fixed label.
 	Labels []CompiledLabel
+
+	// Expands holds compiled expandLabels entries.
+	Expands []CompiledExpand
 }
 
-// CompiledLabel holds the resolved source + compiled path + fallbacks.
+// CompiledLabel holds the resolved source + compiled path + fallbacks for a
+// single fixed label.
 type CompiledLabel struct {
 	Name      string
 	Primary   CompiledExtract
@@ -38,9 +44,20 @@ type CompiledLabel struct {
 
 // CompiledExtract is a single evaluated source + path.
 type CompiledExtract struct {
-	Source string // resolved source (after relation alias lookup)
+	Source string // resolved source (anchor, item, ownerController, topController, or a Kind name)
 	Path   *parsedPath
-	RawSrc string // original source from config, for debugging
+}
+
+// CompiledExpand is a compiled expandLabels entry. Path resolves to a
+// map[string]interface{} at evaluation time; AllowSet/DenySet make
+// allow/deny lookups O(1); MaxKeys=0 means unlimited.
+type CompiledExpand struct {
+	Source   string
+	Path     *parsedPath
+	Prefix   string
+	AllowSet map[string]struct{} // nil when allow is empty
+	DenySet  map[string]struct{} // nil when deny is empty
+	MaxKeys  int
 }
 
 // Compile transforms a config.Rule into a CompiledRule. Path syntax errors
@@ -85,6 +102,16 @@ func Compile(rule *config.Rule) (*CompiledRule, error) {
 			OnMissing: ext.OnMissingValue(),
 		}
 	}
+
+	cr.Expands = make([]CompiledExpand, 0, len(rule.ExpandLabels))
+	for i, ex := range rule.ExpandLabels {
+		ce, err := compileExpand(rule, i, ex)
+		if err != nil {
+			return nil, err
+		}
+		cr.Expands = append(cr.Expands, ce)
+	}
+
 	return cr, nil
 }
 
@@ -95,9 +122,36 @@ func compileExtract(rule *config.Rule, labelName, slot string, e config.Extract)
 		return CompiledExtract{}, fmt.Errorf("rule %q label %q %s: invalid path %q: %w", rule.Name, labelName, slot, e.Path, err)
 	}
 	return CompiledExtract{
-		Source: rule.ResolveRelation(src),
-		RawSrc: src,
+		Source: src,
 		Path:   p,
+	}, nil
+}
+
+func compileExpand(rule *config.Rule, idx int, e config.ExpandLabel) (CompiledExpand, error) {
+	p, err := parsePath(e.Path)
+	if err != nil {
+		return CompiledExpand{}, fmt.Errorf("rule %q expandLabels[%d]: invalid path %q: %w", rule.Name, idx, e.Path, err)
+	}
+	var allow, deny map[string]struct{}
+	if len(e.Allow) > 0 {
+		allow = make(map[string]struct{}, len(e.Allow))
+		for _, k := range e.Allow {
+			allow[k] = struct{}{}
+		}
+	}
+	if len(e.Deny) > 0 {
+		deny = make(map[string]struct{}, len(e.Deny))
+		for _, k := range e.Deny {
+			deny[k] = struct{}{}
+		}
+	}
+	return CompiledExpand{
+		Source:   e.EffectiveSource(),
+		Path:     p,
+		Prefix:   e.Prefix,
+		AllowSet: allow,
+		DenySet:  deny,
+		MaxKeys:  e.MaxKeys,
 	}, nil
 }
 
@@ -204,6 +258,92 @@ func (e *Evaluator) tryExtract(ce CompiledExtract, srcLookup func(source string)
 		return s, true
 	}
 	return "", false
+}
+
+// EvaluateExpand resolves the configured map and returns the (sanitised,
+// prefixed) -> value pairs that should appear as dynamic labels for this
+// series. Allow/Deny/MaxKeys are applied. The output map's keys are already
+// the final Prometheus label names. An empty result is returned when the
+// path does not resolve to a map (consistent with EvaluateLabel "miss"
+// semantics: callers must treat absent labels as the empty string).
+func (e *Evaluator) EvaluateExpand(ce CompiledExpand, srcLookup func(source string) map[string]interface{}) map[string]string {
+	input := srcLookup(ce.Source)
+	if input == nil {
+		return nil
+	}
+	results := ce.Path.evaluate(input)
+	if len(results) == 0 {
+		return nil
+	}
+	// We take the first map result; ambiguity (multiple results) is not
+	// expected for metadata.labels / metadata.annotations.
+	m, ok := results[0].(map[string]interface{})
+	if !ok || len(m) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		if ce.DenySet != nil {
+			if _, denied := ce.DenySet[k]; denied {
+				continue
+			}
+		}
+		if ce.AllowSet != nil {
+			if _, allowed := ce.AllowSet[k]; !allowed {
+				continue
+			}
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if ce.MaxKeys > 0 && len(keys) > ce.MaxKeys {
+		keys = keys[:ce.MaxKeys]
+	}
+
+	out := make(map[string]string, len(keys))
+	for _, k := range keys {
+		raw, has := m[k]
+		if !has || raw == nil {
+			continue
+		}
+		v := stringifyValue(raw)
+		if v == "" {
+			continue
+		}
+		labelName := ce.Prefix + sanitizeLabelKey(k)
+		out[labelName] = v
+	}
+	return out
+}
+
+// sanitizeLabelKey converts a Kubernetes map key (e.g. label or annotation)
+// into a Prometheus-safe label name suffix. Per the Prometheus label name
+// regex `[a-zA-Z_][a-zA-Z0-9_]*`, every character outside [A-Za-z0-9_] is
+// replaced with '_'. Leading characters are not specially handled here — the
+// caller's prefix is responsible for ensuring the final name starts with a
+// valid character (every supported prefix ends with `_`).
+func sanitizeLabelKey(k string) string {
+	if k == "" {
+		return "_"
+	}
+	var b strings.Builder
+	b.Grow(len(k))
+	for _, r := range k {
+		switch {
+		case r == '_':
+			b.WriteByte('_')
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 // stringifyValue converts common scalar values to strings; composite values

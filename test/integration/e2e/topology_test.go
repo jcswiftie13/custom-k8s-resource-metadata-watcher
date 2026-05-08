@@ -186,40 +186,28 @@ func TestTopology_IdleStable(t *testing.T) {
 	scaleExporter(t, 1)
 	waitForSteadyState(t, 15*time.Second)
 
-	before := scrapeExporterMetrics(t)
 	apiBefore := watchDeltaSnapshot(t)
-	reconcileBefore := counterValue(before, "exporter_reconcile_total", nil)
 
 	// Idle window.
 	time.Sleep(60 * time.Second)
 
-	after := scrapeExporterMetrics(t)
 	apiAfter := watchDeltaSnapshot(t)
-	reconcileAfter := counterValue(after, "exporter_reconcile_total", nil)
 
-	// Queue must be empty on both sides of the window (it should have been
-	// empty throughout, but we guard the end-of-window here).
-	if depth, _ := gaugeValue(after, "exporter_reconcile_queue_depth", nil); depth != 0 {
-		t.Errorf("idle: expected queue depth 0, got %v", depth)
-	}
-
-	// Reconcile counter should stay near-flat. With Node watched, kubelet-driven
-	// heartbeat/condition updates can trigger a tiny amount of background reconcile.
-	// Extra nodes increase baseline node churn slightly (multi-node Kind).
-	nodeCount := len(listNodes(t))
-	if nodeCount < 1 {
-		nodeCount = 1
-	}
-	maxIdleReconcileDelta := 5.0 + 2.0*float64(nodeCount-1)
-	if diff := reconcileAfter - reconcileBefore; diff > maxIdleReconcileDelta {
-		t.Errorf("idle: reconcile_total moved by %v over idle window; expected <= %v (nodes=%d)", diff, maxIdleReconcileDelta, nodeCount)
-	}
-
-	// Watch connections should be identical across the idle window.
+	// In the scrape-time architecture, the per-rule collect counter
+	// advances on every Prometheus scrape that hits this exporter — so
+	// "near-flat" is the wrong shape to assert. Instead we ensure that
+	// (a) the cluster's apiserver-side watch population stays unchanged,
+	// and (b) every scrape that happens during the window completes
+	// without the rule-level error counter growing.
 	for _, k := range watchedKinds {
 		if apiBefore[k] != apiAfter[k] {
 			t.Errorf("idle: watch count for resource=%q changed from %v to %v", k, apiBefore[k], apiAfter[k])
 		}
+	}
+
+	mfsAfter := scrapeExporterMetrics(t)
+	if errs := counterValue(mfsAfter, "exporter_collect_total", withLabels(map[string]string{"result": "error"})); errs > 0 {
+		t.Errorf("idle: exporter_collect_total{result=error} > 0 (got %v)", errs)
 	}
 }
 

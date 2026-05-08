@@ -108,16 +108,13 @@ func TestValidate_AcceptsItemSourceWithForEach(t *testing.T) {
 	}
 }
 
-func TestValidate_AcceptsRelationAliases(t *testing.T) {
+func TestValidate_AcceptsTopControllerSourceDirectly(t *testing.T) {
 	c := &Config{
 		Rules: []Rule{{
 			Name:   "pod_info",
 			Anchor: "Pod",
-			Relations: []RelationAlias{
-				{Name: "top", Via: "topController"},
-			},
 			Labels: map[string]Extract{
-				"controller_name": {Source: "top", Path: "metadata.name"},
+				"controller_name": {Source: "topController", Path: "metadata.name"},
 			},
 		}},
 	}
@@ -191,18 +188,11 @@ func TestValidate_AcceptsQuotedAnnotationPathsInLabels(t *testing.T) {
 		Rules: []Rule{{
 			Name:   "pod_info",
 			Anchor: "Pod",
-			Relations: []RelationAlias{
-				{Name: "top", Via: "topController"},
-			},
 			Labels: map[string]Extract{
 				"namespace": {Path: "metadata.namespace"},
 				"controller_annotation_integration_test_controller_note": {
-					Source: "top",
+					Source: "topController",
 					Path:   `metadata.annotations["integration.test/controller-note"]`,
-				},
-				"controller_annotation_integration_test_owner": {
-					Source: "top",
-					Path:   `metadata.annotations["integration.test/owner"]`,
 				},
 			},
 		}},
@@ -259,8 +249,8 @@ func TestValidate_RejectsExplicitKindSourceMissingFromWatchResources(t *testing.
 			Name:   "pod_info",
 			Anchor: "Pod",
 			Labels: map[string]Extract{
-				"ns":   {Path: "metadata.namespace"},
-				"dep":  {Source: "Deployment", Path: "metadata.name"},
+				"ns":  {Path: "metadata.namespace"},
+				"dep": {Source: "Deployment", Path: "metadata.name"},
 			},
 		}},
 	}
@@ -278,12 +268,9 @@ func TestValidate_AllowsTopControllerWithSubsetWatchKinds(t *testing.T) {
 		Rules: []Rule{{
 			Name:   "pod_info",
 			Anchor: "Pod",
-			Relations: []RelationAlias{
-				{Name: "top", Via: "topController"},
-			},
 			Labels: map[string]Extract{
 				"ns": {Path: "metadata.namespace"},
-				"x":  {Source: "top", Path: "metadata.name"},
+				"x":  {Source: "topController", Path: "metadata.name"},
 			},
 		}},
 	}
@@ -356,5 +343,153 @@ func TestExtract_OnMissingValue(t *testing.T) {
 	e := Extract{OnMissing: &s}
 	if got := e.OnMissingValue(); got != "N/A" {
 		t.Fatalf("expected N/A, got %q", got)
+	}
+}
+
+func TestValidate_AcceptsExpandLabels(t *testing.T) {
+	c := &Config{
+		Rules: []Rule{{
+			Name:   "pod_info",
+			Anchor: "Pod",
+			Labels: map[string]Extract{
+				"namespace": {Path: "metadata.namespace"},
+			},
+			ExpandLabels: []ExpandLabel{
+				{Path: "metadata.labels", Prefix: "label_"},
+				{Path: "metadata.annotations", Prefix: "annotation_", Source: "topController"},
+			},
+		}},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+}
+
+func TestValidate_RejectsExpandLabelMissingPrefix(t *testing.T) {
+	c := &Config{
+		Rules: []Rule{{
+			Name:   "pod_info",
+			Anchor: "Pod",
+			Labels: map[string]Extract{
+				"namespace": {Path: "metadata.namespace"},
+			},
+			ExpandLabels: []ExpandLabel{
+				{Path: "metadata.labels"},
+			},
+		}},
+	}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "prefix: required") {
+		t.Fatalf("expected prefix required error, got: %v", err)
+	}
+}
+
+func TestValidate_RejectsExpandLabelInvalidPrefix(t *testing.T) {
+	c := &Config{
+		Rules: []Rule{{
+			Name:   "pod_info",
+			Anchor: "Pod",
+			Labels: map[string]Extract{
+				"namespace": {Path: "metadata.namespace"},
+			},
+			ExpandLabels: []ExpandLabel{
+				{Path: "metadata.labels", Prefix: "1bad-"},
+			},
+		}},
+	}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "valid Prometheus label name") {
+		t.Fatalf("expected invalid prefix error, got: %v", err)
+	}
+}
+
+func TestValidate_RejectsExpandLabelReservedPrefix(t *testing.T) {
+	c := &Config{
+		Rules: []Rule{{
+			Name:   "pod_info",
+			Anchor: "Pod",
+			Labels: map[string]Extract{
+				"namespace": {Path: "metadata.namespace"},
+			},
+			ExpandLabels: []ExpandLabel{
+				{Path: "metadata.labels", Prefix: "__internal_"},
+			},
+		}},
+	}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("expected reserved prefix error, got: %v", err)
+	}
+}
+
+func TestValidate_RejectsExpandLabelNegativeMaxKeys(t *testing.T) {
+	c := &Config{
+		Rules: []Rule{{
+			Name:   "pod_info",
+			Anchor: "Pod",
+			Labels: map[string]Extract{
+				"namespace": {Path: "metadata.namespace"},
+			},
+			ExpandLabels: []ExpandLabel{
+				{Path: "metadata.labels", Prefix: "label_", MaxKeys: -1},
+			},
+		}},
+	}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "maxKeys") {
+		t.Fatalf("expected maxKeys error, got: %v", err)
+	}
+}
+
+func TestValidate_RejectsExpandLabelPrefixCollidingWithFixedLabel(t *testing.T) {
+	c := &Config{
+		Rules: []Rule{{
+			Name:   "pod_info",
+			Anchor: "Pod",
+			Labels: map[string]Extract{
+				"label_": {Path: "metadata.namespace"},
+			},
+			ExpandLabels: []ExpandLabel{
+				{Path: "metadata.labels", Prefix: "label_"},
+			},
+		}},
+	}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("expected prefix collision error, got: %v", err)
+	}
+}
+
+func TestValidate_AcceptsRuleWithOnlyExpandLabels(t *testing.T) {
+	c := &Config{
+		Rules: []Rule{{
+			Name:   "pod_meta",
+			Anchor: "Pod",
+			ExpandLabels: []ExpandLabel{
+				{Path: "metadata.labels", Prefix: "label_"},
+			},
+		}},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+}
+
+func TestValidate_RejectsExpandLabelItemSourceWithoutForEach(t *testing.T) {
+	c := &Config{
+		Rules: []Rule{{
+			Name:   "pod_info",
+			Anchor: "Pod",
+			Labels: map[string]Extract{
+				"namespace": {Path: "metadata.namespace"},
+			},
+			ExpandLabels: []ExpandLabel{
+				{Source: "item", Path: "metadata.labels", Prefix: "label_"},
+			},
+		}},
+	}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "requires forEach") {
+		t.Fatalf("expected forEach error, got: %v", err)
 	}
 }

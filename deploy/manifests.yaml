@@ -91,9 +91,6 @@ data:
       - name: "pod_info"
         help: "One series per Pod."
         anchor: Pod
-        relations:
-          - name: top
-            via: topController
         labels:
           namespace:
             path: "metadata.namespace"
@@ -104,13 +101,13 @@ data:
           phase:
             path: "status.phase"
           controller_kind:
-            source: top
+            source: topController
             path: "kind"
           controller_name:
-            source: top
+            source: topController
             path: "metadata.name"
           argocd_tracking_id:
-            source: top
+            source: topController
             path: 'metadata.annotations["argocd.argoproj.io/tracking-id"]'
             fallbacks:
               - source: anchor
@@ -121,9 +118,6 @@ data:
         help: "One series per (pod, container)."
         anchor: Pod
         forEach: "spec.containers[*]"
-        relations:
-          - name: top
-            via: topController
         labels:
           namespace:
             path: "metadata.namespace"
@@ -136,14 +130,31 @@ data:
             source: item
             path: "image"
           controller_kind:
-            source: top
+            source: topController
             path: "kind"
           controller_name:
-            source: top
+            source: topController
             path: "metadata.name"
           argocd_tracking_id:
-            source: top
+            source: topController
             path: 'metadata.annotations["argocd.argoproj.io/tracking-id"]'
+
+      # Optional: kube_pod_labels-style flattening of the Pod's metadata.labels
+      # into dynamic Prometheus labels. Cardinality control via allow/maxKeys
+      # is strongly recommended in production to avoid runaway dimensions.
+      # Uncomment and tune to enable.
+      #
+      # - name: "pod_labels"
+      #   help: "Pod labels expanded into dynamic Prometheus labels."
+      #   anchor: Pod
+      #   labels:
+      #     namespace: { path: "metadata.namespace" }
+      #     pod:       { path: "metadata.name" }
+      #   expandLabels:
+      #     - path: "metadata.labels"
+      #       prefix: "label_"
+      #       maxKeys: 64
+      #       # allow: ["app.kubernetes.io/name", "team", "env"]
 
 ---
 apiVersion: apps/v1

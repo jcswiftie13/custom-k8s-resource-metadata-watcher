@@ -445,23 +445,11 @@ func printExporterMetricsSnapshotIfEnabled(t *testing.T, title string, metricNam
 // snapMetrics* are allowlists for printExporterMetricsSnapshotIfEnabled when
 // INTEGRATION_PRINT_METRICS=1: only sample lines for these metric names are logged.
 var (
-	snapMetricsCorrectnessFixtureFlow          = []string{"it_pod_info", "it_pod_container_info", "exporter_parent_index_size"}
+	snapMetricsCorrectnessFixtureFlow          = []string{"it_pod_info", "it_pod_container_info", "exporter_anchor_count"}
 	snapMetricsCorrectnessControllerAnnotation = []string{"it_pod_info"}
 	snapMetricsCorrectnessNode                  = []string{"it_node_info", "it_node_address", "it_node_condition"}
-	snapMetricsBurdenBurst                       = []string{
-		"exporter_reconcile_total",
-		"exporter_reconcile_queue_depth",
-		"exporter_parent_index_hit_total",
-		"exporter_parent_index_fallback_total",
-		"rest_client_requests_total",
-	}
-	snapMetricsBurdenParentIndex = []string{
-		"it_pod_info",
-		"exporter_parent_index_hit_total",
-		"exporter_parent_index_fallback_total",
-	}
-	snapMetricsTopologyPerNamespace = []string{"it_pod_info"}
-	snapMetricsTopologyIdle         = []string{"exporter_reconcile_total", "exporter_reconcile_queue_depth"}
+	snapMetricsTopologyPerNamespace             = []string{"it_pod_info"}
+	snapMetricsTopologyIdle                     = []string{"exporter_collect_total", "exporter_collect_duration_seconds", "exporter_anchor_count"}
 )
 
 // scrapeExporterMetrics returns the parsed MetricFamilies served by the
@@ -737,6 +725,65 @@ func waitForDeploymentReady(t *testing.T, namespace, name string, timeout time.D
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// ---------------------------------------------------------------------------
+// Pod-info specific assertion helpers
+// ---------------------------------------------------------------------------
+
+// countPodInfoSeries counts the number of `it_pod_info` series whose
+// (namespace, controller_name) labels match the supplied values.
+func countPodInfoSeries(mfs map[string]*dto.MetricFamily, namespace, controllerName string) int {
+	mf, ok := mfs["it_pod_info"]
+	if !ok {
+		return 0
+	}
+	n := 0
+	for _, m := range mf.GetMetric() {
+		l := labelsOf(m)
+		if l["namespace"] == namespace && l["controller_name"] == controllerName {
+			n++
+		}
+	}
+	return n
+}
+
+// podInfoHasAnnotation returns true when at least `expected`
+// `it_pod_info` series carry the supplied controller-note annotation
+// value in `namespace`.
+func podInfoHasAnnotation(mfs map[string]*dto.MetricFamily, namespace, expectedAnnotation string, expected int) bool {
+	mf, ok := mfs["it_pod_info"]
+	if !ok {
+		return false
+	}
+	n := 0
+	for _, m := range mf.GetMetric() {
+		l := labelsOf(m)
+		if l["namespace"] != namespace {
+			continue
+		}
+		if l["controller_annotation_integration_test_controller_note"] != expectedAnnotation {
+			continue
+		}
+		n++
+	}
+	return n >= expected
+}
+
+// waitForPodInfoMentions blocks until `it_pod_info` exposes at least
+// `expected` series for the supplied controller in this namespace, or the
+// timeout elapses (in which case the test fails).
+func waitForPodInfoMentions(t *testing.T, namespace, controllerName string, expected int, timeout time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := waitFor(ctx, 2*time.Second, func(ctx context.Context) (bool, error) {
+		mfs := scrapeExporterMetrics(t)
+		return countPodInfoSeries(mfs, namespace, controllerName) >= expected, nil
+	}); err != nil {
+		t.Fatalf("it_pod_info series for ns=%s controller=%s did not reach %d within %s: %v",
+			namespace, controllerName, expected, timeout, err)
+	}
+}
 
 // dumpLogs retrieves recent exporter logs — useful when diagnosing a failed
 // test. Called implicitly by t.Cleanup for tests that want it.
