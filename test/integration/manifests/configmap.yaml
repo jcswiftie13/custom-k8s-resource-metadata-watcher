@@ -25,6 +25,10 @@ data:
           scope: Namespaced
         - kind: Node
           scope: Cluster
+        - kind: Service
+          scope: Namespaced
+        - kind: EndpointSlice
+          scope: Namespaced
 
     rules:
       - name: "pod_info"
@@ -102,3 +106,30 @@ data:
           status:
             source: item
             path: "status"
+
+      - name: "service_info"
+        help: "Integration test: one series per Service."
+        anchor: Service
+        labels:
+          namespace:
+            path: "metadata.namespace"
+          service:
+            path: "metadata.name"
+          type:
+            path: "spec.type"
+          cluster_ip:
+            path: "spec.clusterIP"
+
+      - name: "endpointslice_info"
+        help: "Integration test: one series per EndpointSlice."
+        anchor: EndpointSlice
+        labels:
+          namespace:
+            path: "metadata.namespace"
+          endpointslice:
+            path: "metadata.name"
+          service:
+            source: Service
+            path: "metadata.name"
+          addr_type:
+            path: "addressType"

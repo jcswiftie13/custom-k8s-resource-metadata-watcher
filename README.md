@@ -1,7 +1,7 @@
 # metadata-exporter
 
 A lightweight, config-driven Kubernetes metadata exporter. It watches cluster
-resources through `SharedInformer` caches (no extra API calls), walks
+resources through dynamic `SharedInformer` caches (no extra API calls), walks
 `ownerReferences` via the cache, and exposes per-series labels as Prometheus
 `_info` gauges — in the same style as `kube-state-metrics`.
 
@@ -21,6 +21,9 @@ resources through `SharedInformer` caches (no extra API calls), walks
   which resource kinds to watch via `watch.resources[]`, declare per-resource
   scope (`Namespaced`/`Cluster`), and apply per-kind `labelSelector` /
   `fieldSelector` for apiserver-side filtering.
+- **Built-in Kubernetes resources**: supports `Pod`, `ReplicaSet`,
+  `Deployment`, `StatefulSet`, `DaemonSet`, `Node`, `Service`, and
+  `EndpointSlice`.
 
 See [docs/CONFIG.md](docs/CONFIG.md) for the full configuration reference.
 

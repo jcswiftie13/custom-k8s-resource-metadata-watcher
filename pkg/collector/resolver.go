@@ -6,9 +6,13 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+
+	"github.com/example/metadata-exporter/pkg/config"
 )
 
 // Chain is the per-anchor map of resolved related objects. Keys include the
@@ -129,18 +133,20 @@ func findControllerRef(refs []metav1.OwnerReference) *metav1.OwnerReference {
 }
 
 func isSupportedKind(kind string) bool {
-	switch kind {
-	case "Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet", "Node":
-		return true
-	}
-	return false
+	_, ok := config.SupportedResource(kind)
+	return ok
 }
 
 // kindOf returns the capitalised Kubernetes Kind for a typed object.
 func kindOf(obj runtime.Object) string {
+	if u, ok := obj.(*unstructured.Unstructured); ok {
+		return u.GetKind()
+	}
 	switch obj.(type) {
 	case *corev1.Pod:
 		return "Pod"
+	case *corev1.Service:
+		return "Service"
 	case *appsv1.ReplicaSet:
 		return "ReplicaSet"
 	case *appsv1.Deployment:
@@ -151,6 +157,8 @@ func kindOf(obj runtime.Object) string {
 		return "DaemonSet"
 	case *corev1.Node:
 		return "Node"
+	case *discoveryv1.EndpointSlice:
+		return "EndpointSlice"
 	}
 	return ""
 }

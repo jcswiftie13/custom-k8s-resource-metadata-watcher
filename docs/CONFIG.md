@@ -113,7 +113,7 @@
 
 ```yaml
 metricPrefix: "custom_"    # 選填；加在每條 rule 的 name 之前
-watch: { ... }             # 選填；預設叢集全域、五種 kind 全 watch、無 selector
+watch: { ... }             # 選填；預設叢集全域、八種 kind 全 watch、無 selector
 rules:
   - { ... }                # 每個元素對應一個 Prometheus metric
 ```
@@ -148,7 +148,7 @@ watch:
       scope: Cluster
 ```
 
-`resources[].kind` 必須是 `Pod` | `ReplicaSet` | `Deployment` | `StatefulSet` | `DaemonSet` | `Node`。若某 Kind 不在 `resources` 中，該 Kind 不會建立 SharedInformer。
+`resources[].kind` 必須是 `Pod` | `ReplicaSet` | `Deployment` | `StatefulSet` | `DaemonSet` | `Node` | `Service` | `EndpointSlice`。若某 Kind 不在 `resources` 中，該 Kind 不會建立 SharedInformer。
 
 若省略 `resources` 或留空，等同 watch 全部支援 kind（含 `Node`）且無 selector。`Validate()` 會驗證每條 `rule` 的 `anchor` 及顯式 Kind source 有列在有效 watch set 內。
 
@@ -176,6 +176,8 @@ watch:
 | Deployment  | `metadata.name`、`metadata.namespace` |
 | StatefulSet | `metadata.name`、`metadata.namespace` |
 | DaemonSet   | `metadata.name`、`metadata.namespace` |
+| Service     | `metadata.name`、`metadata.namespace`、`spec.clusterIP`、`spec.type` |
+| EndpointSlice | `metadata.name`、`metadata.namespace` |
 
 超出白名單會被 apiserver 以 HTTP 400 拒絕。`metadata-exporter` 啟動時會對每組設定好的 selector 做一次小型 `LIST`（dry-run），以儘早暴露錯誤。
 
@@ -214,7 +216,7 @@ watch:
 rules:
   - name: "pod_info"       # 必填；metric 全名 = metricPrefix + name
     help: "..."            # 選填；Prometheus HELP
-    anchor: Pod            # 必填；Pod|Deployment|StatefulSet|DaemonSet|ReplicaSet|Node
+    anchor: Pod            # 必填；Pod|Deployment|StatefulSet|DaemonSet|ReplicaSet|Node|Service|EndpointSlice
     forEach: "spec.containers[*]"   # 選填；展開為 N 筆 series
     labels:                          # 選填；至少 labels 或 expandLabels 二者擇一
       <label_name>:
@@ -235,7 +237,7 @@ rules:
 
 ### `anchor`
 
-`anchor` 同時決定 **哪些 informer cache 會被 scrape 走訪**，以及 **每筆輸出 series 的主體**。允許值：`Pod`、`Deployment`、`StatefulSet`、`DaemonSet`、`ReplicaSet`、`Node`。
+`anchor` 同時決定 **哪些 informer cache 會被 scrape 走訪**，以及 **每筆輸出 series 的主體**。允許值：`Pod`、`Deployment`、`StatefulSet`、`DaemonSet`、`ReplicaSet`、`Node`、`Service`、`EndpointSlice`。
 
 ### `forEach`
 
@@ -257,7 +259,7 @@ rules:
 | `item` | 目前 `forEach` 元素；**僅**在設了 `forEach` 時合法。 |
 | `ownerController` | anchor 在 `ownerReferences` 上的直接 controller（若有）。 |
 | `topController` | owner 鏈上最深、且為 `Deployment`／`StatefulSet`／`DaemonSet` 的祖先；若 anchor 本身就是這些 Kind，回傳 anchor 自己。 |
-| `Pod`／`Deployment`／… | 沿 owner 鏈走訪時**第一個**該 Kind；若 anchor 即該 Kind 則直接回傳 anchor。 |
+| `Pod`／`Deployment`／`Service`／… | 沿 owner 鏈走訪時**第一個**該 Kind；若 anchor 即該 Kind 則直接回傳 anchor。 |
 
 > 相關物件**僅**從 informer 快取取得；**不**為走訪 owner 鏈額外打 API。
 > v1 的 `relations` 別名已移除；請直接寫 `source: topController` / `source: ownerController` / `source: Deployment` 等。
@@ -608,7 +610,7 @@ rules:
 
 ### Informer 快取與 scrape time 求值
 
-- 每個列在 `watch.resources` 的 Kind 都會建立 SharedInformer，將 LIST/WATCH 結果快取。
+- 每個列在 `watch.resources` 的 Kind 都會依固定 GVR registry 建立 dynamic SharedInformer，將 LIST/WATCH 結果以 unstructured 物件快取。
 - `metadata-exporter` **不再** 以事件觸發 reconcile：cache 由 informer 自動更新，但 metric 完全在 `/metrics` 被 scrape 當下從 cache 重算。
 - 因此 scrape latency ≈ `O(rules × anchors × (label evals + dynamic key sanitize))`。Cache 建立成本攤在 startup 與 watch 事件處理上，與 scrape 解耦。
 

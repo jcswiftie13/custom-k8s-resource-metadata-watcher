@@ -26,10 +26,13 @@ metadata:
     app.kubernetes.io/name: metadata-exporter
 rules:
   - apiGroups: [""]
-    resources: ["pods", "nodes"]
+    resources: ["pods", "nodes", "services"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
 
 ---
@@ -85,6 +88,10 @@ data:
           scope: Namespaced
         - kind: Node
           scope: Cluster
+        - kind: Service
+          scope: Namespaced
+        - kind: EndpointSlice
+          scope: Namespaced
 
     rules:
       # Per-pod series (one row per Pod).

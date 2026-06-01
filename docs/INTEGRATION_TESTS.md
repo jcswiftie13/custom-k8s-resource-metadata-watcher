@@ -80,7 +80,7 @@ flowchart LR
   - 閒置區間內 watch 連線不應漂移；scrape error 計數（`exporter_collect_total{result="error"}`) 必須為 0。
   - 在 scrape-time 架構下，`exporter_collect_total` 會隨每次 Prometheus scrape 自然推進，故不再以「near-flat」斷言；改以 watch 連線差分 + error counter 為主。
 - `TestTopology_KindSubset`
-  - `watch.resources[]` 僅含 `Pod`、`Deployment`（`kindSubsetClusterWideConfigYAML`）且 cluster-wide 時，`pods` 與 `deployments` 的 WATCH 差分為 `+1`；`replicasets` / `statefulsets` / `daemonsets` / `nodes` 為 `0`。
+  - `watch.resources[]` 僅含 `Pod`、`Deployment`（`kindSubsetClusterWideConfigYAML`）且 cluster-wide 時，`pods` 與 `deployments` 的 WATCH 差分為 `+1`；`replicasets` / `statefulsets` / `daemonsets` / `nodes` / `services` / `endpointslices` 為 `0`。
   - 規則仍使用 `topController`，未 watch `ReplicaSet` 等父 kind 時，啟動日誌應含 `not all parent kinds are watched`（不阻斷測試斷言）。
 
 ### Correctness 類
@@ -97,6 +97,8 @@ flowchart LR
 - `TestCorrectness_PodDynamicAnnotationsMutation`
   - 驗證 Pod `metadata.annotations` 動態展平後的 mutation 收斂：新增 key 後可見、刪除 key 後不殘留。
   - 並檢查 `exporter_collect_total{result="error"}` 不增加，避免功能正確但 collector 已出錯。
+- `TestCorrectness_ServiceEndpointSliceMetrics`
+  - 建立測試用 `Service` 與具 owner reference 的 `EndpointSlice`，驗證 `it_service_info` 與 `it_endpointslice_info` 會在 exporter `/metrics` 正確輸出。
 - `TestCorrectness_NodeDynamicMetadataSingleKey`
   - Node 動態 metadata 基礎路徑：1 個 label key + 1 個 annotation key 可正確展平並輸出。
 - `TestCorrectness_NodeDynamicMetadataMultiKey`
@@ -137,7 +139,7 @@ Topology 測試先量 baseline（exporter scale=0），再 scale=1 量 after，�
 其中 `controller_annotation_integration_test_controller_note` 直接以 `source: topController` 取得  
 `metadata.annotations["integration.test/controller-note"]`，可用來明確驗證資料來源是 controller 而非 Pod。
 
-預設的 `configmap`／`renderConfigYAML` 在 `kinds` 下列出 **五種** resource，僅對 `Pod` 加 `fieldSelector`（其餘空物件），以維持與舊版「全 kind + Pod 篩選」等價的 topology 與 `topController` 行為。`kind-subset` 專用設定在 `kindSubsetClusterWideConfigYAML`（僅在 `TestTopology_KindSubset` 套用），避免干擾其他以「全量 kind」假設的測試。
+預設的 `configmap`／`renderConfigYAML` 在 `watch.resources[]` 下列出 **八種** resource，僅對 `Pod` 加 `fieldSelector`（其餘空物件），以維持「全 kind + Pod 篩選」等價的 topology 與 `topController` 行為。`kind-subset` 專用設定在 `kindSubsetClusterWideConfigYAML`（僅在 `TestTopology_KindSubset` 套用），避免干擾其他以「全量 kind」假設的測試。
 
 ## 擴充測試時的建議
 

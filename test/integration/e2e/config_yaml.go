@@ -87,6 +87,33 @@ rules:
       status:
         source: item
         path: "status"
+
+  - name: "service_info"
+    help: "Integration test: one series per Service."
+    anchor: Service
+    labels:
+      namespace:
+        path: "metadata.namespace"
+      service:
+        path: "metadata.name"
+      type:
+        path: "spec.type"
+      cluster_ip:
+        path: "spec.clusterIP"
+
+  - name: "endpointslice_info"
+    help: "Integration test: one series per EndpointSlice."
+    anchor: EndpointSlice
+    labels:
+      namespace:
+        path: "metadata.namespace"
+      endpointslice:
+        path: "metadata.name"
+      service:
+        source: Service
+        path: "metadata.name"
+      addr_type:
+        path: "addressType"
 `
 
 // podRulesYAML contains only pod-anchored rules for subset watch tests where
@@ -240,5 +267,9 @@ watch:
       scope: Namespaced
 ` + podNsBlock + `    - kind: Node
       scope: Cluster
-` + sharedRulesYAML
+    - kind: Service
+      scope: Namespaced
+` + podNsBlock + `    - kind: EndpointSlice
+      scope: Namespaced
+` + podNsBlock + sharedRulesYAML
 }
