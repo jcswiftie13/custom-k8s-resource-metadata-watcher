@@ -4,11 +4,14 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func TestCorrectness_NodeMetrics(t *testing.T) {
@@ -50,12 +53,125 @@ func TestCorrectness_NodeMetrics(t *testing.T) {
 		t.Fatalf("node metrics did not converge for all %d nodes: %v", wantCount, err)
 	}
 
-	finalNodes := listNodes(t)
-	if len(finalNodes) != wantCount {
-		t.Fatalf("node count changed: had %d, now %d", wantCount, len(finalNodes))
+	ctxFinal, cancelFinal := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancelFinal()
+	if err := waitFor(ctxFinal, 2*time.Second, func(ctx context.Context) (bool, error) {
+		cur := listNodes(t)
+		if len(cur) != wantCount {
+			return false, nil
+		}
+		mfs := scrapeExporterMetrics(t)
+		for i := range cur {
+			if !nodeReadyInMetrics(mfs, &cur[i]) {
+				return false, nil
+			}
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("final node metrics consistency check failed for %d nodes: %v", wantCount, err)
 	}
-	for i := range finalNodes {
-		assertNodeMetricsExported(t, &finalNodes[i])
+}
+
+func TestCorrectness_NodeDynamicMetadataSingleKey(t *testing.T) {
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpLogs(t)
+		}
+	})
+
+	setExporterConfig(t, dynamicMetadataConfigYAML())
+	scaleExporter(t, 1)
+	waitForSteadyState(t, 10*time.Second)
+
+	nodes := listNodes(t)
+	if len(nodes) == 0 {
+		t.Fatalf("cluster has no nodes")
+	}
+	nodeName := nodes[0].Name
+
+	labelKey := "integration.test/node-label-single"
+	annoKey := "integration.test/node-annotation-single"
+	if err := patchNodeMetadataKeys(t, nodeName,
+		map[string]interface{}{labelKey: "label-single"},
+		map[string]interface{}{annoKey: "anno-single"},
+	); err != nil {
+		t.Fatalf("patch node metadata (single key): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = patchNodeMetadataKeys(t, nodeName,
+			map[string]interface{}{labelKey: nil},
+			map[string]interface{}{annoKey: nil},
+		)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := waitFor(ctx, 2*time.Second, func(ctx context.Context) (bool, error) {
+		mfs := scrapeExporterMetrics(t)
+		return metricHasExactLabels(mfs, "it_node_dynamic_metadata", map[string]string{
+			"node_name":                              nodeName,
+			"label_integration_test_node_label_single":      "label-single",
+			"annotation_integration_test_node_annotation_single": "anno-single",
+		}), nil
+	}); err != nil {
+		t.Fatalf("dynamic node metadata (single key) did not converge: %v", err)
+	}
+}
+
+func TestCorrectness_NodeDynamicMetadataMultiKey(t *testing.T) {
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpLogs(t)
+		}
+	})
+
+	setExporterConfig(t, dynamicMetadataConfigYAML())
+	scaleExporter(t, 1)
+	waitForSteadyState(t, 10*time.Second)
+
+	nodes := listNodes(t)
+	if len(nodes) == 0 {
+		t.Fatalf("cluster has no nodes")
+	}
+	nodeName := nodes[0].Name
+
+	labelPatch := map[string]interface{}{
+		"integration.test/node-label-a": "label-a",
+		"integration.test/node.label.b": "label-b",
+	}
+	annotationPatch := map[string]interface{}{
+		"integration.test/node-annotation-a": "anno-a",
+		"integration.test/node.annotation.b": "anno-b",
+	}
+	if err := patchNodeMetadataKeys(t, nodeName, labelPatch, annotationPatch); err != nil {
+		t.Fatalf("patch node metadata (multi key): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = patchNodeMetadataKeys(t, nodeName,
+			map[string]interface{}{
+				"integration.test/node-label-a": nil,
+				"integration.test/node.label.b": nil,
+			},
+			map[string]interface{}{
+				"integration.test/node-annotation-a": nil,
+				"integration.test/node.annotation.b": nil,
+			},
+		)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := waitFor(ctx, 2*time.Second, func(ctx context.Context) (bool, error) {
+		mfs := scrapeExporterMetrics(t)
+		return metricHasExactLabels(mfs, "it_node_dynamic_metadata", map[string]string{
+			"node_name":                                nodeName,
+			"label_integration_test_node_label_a":      "label-a",
+			"label_integration_test_node_label_b":      "label-b",
+			"annotation_integration_test_node_annotation_a": "anno-a",
+			"annotation_integration_test_node_annotation_b": "anno-b",
+		}), nil
+	}); err != nil {
+		t.Fatalf("dynamic node metadata (multi key) did not converge: %v", err)
 	}
 }
 
@@ -165,4 +281,28 @@ func hasNodeCondition(mfs map[string]*dto.MetricFamily, nodeName string, conds [
 		}
 	}
 	return false
+}
+
+func patchNodeMetadataKeys(t *testing.T, nodeName string, labels map[string]interface{}, annotations map[string]interface{}) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	body := map[string]interface{}{
+		"metadata": map[string]interface{}{},
+	}
+	meta := body["metadata"].(map[string]interface{})
+	if labels != nil {
+		meta["labels"] = labels
+	}
+	if annotations != nil {
+		meta["annotations"] = annotations
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	cs := mustClient(t)
+	_, err = cs.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, raw, metav1.PatchOptions{})
+	return err
 }

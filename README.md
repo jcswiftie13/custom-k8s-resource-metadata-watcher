@@ -2,19 +2,21 @@
 
 A lightweight, config-driven Kubernetes metadata exporter. It watches cluster
 resources through `SharedInformer` caches (no extra API calls), walks
-`ownerReferences` via the cache, and publishes per-series labels as Prometheus
+`ownerReferences` via the cache, and exposes per-series labels as Prometheus
 `_info` gauges — in the same style as `kube-state-metrics`.
 
-- **Informer updates, kube-state-metrics style**: every `Update` that advances
-  `resourceVersion` can enqueue reconcile work (no client-side metadata digest
-  filter); narrow `watch.resources` and rules when you need to cap CPU.
-
+- **Custom `prometheus.Collector`, scrape-time output**: every `/metrics`
+  request walks the informer cache and rebuilds the metric family on the fly.
+  No `GaugeVec` series state is kept between scrapes, so each scrape reflects
+  the cluster's current truth and there is no migration / rebuild cost when
+  resource labels change.
+- **`expandLabels` for kube_pod_labels-style dynamic labels**: per-rule, opt
+  in to flatten `metadata.labels` / `metadata.annotations` (or any other
+  Kubernetes map) into dynamic Prometheus label names with `allow` / `deny` /
+  `maxKeys` cardinality controls.
 - **Config-driven**: declare every Prometheus metric in YAML using standard
   kubectl-style JSONPath.
 - **Zero extra API calls**: owner-chain resolution uses only cached listers.
-- **Pluggable sink**: `MetadataSink` interface, with a Prometheus implementation;
-  future backends (Kafka, PostgreSQL…) implement the same interface without
-  touching the collector core.
 - **Scoped informers**: optionally restrict watches to specific namespaces, pick
   which resource kinds to watch via `watch.resources[]`, declare per-resource
   scope (`Namespaced`/`Cluster`), and apply per-kind `labelSelector` /
@@ -50,18 +52,15 @@ Local (against the current kubeconfig context):
 | `--log-level` | `info` | One of `debug`, `info`, `warn`, `error`. |
 | `--kube-api-qps` | `20` | Maximum QPS of the kubernetes client against the apiserver. |
 | `--kube-api-burst` | `40` | Maximum burst of the kubernetes client against the apiserver. |
-| `--reconcile-workers` | `4` | Number of goroutines draining the reconcile workqueue. |
 
 Tune `--kube-api-qps` / `--kube-api-burst` downward on large clusters to cap
 exporter pressure on the apiserver, and upward when tens of namespaces are
-watched in parallel. The exporter also exposes its own self-metrics to help
-you right-size the workqueue:
+watched in parallel. The exporter exposes self-metrics so you can size scrape
+intervals against the cluster's cardinality:
 
-- `exporter_reconcile_queue_depth` — current queue depth gauge.
-- `exporter_reconcile_total{rule,result}` — reconcile attempts per rule.
-- `exporter_reconcile_duration_seconds` — reconcile latency histogram per anchor kind.
-- `exporter_parent_index_hit_total` / `exporter_parent_index_fallback_total` — parent-event routing stats.
-- `exporter_parent_index_size{direction}` — reverse-index map sizes (by_parent / by_anchor), useful for leak detection.
+- `exporter_collect_total{rule,result}` — collect attempts per rule and outcome.
+- `exporter_collect_duration_seconds{rule}` — per-rule scrape build latency.
+- `exporter_anchor_count{rule,kind}` — anchor objects observed by the most recent collect.
 - `rest_client_requests_total{code,method,host}` + `rest_client_request_duration_seconds{verb,host}` — standard client-go metrics, handy for spotting apiserver pressure.
 
 Deploy to a cluster:
@@ -73,6 +72,19 @@ kubectl apply -f deploy/manifests.yaml
 Then scrape `http://<service>:8080/metrics`. The shipped manifests include
 `prometheus.io/scrape` annotations and a `Service` so that a Prometheus with
 pod-level service discovery will find the exporter automatically.
+
+## Benchmarks
+
+`pkg/collector/collector_bench_test.go` quantifies scrape-time cost as a
+function of N anchors and K dynamic labels. Use it after every config or
+collector change to confirm latency/allocation has not regressed:
+
+```sh
+make bench-collect
+```
+
+The numbers are produced against a `fake.Clientset`, so treat them as
+**relative** signals (compare runs on the same machine), not absolute SLOs.
 
 ## Integration tests (Kind)
 
@@ -192,11 +204,10 @@ go run ./test/tools/informer-observer/informer_pending_observer.go \
 
 ```
 cmd/
-  main.go                  Entry point
+  main.go                  Entry point (registers the custom Collector)
 pkg/
   config/                  YAML schema + validation
-  sink/                    MetadataSink interface + Prometheus impl
-  collector/               Informer wiring, resolver, evaluator, handlers
+  collector/               Informer wiring, resolver, evaluator, custom Prometheus Collector
 deploy/
   manifests.yaml           SA, ClusterRole+Binding, ConfigMap, Deployment, Service
 docs/

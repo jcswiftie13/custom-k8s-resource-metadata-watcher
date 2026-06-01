@@ -1,6 +1,8 @@
 // Command metadata-exporter is a lightweight Kubernetes metadata collector
 // that watches resources via SharedInformers and publishes per-series labels
-// as Prometheus `_info` gauges.
+// as Prometheus `_info` gauges. It is implemented as a custom prometheus
+// Collector, so each /metrics scrape walks the informer caches at scrape
+// time and emits one constant-value series per (anchor, forEach-item).
 package main
 
 import (
@@ -23,7 +25,6 @@ import (
 
 	"github.com/example/metadata-exporter/pkg/collector"
 	"github.com/example/metadata-exporter/pkg/config"
-	"github.com/example/metadata-exporter/pkg/sink"
 )
 
 func main() {
@@ -34,7 +35,6 @@ func main() {
 		logLevel    = flag.String("log-level", "info", "Log level: debug | info | warn | error")
 		kubeQPS     = flag.Float64("kube-api-qps", 20, "Maximum QPS the kubernetes client issues against the apiserver")
 		kubeBurst   = flag.Int("kube-api-burst", 40, "Maximum burst the kubernetes client issues against the apiserver")
-		workers     = flag.Int("reconcile-workers", 4, "Number of goroutines that drain the reconcile workqueue")
 	)
 	flag.Parse()
 
@@ -66,16 +66,15 @@ func main() {
 	reg.MustRegister(collectors.NewGoCollector())
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	registerClientGoMetrics(reg)
-	ps := sink.NewPrometheusSink(reg)
 
-	col, err := collector.New(cfg, client, ps, log, collector.Options{
-		Workers:    *workers,
+	col, err := collector.New(cfg, client, log, collector.Options{
 		Registerer: reg,
 	})
 	if err != nil {
 		log.Error("collector init failed", "err", err)
 		os.Exit(1)
 	}
+	reg.MustRegister(col)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

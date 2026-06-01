@@ -3,7 +3,10 @@
 // The config model is rule-based: each rule describes one Prometheus metric
 // whose subject (the "anchor") is a Kubernetes resource kind, and whose labels
 // are expressed as JSONPath extractions over the anchor object or related
-// objects resolved through ownerReferences.
+// objects resolved through ownerReferences. Optionally, a rule may also
+// declare expandLabels which flatten Kubernetes maps (typically
+// metadata.labels / metadata.annotations) into dynamic Prometheus label
+// names at scrape time.
 package config
 
 import (
@@ -31,8 +34,9 @@ var allSupportedKindOrder = []string{
 	"Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet", "Node",
 }
 
-// Built-in relation source names (case-sensitive).
-// Kind names are also accepted as sources (first occurrence along the owner chain).
+// Built-in source names recognised on labels.source / expandLabels.source
+// (case-sensitive). Kind names are also accepted as sources (first occurrence
+// along the owner chain).
 var builtinSources = map[string]struct{}{
 	"anchor":          {},
 	"item":            {},
@@ -72,9 +76,9 @@ type WatchResource struct {
 	// Scope must be "Namespaced" or "Cluster".
 	Scope string `json:"scope"`
 	// Namespaces is only valid for namespaced resources when scope=Namespaced.
-	Namespaces []string `json:"namespaces,omitempty"`
-	LabelSelector string `json:"labelSelector,omitempty"`
-	FieldSelector string `json:"fieldSelector,omitempty"`
+	Namespaces    []string `json:"namespaces,omitempty"`
+	LabelSelector string   `json:"labelSelector,omitempty"`
+	FieldSelector string   `json:"fieldSelector,omitempty"`
 }
 
 const (
@@ -145,25 +149,24 @@ type Rule struct {
 	// Help is the Prometheus metric help string.
 	Help string `json:"help,omitempty"`
 
-	// Anchor is the Kubernetes Kind whose events trigger reconciliation and
-	// which is the subject of each emitted series.
+	// Anchor is the Kubernetes Kind whose objects produce the series.
 	Anchor string `json:"anchor"`
 
 	// ForEach is an optional JSONPath (relative to anchor) evaluating to a
 	// list; one series is emitted per element.
 	ForEach string `json:"forEach,omitempty"`
 
-	// Relations declares named aliases for related objects (e.g. topController).
-	Relations []RelationAlias `json:"relations,omitempty"`
+	// Labels maps Prometheus label name -> Extract producing its value. The
+	// label name set declared here is the FIXED part of every series for
+	// this rule. ExpandLabels add dynamic, per-series label keys on top.
+	Labels map[string]Extract `json:"labels,omitempty"`
 
-	// Labels maps Prometheus label name -> Extract producing its value.
-	Labels map[string]Extract `json:"labels"`
-}
-
-// RelationAlias gives a short local name to a source.
-type RelationAlias struct {
-	Name string `json:"name"`
-	Via  string `json:"via"`
+	// ExpandLabels declares any number of "flatten this map into dynamic
+	// label names" rules. Each entry reads a Kubernetes map (e.g.
+	// metadata.labels) and, after key sanitisation and prefixing, every
+	// (k,v) pair becomes a Prometheus label on that anchor's series.
+	// Different anchors may carry different dynamic keys in the same scrape.
+	ExpandLabels []ExpandLabel `json:"expandLabels,omitempty"`
 }
 
 // Extract describes how to produce a single string value.
@@ -192,6 +195,62 @@ func (e Extract) OnMissingValue() string {
 		return ""
 	}
 	return *e.OnMissing
+}
+
+// EffectiveSource returns the source name after applying the "anchor" default.
+func (e Extract) EffectiveSource() string {
+	if e.Source == "" {
+		return "anchor"
+	}
+	return e.Source
+}
+
+// ExpandLabel flattens a Kubernetes map into dynamic Prometheus labels.
+//
+// Example: source="anchor", path="metadata.labels", prefix="label_" turns
+//
+//	metadata.labels{ "app.kubernetes.io/name": "api", "team": "payments" }
+//
+// into
+//
+//	label_app_kubernetes_io_name="api", label_team="payments"
+//
+// on every series produced by the rule for that anchor.
+type ExpandLabel struct {
+	// Source identifies the related object whose Path resolves to a map.
+	// Defaults to "anchor". Same naming convention as Extract.Source.
+	Source string `json:"source,omitempty"`
+
+	// Path resolves to the map to flatten. Most common values:
+	// "metadata.labels", "metadata.annotations".
+	Path string `json:"path"`
+
+	// Prefix is prepended to every dynamic label name. It must form a valid
+	// Prometheus label name on its own (matching [a-zA-Z_][a-zA-Z0-9_]*).
+	// Common conventional choices: "label_", "annotation_".
+	Prefix string `json:"prefix"`
+
+	// Allow optionally narrows the set of map keys exported. When non-empty
+	// only keys present in Allow are emitted.
+	Allow []string `json:"allow,omitempty"`
+
+	// Deny is a blacklist of map keys to skip. Deny wins over Allow when a
+	// key appears in both.
+	Deny []string `json:"deny,omitempty"`
+
+	// MaxKeys caps the number of dynamic keys emitted per anchor (per
+	// ExpandLabel entry). 0 means no limit. When non-zero the cheapest
+	// stable bound is achieved by sorting key candidates lexicographically
+	// and dropping the tail.
+	MaxKeys int `json:"maxKeys,omitempty"`
+}
+
+// EffectiveSource returns the source name after applying the "anchor" default.
+func (e ExpandLabel) EffectiveSource() string {
+	if e.Source == "" {
+		return "anchor"
+	}
+	return e.Source
 }
 
 // Load reads and validates a config file from disk.
@@ -273,19 +332,18 @@ func (c *Config) validateWatchKinds() error {
 	return nil
 }
 
-// requiredWatchKinds are kinds the rule's anchor and explicit label
+// requiredWatchKinds are kinds the rule's anchor and explicit label/expandLabel
 // sources need to have in the informer cache (excludes ownerController/topController).
 func (r *Rule) requiredWatchKinds() map[string]struct{} {
 	out := map[string]struct{}{}
 	out[r.Anchor] = struct{}{}
 	add := func(src string) {
-		resolved := r.ResolveRelation(src)
-		switch resolved {
+		switch src {
 		case "", "anchor", "item", "ownerController", "topController":
 			return
 		}
-		if _, ok := supportedAnchors[resolved]; ok {
-			out[resolved] = struct{}{}
+		if _, ok := supportedAnchors[src]; ok {
+			out[src] = struct{}{}
 		}
 	}
 	for _, ext := range r.Labels {
@@ -293,6 +351,9 @@ func (r *Rule) requiredWatchKinds() map[string]struct{} {
 		for _, f := range ext.Fallbacks {
 			add(f.EffectiveSource())
 		}
+	}
+	for _, ex := range r.ExpandLabels {
+		add(ex.EffectiveSource())
 	}
 	return out
 }
@@ -307,53 +368,44 @@ func (r *Rule) validateAgainstWatch(w WatchScope) error {
 	return nil
 }
 
+// validSourceSet returns the set of legal source names recognised by labels
+// and expandLabels: built-ins plus every supported Kind name. Relation
+// aliases are no longer supported; refer to topController / ownerController
+// or a kind name directly.
+func validSourceSet() map[string]struct{} {
+	out := make(map[string]struct{}, len(builtinSources)+len(supportedAnchors))
+	for k, v := range builtinSources {
+		out[k] = v
+	}
+	for k := range supportedAnchors {
+		out[k] = struct{}{}
+	}
+	return out
+}
+
 func (r *Rule) validate() error {
 	if strings.TrimSpace(r.Name) == "" {
 		return fmt.Errorf("name: required")
 	}
 	if _, ok := supportedAnchors[r.Anchor]; !ok {
-		return fmt.Errorf("anchor: %q is not supported (allowed: Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet)", r.Anchor)
+		return fmt.Errorf("anchor: %q is not supported (allowed: Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Node)", r.Anchor)
 	}
-	if len(r.Labels) == 0 {
-		return fmt.Errorf("labels: at least one label is required")
+	if len(r.Labels) == 0 && len(r.ExpandLabels) == 0 {
+		return fmt.Errorf("labels: at least one fixed label or expandLabels entry is required")
 	}
 
-	// Build the set of valid source names: builtins + kinds + relation aliases.
-	validSources := map[string]struct{}{}
-	for k, v := range builtinSources {
-		validSources[k] = v
-	}
-	for k := range supportedAnchors {
-		validSources[k] = struct{}{}
-	}
-	for i, rel := range r.Relations {
-		if strings.TrimSpace(rel.Name) == "" {
-			return fmt.Errorf("relations[%d].name: required", i)
-		}
-		if _, ok := builtinSources[rel.Via]; !ok {
-			if _, ok := supportedAnchors[rel.Via]; !ok {
-				return fmt.Errorf("relations[%d]: via=%q is not a valid source (allowed: anchor, ownerController, topController, or a supported kind)", i, rel.Via)
-			}
-		}
-		if rel.Via == "item" {
-			return fmt.Errorf("relations[%d]: via=%q is not permitted (item is only valid as a direct source on a label when forEach is set)", i, rel.Via)
-		}
-		if _, dup := validSources[rel.Name]; dup {
-			return fmt.Errorf("relations[%d]: name=%q collides with a builtin or earlier alias", i, rel.Name)
-		}
-		validSources[rel.Name] = struct{}{}
-	}
+	validSources := validSourceSet()
 
 	// Validate forEach: only meaningful when the anchor has array fields.
 	if r.ForEach != "" {
-		// Allowed anchors for forEach: keep permissive but sane.
-		// Evaluator will reject unparseable paths.
 		if r.Anchor == "" {
 			return fmt.Errorf("forEach: requires a valid anchor")
 		}
 	}
 
 	hasForEach := r.ForEach != ""
+
+	fixedNames := map[string]struct{}{}
 	for name, extract := range r.Labels {
 		if !promLabelNameRe.MatchString(name) {
 			return fmt.Errorf("labels[%q]: invalid Prometheus label name (must match [a-zA-Z_][a-zA-Z0-9_]*)", name)
@@ -364,15 +416,25 @@ func (r *Rule) validate() error {
 		if err := extract.validate(validSources, hasForEach); err != nil {
 			return fmt.Errorf("labels[%q]: %w", name, err)
 		}
+		fixedNames[name] = struct{}{}
+	}
+
+	for i, ex := range r.ExpandLabels {
+		if err := ex.validate(validSources, hasForEach); err != nil {
+			return fmt.Errorf("expandLabels[%d]: %w", i, err)
+		}
+		// A prefix that exactly matches a fixed label name would create
+		// ambiguity for keys that sanitise to "" — not common, but warn
+		// loudly by failing fast.
+		if _, dup := fixedNames[ex.Prefix]; dup {
+			return fmt.Errorf("expandLabels[%d]: prefix %q collides with a fixed label name", i, ex.Prefix)
+		}
 	}
 	return nil
 }
 
 func (e Extract) validate(validSources map[string]struct{}, forEachActive bool) error {
-	src := e.Source
-	if src == "" {
-		src = "anchor"
-	}
+	src := e.EffectiveSource()
 	if _, ok := validSources[src]; !ok {
 		return fmt.Errorf("source %q is not recognised", src)
 	}
@@ -393,30 +455,37 @@ func (e Extract) validate(validSources map[string]struct{}, forEachActive bool) 
 	return nil
 }
 
+func (e ExpandLabel) validate(validSources map[string]struct{}, forEachActive bool) error {
+	src := e.EffectiveSource()
+	if _, ok := validSources[src]; !ok {
+		return fmt.Errorf("source %q is not recognised", src)
+	}
+	if src == "item" && !forEachActive {
+		return fmt.Errorf("source=item requires forEach on the rule")
+	}
+	if strings.TrimSpace(e.Path) == "" {
+		return fmt.Errorf("path: required")
+	}
+	if strings.TrimSpace(e.Prefix) == "" {
+		return fmt.Errorf("prefix: required (e.g. label_, annotation_)")
+	}
+	// Validate that the prefix can begin a Prometheus label name. We
+	// approximate by appending an arbitrary identifier-safe suffix.
+	if !promLabelNameRe.MatchString(e.Prefix + "x") {
+		return fmt.Errorf("prefix %q does not form a valid Prometheus label name", e.Prefix)
+	}
+	if strings.HasPrefix(e.Prefix, "__") {
+		return fmt.Errorf("prefix %q is reserved (must not begin with __)", e.Prefix)
+	}
+	if e.MaxKeys < 0 {
+		return fmt.Errorf("maxKeys: must be >= 0 (0 means unlimited)")
+	}
+	return nil
+}
+
 // MetricName returns the fully-qualified Prometheus metric name for a rule.
 func (c *Config) MetricName(r *Rule) string {
 	return c.MetricPrefix + r.Name
-}
-
-// EffectiveSource returns the source name after applying the "anchor" default.
-func (e Extract) EffectiveSource() string {
-	if e.Source == "" {
-		return "anchor"
-	}
-	return e.Source
-}
-
-// ResolveRelation returns the underlying built-in source (or kind) that a
-// relation alias points to. Builtin names and kinds pass through unchanged.
-// Unknown names return the input as-is so callers can still surface a clear
-// error from evaluation.
-func (r *Rule) ResolveRelation(name string) string {
-	for _, rel := range r.Relations {
-		if rel.Name == name {
-			return rel.Via
-		}
-	}
-	return name
 }
 
 func defaultScopeForKind(kind string) string {
