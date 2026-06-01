@@ -11,7 +11,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/example/metadata-exporter/pkg/config"
 )
@@ -147,7 +146,7 @@ func BenchmarkCollect_OwnerChain(b *testing.B) {
 // so it can be reused from any benchmark. It does NOT call any
 // *testing.T-only methods.
 func startBenchCollectorAny(b *testing.B, cfg *config.Config, objs ...runtime.Object) (*Collector, context.CancelFunc) {
-	client := fake.NewSimpleClientset(objs...)
+	client := dynamicClientForObjects(b, objs...)
 	col, err := New(cfg, client, discardLogger(), Options{})
 	if err != nil {
 		b.Fatalf("New: %v", err)

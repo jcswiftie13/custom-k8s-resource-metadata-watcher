@@ -17,7 +17,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/dynamic"
 
 	"github.com/example/metadata-exporter/pkg/config"
 )
@@ -55,7 +55,7 @@ type Collector struct {
 //   - Calling Start to drive the informers
 //   - Registering the Collector with a prometheus.Registerer to expose its
 //     metrics (Collect is invoked on every scrape).
-func New(cfg *config.Config, client kubernetes.Interface, log *slog.Logger, opts Options) (*Collector, error) {
+func New(cfg *config.Config, client dynamic.Interface, log *slog.Logger, opts Options) (*Collector, error) {
 	if log == nil {
 		log = slog.Default()
 	}

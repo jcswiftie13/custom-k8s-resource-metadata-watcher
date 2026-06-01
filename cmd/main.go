@@ -19,7 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -56,9 +56,9 @@ func main() {
 	restCfg.QPS = float32(*kubeQPS)
 	restCfg.Burst = *kubeBurst
 	log.Info("kube client configured", "qps", restCfg.QPS, "burst", restCfg.Burst)
-	client, err := kubernetes.NewForConfig(restCfg)
+	client, err := dynamic.NewForConfig(restCfg)
 	if err != nil {
-		log.Error("kubernetes client failed", "err", err)
+		log.Error("dynamic kubernetes client failed", "err", err)
 		os.Exit(1)
 	}
 

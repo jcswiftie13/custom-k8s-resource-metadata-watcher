@@ -293,8 +293,8 @@ func TestValidate_DefaultsEmptyWatchResourcesToAllSupported(t *testing.T) {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	eff := c.Watch.EffectiveKinds()
-	if len(eff) != 6 {
-		t.Fatalf("EffectiveKinds: got len %d, want 6", len(eff))
+	if len(eff) != 8 {
+		t.Fatalf("EffectiveKinds: got len %d, want 8", len(eff))
 	}
 }
 
@@ -306,14 +306,38 @@ func TestWatchScope_EffectiveKinds_ExplicitOrder(t *testing.T) {
 			{Kind: "ReplicaSet", Scope: ScopeNamespaced},
 			{Kind: "StatefulSet", Scope: ScopeNamespaced},
 			{Kind: "DaemonSet", Scope: ScopeNamespaced},
+			{Kind: "EndpointSlice", Scope: ScopeNamespaced},
+			{Kind: "Service", Scope: ScopeNamespaced},
 		},
 	}
 	got := w.EffectiveKinds()
-	want := []string{"Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet"}
+	want := []string{"Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet", "Service", "EndpointSlice"}
 	for i := range want {
 		if i >= len(got) || got[i] != want[i] {
 			t.Fatalf("EffectiveKinds order mismatch: got %v want %v", got, want)
 		}
+	}
+}
+
+func TestValidate_AcceptsServiceAndEndpointSliceAnchors(t *testing.T) {
+	for _, kind := range []string{"Service", "EndpointSlice"} {
+		t.Run(kind, func(t *testing.T) {
+			c := &Config{
+				Watch: WatchScope{
+					Resources: []WatchResource{{Kind: kind, Scope: ScopeNamespaced}},
+				},
+				Rules: []Rule{{
+					Name:   "info",
+					Anchor: kind,
+					Labels: map[string]Extract{
+						"name": {Path: "metadata.name"},
+					},
+				}},
+			}
+			if err := c.Validate(); err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+		})
 	}
 }
 

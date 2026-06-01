@@ -13,11 +13,15 @@ import (
 	"github.com/prometheus/common/expfmt"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/dynamic"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	clientscheme "k8s.io/client-go/kubernetes/scheme"
 
 	"github.com/example/metadata-exporter/pkg/config"
 )
@@ -71,7 +75,7 @@ func depObj(name, ns string, labels, annotations map[string]string) *appsv1.Depl
 // startCollector boots an informer-backed Collector against the supplied
 // fake clientset and waits for caches to sync. The returned cancel must be
 // called by the caller (typically via defer) to stop informers.
-func startCollector(t *testing.T, cfg *config.Config, client kubernetes.Interface) (*Collector, *prometheus.Registry, context.CancelFunc) {
+func startCollector(t *testing.T, cfg *config.Config, client dynamic.Interface) (*Collector, *prometheus.Registry, context.CancelFunc) {
 	t.Helper()
 	col, err := New(cfg, client, discardLogger(), Options{})
 	if err != nil {
@@ -129,6 +133,42 @@ func runtimeObjs(items ...runtime.Object) []runtime.Object {
 	return items
 }
 
+func dynamicClientForObjects(t testing.TB, items ...runtime.Object) dynamic.Interface {
+	t.Helper()
+	objs := make([]runtime.Object, 0, len(items))
+	for _, item := range items {
+		objs = append(objs, dynamicObject(t, item))
+	}
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), dynamicListKinds(), objs...)
+}
+
+func dynamicListKinds() map[schema.GroupVersionResource]string {
+	out := map[schema.GroupVersionResource]string{}
+	for _, kind := range config.SupportedKinds() {
+		info, _ := config.SupportedResource(kind)
+		out[info.GVR()] = info.Kind + "List"
+	}
+	return out
+}
+
+func dynamicObject(t testing.TB, obj runtime.Object) runtime.Object {
+	t.Helper()
+	if u, ok := obj.(*unstructured.Unstructured); ok {
+		return u
+	}
+	m, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		t.Fatalf("to unstructured %T: %v", obj, err)
+	}
+	u := &unstructured.Unstructured{Object: m}
+	gvks, _, err := clientscheme.Scheme.ObjectKinds(obj)
+	if err != nil || len(gvks) == 0 {
+		t.Fatalf("object kind %T: %v", obj, err)
+	}
+	u.SetGroupVersionKind(gvks[0])
+	return u
+}
+
 // ---------------------------------------------------------------------------
 // Owner-chain non-regression: Pod -> ReplicaSet -> Deployment via
 // topController must continue to populate metric labels with the parent's
@@ -158,7 +198,7 @@ func TestCollect_OwnerChainTopControllerLabels(t *testing.T) {
 	r := rsObj("rs1", "ns", "dep1")
 	p := podWithOwner("p1", "ns", "rs1", nil, nil)
 
-	client := fake.NewSimpleClientset(runtimeObjs(d, r, p)...)
+	client := dynamicClientForObjects(t, runtimeObjs(d, r, p)...)
 	_, reg, cancel := startCollector(t, cfg, client)
 	defer cancel()
 
@@ -182,12 +222,12 @@ func TestCollect_OwnerControllerVsTopController(t *testing.T) {
 			Name:   "pod_info",
 			Anchor: "Pod",
 			Labels: map[string]config.Extract{
-				"namespace":      {Path: "metadata.namespace"},
-				"pod":            {Path: "metadata.name"},
-				"owner_kind":     {Source: "ownerController", Path: "kind"},
-				"owner_name":     {Source: "ownerController", Path: "metadata.name"},
-				"top_kind":       {Source: "topController", Path: "kind"},
-				"top_name":       {Source: "topController", Path: "metadata.name"},
+				"namespace":  {Path: "metadata.namespace"},
+				"pod":        {Path: "metadata.name"},
+				"owner_kind": {Source: "ownerController", Path: "kind"},
+				"owner_name": {Source: "ownerController", Path: "metadata.name"},
+				"top_kind":   {Source: "topController", Path: "kind"},
+				"top_name":   {Source: "topController", Path: "metadata.name"},
 			},
 		}},
 	}
@@ -195,7 +235,7 @@ func TestCollect_OwnerControllerVsTopController(t *testing.T) {
 	d := depObj("dep1", "ns", nil, nil)
 	r := rsObj("rs1", "ns", "dep1")
 	p := podWithOwner("p1", "ns", "rs1", nil, nil)
-	client := fake.NewSimpleClientset(runtimeObjs(d, r, p)...)
+	client := dynamicClientForObjects(t, runtimeObjs(d, r, p)...)
 	_, reg, cancel := startCollector(t, cfg, client)
 	defer cancel()
 
@@ -237,7 +277,7 @@ func TestCollect_DynamicExpandLabelsUnionAcrossPods(t *testing.T) {
 	}, nil)
 	r := rsObj("rs1", "ns", "dep1")
 	d := depObj("dep1", "ns", nil, nil)
-	client := fake.NewSimpleClientset(runtimeObjs(d, r, a, b)...)
+	client := dynamicClientForObjects(t, runtimeObjs(d, r, a, b)...)
 
 	_, reg, cancel := startCollector(t, cfg, client)
 	defer cancel()
@@ -296,7 +336,7 @@ func TestCollect_ForEachWithExpandLabels(t *testing.T) {
 		}},
 	}
 
-	client := fake.NewSimpleClientset(runtimeObjs(p)...)
+	client := dynamicClientForObjects(t, runtimeObjs(p)...)
 	_, reg, cancel := startCollector(t, cfg, client)
 	defer cancel()
 
@@ -307,6 +347,76 @@ func TestCollect_ForEachWithExpandLabels(t *testing.T) {
 	expectContain(t, out, `image="img:2"`)
 	// Dynamic label is inherited by every container series.
 	expectContain(t, out, `label_team="payments"`)
+}
+
+func TestCollect_ServiceAndEndpointSliceAnchors(t *testing.T) {
+	ctrl := true
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "api",
+			Namespace: "ns",
+			UID:       types.UID("uid-service-api"),
+			Labels:    map[string]string{"app": "api"},
+		},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP},
+	}
+	ep := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "api-abc",
+			Namespace: "ns",
+			UID:       types.UID("uid-endpointslice-api"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Service",
+				Name:       "api",
+				UID:        svc.UID,
+				Controller: &ctrl,
+			}},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses: []string{"10.0.0.10"},
+		}},
+	}
+	cfg := &config.Config{
+		MetricPrefix: "test_",
+		Watch: config.WatchScope{Resources: []config.WatchResource{
+			{Kind: "Service", Scope: config.ScopeNamespaced},
+			{Kind: "EndpointSlice", Scope: config.ScopeNamespaced},
+		}},
+		Rules: []config.Rule{
+			{
+				Name:   "service_info",
+				Anchor: "Service",
+				Labels: map[string]config.Extract{
+					"namespace": {Path: "metadata.namespace"},
+					"service":   {Path: "metadata.name"},
+					"type":      {Path: "spec.type"},
+				},
+			},
+			{
+				Name:   "endpointslice_info",
+				Anchor: "EndpointSlice",
+				Labels: map[string]config.Extract{
+					"namespace": {Path: "metadata.namespace"},
+					"slice":     {Path: "metadata.name"},
+					"service":   {Source: "Service", Path: "metadata.name"},
+					"addr_type": {Path: "addressType"},
+				},
+			},
+		},
+	}
+	client := dynamicClientForObjects(t, svc, ep)
+	_, reg, cancel := startCollector(t, cfg, client)
+	defer cancel()
+
+	out := gatherText(t, reg)
+	expectContain(t, out, `test_service_info{`)
+	expectContain(t, out, `service="api"`)
+	expectContain(t, out, `type="ClusterIP"`)
+	expectContain(t, out, `test_endpointslice_info{`)
+	expectContain(t, out, `slice="api-abc"`)
+	expectContain(t, out, `addr_type="IPv4"`)
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +452,7 @@ func TestCollect_ExpandLabelsRespectsAllowAndMaxKeys(t *testing.T) {
 	})
 	r := rsObj("rs1", "ns", "dep1")
 	d := depObj("dep1", "ns", nil, nil)
-	client := fake.NewSimpleClientset(runtimeObjs(d, r, p)...)
+	client := dynamicClientForObjects(t, runtimeObjs(d, r, p)...)
 
 	_, reg, cancel := startCollector(t, cfg, client)
 	defer cancel()
@@ -387,7 +497,7 @@ func TestCollect_PerPodIndependence(t *testing.T) {
 	b := podWithOwner("b", "ns", "rs1", map[string]string{"team": "search"}, nil)
 	r := rsObj("rs1", "ns", "dep1")
 	d := depObj("dep1", "ns", nil, nil)
-	client := fake.NewSimpleClientset(runtimeObjs(d, r, a, b)...)
+	client := dynamicClientForObjects(t, runtimeObjs(d, r, a, b)...)
 
 	_, reg, cancel := startCollector(t, cfg, client)
 	defer cancel()
@@ -403,7 +513,9 @@ func TestCollect_PerPodIndependence(t *testing.T) {
 	updated := a.DeepCopy()
 	updated.Labels = map[string]string{"team": "platform", "owner": "alice"}
 	updated.ResourceVersion = "2"
-	if _, err := client.CoreV1().Pods("ns").Update(context.Background(), updated, metav1.UpdateOptions{}); err != nil {
+	podInfo, _ := config.SupportedResource("Pod")
+	updatedObj := dynamicObject(t, updated).(*unstructured.Unstructured)
+	if _, err := client.Resource(podInfo.GVR()).Namespace("ns").Update(context.Background(), updatedObj, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("update pod a: %v", err)
 	}
 
@@ -438,7 +550,7 @@ func TestSelfMetrics_Names(t *testing.T) {
 		}},
 	}
 	reg := prometheus.NewRegistry()
-	col, err := New(cfg, fake.NewSimpleClientset(), discardLogger(), Options{Registerer: reg})
+	col, err := New(cfg, dynamicClientForObjects(t), discardLogger(), Options{Registerer: reg})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -141,5 +142,45 @@ func TestResolve_StatefulSetAnchor(t *testing.T) {
 	}
 	if chain["StatefulSet"] != sts {
 		t.Fatalf("StatefulSet kind entry missing")
+	}
+}
+
+func TestResolve_UnstructuredEndpointSliceToService(t *testing.T) {
+	svc := &unstructured.Unstructured{}
+	svc.SetAPIVersion("v1")
+	svc.SetKind("Service")
+	svc.SetNamespace("n")
+	svc.SetName("svc")
+
+	ep := &unstructured.Unstructured{}
+	ep.SetAPIVersion("discovery.k8s.io/v1")
+	ep.SetKind("EndpointSlice")
+	ep.SetNamespace("n")
+	ep.SetName("svc-abc")
+	ep.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: "v1",
+		Kind:       "Service",
+		Name:       "svc",
+		Controller: ptrBool(true),
+	}})
+
+	fl := &fakeLister{objects: map[string]runtime.Object{"Service/n/svc": svc}}
+	r := NewResolver(fl, slog.Default())
+	chain := r.Resolve(ep)
+
+	if got := kindOf(ep); got != "EndpointSlice" {
+		t.Fatalf("kindOf endpoint slice = %q, want EndpointSlice", got)
+	}
+	if chain["anchor"] != ep {
+		t.Fatalf("anchor mismatch")
+	}
+	if chain["ownerController"] != svc {
+		t.Fatalf("ownerController expected service, got %T", chain["ownerController"])
+	}
+	if chain["Service"] != svc {
+		t.Fatalf("Service kind entry missing")
+	}
+	if _, has := chain["topController"]; has {
+		t.Fatalf("EndpointSlice -> Service must not set topController")
 	}
 }

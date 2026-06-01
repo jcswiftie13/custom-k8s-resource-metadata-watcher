@@ -16,7 +16,7 @@ import (
 // watchedKinds are the plural resource names recorded by kube-apiserver in
 // `apiserver_longrunning_requests{resource=...}`. Keep in sync with
 // pkg/config/config.go:allSupportedKindOrder when the default is to watch all kinds.
-var watchedKinds = []string{"pods", "replicasets", "deployments", "statefulsets", "daemonsets", "nodes"}
+var watchedKinds = []string{"pods", "replicasets", "deployments", "statefulsets", "daemonsets", "nodes", "services", "endpointslices"}
 
 // TestTopology_ClusterWide verifies that the exporter opens exactly one
 // WATCH per kind regardless of how many namespaces exist in the cluster.
@@ -92,7 +92,7 @@ func TestTopology_KindSubset(t *testing.T) {
 			t.Errorf("kind-subset: watch delta for resource=%q = %v, want 1", k, got)
 		}
 	}
-	for _, k := range []string{"replicasets", "statefulsets", "daemonsets", "nodes"} {
+	for _, k := range []string{"replicasets", "statefulsets", "daemonsets", "nodes", "services", "endpointslices"} {
 		if got := delta[k]; got != 0 {
 			t.Errorf("kind-subset: watch delta for resource=%q = %v, want 0", k, got)
 		}

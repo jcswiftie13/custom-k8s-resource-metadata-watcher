@@ -15,23 +15,104 @@ import (
 	"regexp"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/yaml"
 )
-
-// Supported anchor kinds in v1.
-var supportedAnchors = map[string]struct{}{
-	"Pod":         {},
-	"Deployment":  {},
-	"StatefulSet": {},
-	"DaemonSet":   {},
-	"ReplicaSet":  {},
-	"Node":        {},
-}
 
 // allSupportedKindOrder is the fixed order used for informers, validation, and
 // log output when watch.kinds is empty (watch all) or for merging explicit kinds.
 var allSupportedKindOrder = []string{
-	"Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet", "Node",
+	"Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet", "Node", "Service", "EndpointSlice",
+}
+
+// ResourceInfo describes one Kubernetes resource supported by the exporter.
+type ResourceInfo struct {
+	Kind     string
+	Group    string
+	Version  string
+	Resource string
+	Scope    string
+}
+
+// GVR returns the Kubernetes GroupVersionResource used by dynamic informers.
+func (r ResourceInfo) GVR() schema.GroupVersionResource {
+	return schema.GroupVersionResource{Group: r.Group, Version: r.Version, Resource: r.Resource}
+}
+
+// GVK returns the Kubernetes GroupVersionKind for objects of this resource.
+func (r ResourceInfo) GVK() schema.GroupVersionKind {
+	return schema.GroupVersionKind{Group: r.Group, Version: r.Version, Kind: r.Kind}
+}
+
+var supportedResources = map[string]ResourceInfo{
+	"Pod": {
+		Kind:     "Pod",
+		Version:  "v1",
+		Resource: "pods",
+		Scope:    ScopeNamespaced,
+	},
+	"ReplicaSet": {
+		Kind:     "ReplicaSet",
+		Group:    "apps",
+		Version:  "v1",
+		Resource: "replicasets",
+		Scope:    ScopeNamespaced,
+	},
+	"Deployment": {
+		Kind:     "Deployment",
+		Group:    "apps",
+		Version:  "v1",
+		Resource: "deployments",
+		Scope:    ScopeNamespaced,
+	},
+	"StatefulSet": {
+		Kind:     "StatefulSet",
+		Group:    "apps",
+		Version:  "v1",
+		Resource: "statefulsets",
+		Scope:    ScopeNamespaced,
+	},
+	"DaemonSet": {
+		Kind:     "DaemonSet",
+		Group:    "apps",
+		Version:  "v1",
+		Resource: "daemonsets",
+		Scope:    ScopeNamespaced,
+	},
+	"Node": {
+		Kind:     "Node",
+		Version:  "v1",
+		Resource: "nodes",
+		Scope:    ScopeCluster,
+	},
+	"Service": {
+		Kind:     "Service",
+		Version:  "v1",
+		Resource: "services",
+		Scope:    ScopeNamespaced,
+	},
+	"EndpointSlice": {
+		Kind:     "EndpointSlice",
+		Group:    "discovery.k8s.io",
+		Version:  "v1",
+		Resource: "endpointslices",
+		Scope:    ScopeNamespaced,
+	},
+}
+
+// SupportedResource returns metadata for a supported kind.
+func SupportedResource(kind string) (ResourceInfo, bool) {
+	info, ok := supportedResources[kind]
+	return info, ok
+}
+
+// SupportedKinds returns all supported kind names in canonical watch order.
+func SupportedKinds() []string {
+	return append([]string(nil), allSupportedKindOrder...)
+}
+
+func allowedKindsString() string {
+	return strings.Join(allSupportedKindOrder, ", ")
 }
 
 // Built-in source names recognised on labels.source / expandLabels.source
@@ -306,8 +387,8 @@ func (c *Config) Validate() error {
 func (c *Config) validateWatchKinds() error {
 	seen := map[string]struct{}{}
 	for i, r := range c.Watch.Resources {
-		if _, ok := supportedAnchors[r.Kind]; !ok {
-			return fmt.Errorf("watch.resources[%d].kind: unknown kind %q (allowed: Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Node)", i, r.Kind)
+		if _, ok := SupportedResource(r.Kind); !ok {
+			return fmt.Errorf("watch.resources[%d].kind: unknown kind %q (allowed: %s)", i, r.Kind, allowedKindsString())
 		}
 		if _, dup := seen[r.Kind]; dup {
 			return fmt.Errorf("watch.resources[%d].kind: duplicated kind %q", i, r.Kind)
@@ -342,7 +423,7 @@ func (r *Rule) requiredWatchKinds() map[string]struct{} {
 		case "", "anchor", "item", "ownerController", "topController":
 			return
 		}
-		if _, ok := supportedAnchors[src]; ok {
+		if _, ok := SupportedResource(src); ok {
 			out[src] = struct{}{}
 		}
 	}
@@ -373,11 +454,11 @@ func (r *Rule) validateAgainstWatch(w WatchScope) error {
 // aliases are no longer supported; refer to topController / ownerController
 // or a kind name directly.
 func validSourceSet() map[string]struct{} {
-	out := make(map[string]struct{}, len(builtinSources)+len(supportedAnchors))
+	out := make(map[string]struct{}, len(builtinSources)+len(supportedResources))
 	for k, v := range builtinSources {
 		out[k] = v
 	}
-	for k := range supportedAnchors {
+	for k := range supportedResources {
 		out[k] = struct{}{}
 	}
 	return out
@@ -387,8 +468,8 @@ func (r *Rule) validate() error {
 	if strings.TrimSpace(r.Name) == "" {
 		return fmt.Errorf("name: required")
 	}
-	if _, ok := supportedAnchors[r.Anchor]; !ok {
-		return fmt.Errorf("anchor: %q is not supported (allowed: Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Node)", r.Anchor)
+	if _, ok := SupportedResource(r.Anchor); !ok {
+		return fmt.Errorf("anchor: %q is not supported (allowed: %s)", r.Anchor, allowedKindsString())
 	}
 	if len(r.Labels) == 0 && len(r.ExpandLabels) == 0 {
 		return fmt.Errorf("labels: at least one fixed label or expandLabels entry is required")
@@ -489,8 +570,8 @@ func (c *Config) MetricName(r *Rule) string {
 }
 
 func defaultScopeForKind(kind string) string {
-	if kind == "Node" {
-		return ScopeCluster
+	if info, ok := SupportedResource(kind); ok {
+		return info.Scope
 	}
 	return ScopeNamespaced
 }

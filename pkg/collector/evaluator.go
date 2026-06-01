@@ -192,6 +192,17 @@ func enrichTypeMetaFromScheme(m map[string]interface{}, obj runtime.Object) {
 	if k != "" && v != "" {
 		return
 	}
+	if gvk := obj.GetObjectKind().GroupVersionKind(); !gvk.Empty() {
+		if k == "" && gvk.Kind != "" {
+			m["kind"] = gvk.Kind
+		}
+		if v == "" {
+			if gv := gvk.GroupVersion(); gv.String() != "" {
+				m["apiVersion"] = gv.String()
+			}
+		}
+		return
+	}
 	gvks, _, err := clientscheme.Scheme.ObjectKinds(obj)
 	if err != nil || len(gvks) == 0 {
 		return

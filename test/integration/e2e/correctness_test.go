@@ -10,6 +10,8 @@ import (
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -159,7 +161,7 @@ func TestCorrectness_PodDynamicLabelsExpanded(t *testing.T) {
 
 	pod := createPausePod(t, ns, "dynamic-pod-labels",
 		map[string]string{
-			"app.kubernetes.io/name":      "web",
+			"app.kubernetes.io/name":       "web",
 			"integration.test/extra-label": "blue",
 		},
 		nil,
@@ -170,9 +172,9 @@ func TestCorrectness_PodDynamicLabelsExpanded(t *testing.T) {
 	if err := waitFor(ctx, 2*time.Second, func(ctx context.Context) (bool, error) {
 		mfs := scrapeExporterMetrics(t)
 		return metricHasExactLabels(mfs, "it_pod_dynamic_metadata", map[string]string{
-			"namespace":                        ns,
-			"pod":                              pod.Name,
-			"label_app_kubernetes_io_name":     "web",
+			"namespace":                          ns,
+			"pod":                                pod.Name,
+			"label_app_kubernetes_io_name":       "web",
 			"label_integration_test_extra_label": "blue",
 		}), nil
 	}); err != nil {
@@ -213,8 +215,8 @@ func TestCorrectness_PodDynamicAnnotationsMutation(t *testing.T) {
 		}
 		mfs := parsePromText(t, body)
 		return metricHasExactLabels(mfs, "it_pod_dynamic_metadata", map[string]string{
-			"namespace":                     ns,
-			"pod":                           pod.Name,
+			"namespace":                          ns,
+			"pod":                                pod.Name,
 			"annotation_integration_test_anno_a": "value-a",
 		}), nil
 	}); err != nil {
@@ -252,8 +254,8 @@ func TestCorrectness_PodDynamicAnnotationsMutation(t *testing.T) {
 		}
 		mfs := parsePromText(t, body)
 		hasNew := metricHasExactLabels(mfs, "it_pod_dynamic_metadata", map[string]string{
-			"namespace":                     ns,
-			"pod":                           pod.Name,
+			"namespace":                          ns,
+			"pod":                                pod.Name,
 			"annotation_integration_test_anno_b": "value-b",
 		})
 		hasOld := metricHasLabelValue(mfs, "it_pod_dynamic_metadata", map[string]string{
@@ -269,6 +271,115 @@ func TestCorrectness_PodDynamicAnnotationsMutation(t *testing.T) {
 	if errs := counterValue(mfs, "exporter_collect_total", withLabels(map[string]string{"result": "error"})); errs > 0 {
 		t.Fatalf("collector errors observed after dynamic annotation mutation: %v", errs)
 	}
+}
+
+func TestCorrectness_ServiceEndpointSliceMetrics(t *testing.T) {
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpLogs(t)
+		}
+	})
+	ns := "e2e-service-endpointslice-0"
+	createNamespaces(t, ns)
+	t.Cleanup(func() { deleteNamespaces(t, ns) })
+	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), snapMetricsCorrectnessServiceEndpointSlice) })
+
+	setExporterConfig(t, clusterWideConfigYAML())
+	scaleExporter(t, 1)
+	waitForSteadyState(t, 10*time.Second)
+
+	svc := createFixtureService(t, ns, "fixture-api")
+	ep := createFixtureEndpointSlice(t, ns, "fixture-api-abc", svc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := waitFor(ctx, 2*time.Second, func(ctx context.Context) (bool, error) {
+		mfs := scrapeExporterMetrics(t)
+		hasService := metricHasExactLabels(mfs, "it_service_info", map[string]string{
+			"namespace":  ns,
+			"service":    svc.Name,
+			"type":       string(corev1.ServiceTypeClusterIP),
+			"cluster_ip": svc.Spec.ClusterIP,
+		})
+		hasEndpointSlice := metricHasExactLabels(mfs, "it_endpointslice_info", map[string]string{
+			"namespace":     ns,
+			"endpointslice": ep.Name,
+			"service":       svc.Name,
+			"addr_type":     string(discoveryv1.AddressTypeIPv4),
+		})
+		return hasService && hasEndpointSlice, nil
+	}); err != nil {
+		t.Fatalf("service/endpointslice metrics did not converge: %v", err)
+	}
+}
+
+func createFixtureService(t *testing.T, namespace, name string) *corev1.Service {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name": name,
+				testLabelKey:             testLabelValue,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{{
+				Name:     "http",
+				Port:     80,
+				Protocol: corev1.ProtocolTCP,
+			}},
+		},
+	}
+	created, err := mustClient(t).CoreV1().Services(namespace).Create(ctx, svc, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create service %s/%s: %v", namespace, name, err)
+	}
+	if created.Spec.ClusterIP == "" {
+		t.Fatalf("created service %s/%s has empty clusterIP", namespace, name)
+	}
+	return created
+}
+
+func createFixtureEndpointSlice(t *testing.T, namespace, name string, svc *corev1.Service) *discoveryv1.EndpointSlice {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ep := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"kubernetes.io/service-name": svc.Name,
+				testLabelKey:                 testLabelValue,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Service",
+				Name:       svc.Name,
+				UID:        svc.UID,
+				Controller: ptr(true),
+			}},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses: []string{"10.0.0.10"},
+		}},
+		Ports: []discoveryv1.EndpointPort{{
+			Name:     ptr("http"),
+			Port:     ptr(int32(8080)),
+			Protocol: ptr(corev1.ProtocolTCP),
+		}},
+	}
+	created, err := mustClient(t).DiscoveryV1().EndpointSlices(namespace).Create(ctx, ep, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create endpointslice %s/%s: %v", namespace, name, err)
+	}
+	return created
 }
 
 // containerInfoMatches returns true when it_pod_container_info contains at

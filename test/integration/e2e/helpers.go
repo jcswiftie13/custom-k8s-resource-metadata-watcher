@@ -53,8 +53,8 @@ const (
 
 // shared holds process-wide test singletons established by TestMain.
 var shared struct {
-	cfg    *rest.Config
-	client kubernetes.Interface
+	cfg      *rest.Config
+	client   kubernetes.Interface
 	repoRoot string
 }
 
@@ -447,9 +447,10 @@ func printExporterMetricsSnapshotIfEnabled(t *testing.T, title string, metricNam
 var (
 	snapMetricsCorrectnessFixtureFlow          = []string{"it_pod_info", "it_pod_container_info", "exporter_anchor_count"}
 	snapMetricsCorrectnessControllerAnnotation = []string{"it_pod_info"}
-	snapMetricsCorrectnessNode                  = []string{"it_node_info", "it_node_address", "it_node_condition"}
-	snapMetricsTopologyPerNamespace             = []string{"it_pod_info"}
-	snapMetricsTopologyIdle                     = []string{"exporter_collect_total", "exporter_collect_duration_seconds", "exporter_anchor_count"}
+	snapMetricsCorrectnessNode                 = []string{"it_node_info", "it_node_address", "it_node_condition"}
+	snapMetricsCorrectnessServiceEndpointSlice = []string{"it_service_info", "it_endpointslice_info"}
+	snapMetricsTopologyPerNamespace            = []string{"it_pod_info"}
+	snapMetricsTopologyIdle                    = []string{"exporter_collect_total", "exporter_collect_duration_seconds", "exporter_anchor_count"}
 )
 
 // scrapeExporterMetrics returns the parsed MetricFamilies served by the
@@ -818,4 +819,3 @@ func dumpLogs(t *testing.T) {
 		t.Logf("=== exporter logs for pod %s ===\n%s", p.Name, strings.TrimRight(string(body), "\n"))
 	}
 }
-
