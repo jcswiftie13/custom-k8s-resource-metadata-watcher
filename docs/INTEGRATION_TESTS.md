@@ -11,6 +11,7 @@
 2. `topController` 關聯鏈解析正確性，含未 watch 父 kind 時的 `onMissing`/`fallbacks` 行為。
 3. 在高頻更新下，scrape 端的可觀測性穩定（`exporter_collect_total` 不出現 error，`exporter_anchor_count` 隨 cache 收斂）。
 4. watch 拓樸在 **cluster-wide**、**per-namespace**、以及 **`watch.resources[]` 僅子集** 等模式下的可預期性，與 `apiserver_longrunning_requests` 的差分一致。
+5. 任意 GVR / CRD、discovery opt-in、缺 RBAC 與 empty watch 行為不增加非預期 apiserver 負擔。
 
 ## 範圍與非目標
 
@@ -18,11 +19,13 @@
 
 - 從 Kubernetes 物件到 Prometheus 指標的端到端驗證。
 - watch 連線數在不同拓樸下的差分（delta）驗證。
+- empty watch 不建立 informer / WATCH 連線，以及缺少 `watch.resources` 時的啟動失敗訊息。
+- 任意 GVR / CRD 的 namespaced 與 cluster-scoped watch 行為。
 - 高頻更新下，scrape-time 仍可在 timeout 內穩定產出（不噴 error counter）。
 
 不在此套件範圍：
 
-- 長時間 soak 或記憶體洩漏認證（例如連跑數小時）。
+- 長時間 soak 或正式記憶體洩漏認證（例如連跑數小時）；本套件只做 idle/watch connection 不漂移與 benchmark/race 的回歸訊號。
 - 多節點**排程策略**、Pod 跨節點遷移與工作負載抖動（整測預設 Kind 已為多節點，僅用於擴充 Node 指標覆蓋與較真實的節點 churn，不驗證排程器行為）。
 - 網路故障 / 控制平面中斷的 chaos 驗證。
 
@@ -82,6 +85,9 @@ flowchart LR
 - `TestTopology_KindSubset`
   - `watch.resources[]` 僅含 `Pod`、`Deployment`（`kindSubsetClusterWideConfigYAML`）且 cluster-wide 時，`pods` 與 `deployments` 的 WATCH 差分為 `+1`；`replicasets` / `statefulsets` / `daemonsets` / `nodes` / `services` / `endpointslices` 為 `0`。
   - 規則仍使用 `topController`，未 watch `ReplicaSet` 等父 kind 時，啟動日誌應含 `not all parent kinds are watched`（不阻斷測試斷言）。
+- `TestTopology_EmptyWatch`（新增目標）
+  - `watch.resources` 省略或空時，effective watch set 為空；若 config 還有 rules，exporter 應 fail fast 並在 log 中提示需明確加入 `watch.resources`。
+  - scale exporter 前後的 `apiserver_longrunning_requests{verb="WATCH"}` delta 應維持 0，確認預設不對 apiserver 建立 LIST/WATCH 負擔。
 
 ### Correctness 類
 
@@ -99,6 +105,15 @@ flowchart LR
   - 並檢查 `exporter_collect_total{result="error"}` 不增加，避免功能正確但 collector 已出錯。
 - `TestCorrectness_ServiceEndpointSliceMetrics`
   - 建立測試用 `Service` 與具 owner reference 的 `EndpointSlice`，驗證 `it_service_info` 與 `it_endpointslice_info` 會在 exporter `/metrics` 正確輸出。
+- `TestCorrectness_ArbitraryGVRCRD`（新增目標）
+  - 建立 namespaced CRD + CR，使用完整 `group/version/resource/kind/scope` config 驗證 metric 輸出、namespace filtering 與 watch delta。
+  - 建立 cluster-scoped CRD + CR，驗證 `scope: Cluster` 不接受 `namespaces`，且 watch delta 為 1。
+- `TestCorrectness_DiscoveryOptIn`（新增目標）
+  - `discovery.enabled=false` 且未寫完整 GVR 時啟動失敗並給明確錯誤。
+  - `discovery.enabled=true` 時以 `apiVersion + kind` 解析 resource/scope；缺 discovery 權限或查不到時啟動失敗，提示改寫完整 GVR。
+- `TestCorrectness_RBACForArbitraryGVR`（新增目標）
+  - 有 CRD `get/list/watch` 權限時 exporter 可 Ready 且輸出 metrics。
+  - 缺目標 GVR `list/watch` 權限時啟動失敗，錯誤包含 GVR、scope、namespace/selector。
 - `TestCorrectness_NodeDynamicMetadataSingleKey`
   - Node 動態 metadata 基礎路徑：1 個 label key + 1 個 annotation key 可正確展平並輸出。
 - `TestCorrectness_NodeDynamicMetadataMultiKey`
@@ -118,7 +133,7 @@ flowchart LR
 
 Topology 測試先量 baseline（exporter scale=0），再 scale=1 量 after，最後比 `delta`。  
 這是因為 apiserver 指標本身包含系統元件的 watch，直接用絕對值容易誤判。  
-有明確的 `watch.resources[]`（或省略時展開為全部支援 kind）時，WATCH 扇出大約是「namespace 段數（cluster-wide 為 1）× **啟用中的 kind 數**」，等同程式內的 `len(namespaces) × len(EffectiveKinds)`（`EffectiveKinds` 定義在 `docs/CONFIG.md` / `pkg/config`）。
+有明確的 `watch.resources[]` 時，WATCH 扇出大約是「namespace 段數（cluster-wide 為 1）× **啟用中的 resource 數**」，等同程式內的 `sum(resourceWatchScopes)`。省略或空 `watch.resources` 時不建立 informer，預期 WATCH delta 為 0；若 rules 仍引用 anchor/source，exporter 應在啟動驗證階段失敗。
 
 ### 3) 最終一致性等待（`waitFor + timeout`）是測試設計的一部分
 
@@ -139,7 +154,9 @@ Topology 測試先量 baseline（exporter scale=0），再 scale=1 量 after，�
 其中 `controller_annotation_integration_test_controller_note` 直接以 `source: topController` 取得  
 `metadata.annotations["integration.test/controller-note"]`，可用來明確驗證資料來源是 controller 而非 Pod。
 
-預設的 `configmap`／`renderConfigYAML` 在 `watch.resources[]` 下列出 **八種** resource，僅對 `Pod` 加 `fieldSelector`（其餘空物件），以維持「全 kind + Pod 篩選」等價的 topology 與 `topController` 行為。`kind-subset` 專用設定在 `kindSubsetClusterWideConfigYAML`（僅在 `TestTopology_KindSubset` 套用），避免干擾其他以「全量 kind」假設的測試。
+預設的 `configmap`／`renderConfigYAML` 在 `watch.resources[]` 下明確列出 **八種內建** resource，僅對 `Pod` 加 `fieldSelector`（其餘空物件），以維持「明確全內建 resource + Pod 篩選」的 topology 與 `topController` 行為。`kind-subset` 專用設定在 `kindSubsetClusterWideConfigYAML`（僅在 `TestTopology_KindSubset` 套用），避免干擾其他以「明確全內建 resource」假設的測試。
+
+任意 GVR 測試應優先用測試專用 CRD manifest，而不是依賴叢集版本內建資源差異。Discovery 測試只在啟動時解析一次，不應出現在 scrape 或 watch event 路徑。
 
 ## 擴充測試時的建議
 
@@ -153,11 +170,11 @@ Topology 測試先量 baseline（exporter scale=0），再 scale=1 量 after，�
 
 ## 已知限制
 
-- 尚未納入長時間記憶體/協程趨勢追蹤。
+- 尚未納入長時間記憶體/協程趨勢追蹤；短期回歸以 `BenchmarkCollect_*`、idle watch delta、Go race/leak 類檢查輔助。
 - 尚未涵蓋控制平面故障復原情境。
 - watch 歸因仍採差分法，不是單 exporter 身分歸因。
 - Kind 預設為 [`kind-config.yaml`](../test/integration/kind-config.yaml) 的三節點拓樸；Node `ExternalIP` 為測試用 patch，若 kubelet 覆寫 `status.addresses` 可能影響穩定性（見 `patch_kind_node_external_ips.sh` 註解與 `INTEGRATION_PATCH_NODE_EXTERNAL_IP`）。
 
 ## 設定檔（schema）
 
-整合測與 [`docs/CONFIG.md`](../docs/CONFIG.md) 第 4 節一致，使用 `watch.resources[]`（`kind`、`scope`、`namespaces`、`labelSelector`、`fieldSelector`）。變更 exporter 二進位或設定後跑 `make e2e` 前請**重建 exporter image**。YAML 中若出現不在 struct 內的鍵，反序列化時會被忽略，不會由 `Load` 特別報錯。
+整合測與 [`docs/CONFIG.md`](../docs/CONFIG.md) 第 4 節一致，使用 `watch.resources[]`。內建資源可用 legacy `kind` + `scope`；任意 GVR / CRD 使用 `name`、`group`、`version`、`resource`、`kind`、`scope`；discovery opt-in 可用 `apiVersion + kind` 於啟動時解析。變更 exporter 二進位或設定後跑 `make e2e` 前請**重建 exporter image**。YAML 中若出現不在 struct 內的鍵，反序列化時會被忽略，不會由 `Load` 特別報錯。

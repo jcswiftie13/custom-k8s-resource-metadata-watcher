@@ -25,6 +25,11 @@ metadata:
   labels:
     app.kubernetes.io/name: metadata-exporter
 rules:
+  # Built-in example resources used by the default ConfigMap below.
+  # Add get/list/watch rules for every extra GVR you declare in config.yaml
+  # (for example batch/cronjobs, batch/jobs, networking.k8s.io/ingresses,
+  # or your CRD plural resource). Discovery, when enabled, only resolves
+  # schema; it does not replace these target-resource permissions.
   - apiGroups: [""]
     resources: ["pods", "nodes", "services"]
     verbs: ["get", "list", "watch"]
@@ -67,6 +72,8 @@ data:
     # watch the whole cluster (requires cluster-wide RBAC which is already
     # granted by the ClusterRoleBinding above).
     watch:
+      # Explicit watch set. If resources is omitted or empty, the exporter
+      # watches nothing and rules that reference anchors fail fast.
       resources:
         - kind: Pod
           scope: Namespaced

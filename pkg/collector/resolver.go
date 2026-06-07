@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/example/metadata-exporter/pkg/config"
 )
@@ -30,24 +31,17 @@ type ListerGetter interface {
 
 // Resolver walks ownerReferences using only the supplied ListerGetter.
 type Resolver struct {
-	lg  ListerGetter
-	log *slog.Logger
+	lg       ListerGetter
+	registry *config.Registry
+	log      *slog.Logger
 }
 
 // NewResolver constructs a resolver.
-func NewResolver(lg ListerGetter, log *slog.Logger) *Resolver {
+func NewResolver(lg ListerGetter, registry *config.Registry, log *slog.Logger) *Resolver {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Resolver{lg: lg, log: log}
-}
-
-// supportedKinds indexes the kinds whose owner references we follow and for
-// which we keep a slot in the Chain.
-var topControllerKinds = map[string]struct{}{
-	"Deployment":  {},
-	"StatefulSet": {},
-	"DaemonSet":   {},
+	return &Resolver{lg: lg, registry: registry, log: log}
 }
 
 // Resolve builds the Chain for the given anchor object, following
@@ -65,8 +59,8 @@ func (r *Resolver) Resolve(obj runtime.Object) Chain {
 	if kind != "" {
 		chain[kind] = obj
 	}
-	if _, top := topControllerKinds[kind]; top {
-		chain["topController"] = obj
+	if info, ok := r.resourceForObject(obj); ok {
+		r.addChainObject(chain, info, obj)
 	}
 
 	const maxDepth = 8 // defensive: K8s owner chains are shallow (Pod -> RS -> Deployment).
@@ -77,21 +71,32 @@ func (r *Resolver) Resolve(obj runtime.Object) Chain {
 		if ref == nil {
 			break
 		}
-		if !isSupportedKind(ref.Kind) {
-			// Unknown controller (e.g. a CRD); stop here without failing.
+		parentInfo, ok := r.resourceForOwnerRef(ref)
+		if !ok || !parentInfo.Owner.FollowEnabled() {
+			r.log.Warn("owner GVK is not watched; stopping owner-chain walk",
+				"apiVersion", ref.APIVersion,
+				"kind", ref.Kind,
+				"namespace", currentMeta.GetNamespace(),
+				"name", ref.Name,
+				"suggestion", "add the owner resource to watch.resources when source labels need it",
+			)
 			break
 		}
-		parent, err := r.lg.Get(ref.Kind, currentMeta.GetNamespace(), ref.Name)
+		parent, err := r.lg.Get(parentInfo.Name, currentMeta.GetNamespace(), ref.Name)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				r.log.Warn("owner not found in cache; stopping owner-chain walk",
+					"apiVersion", ref.APIVersion,
 					"kind", ref.Kind,
+					"resource", parentInfo.Name,
 					"namespace", currentMeta.GetNamespace(),
 					"name", ref.Name,
 				)
 			} else {
 				r.log.Warn("owner lookup failed; stopping owner-chain walk",
+					"apiVersion", ref.APIVersion,
 					"kind", ref.Kind,
+					"resource", parentInfo.Name,
 					"namespace", currentMeta.GetNamespace(),
 					"name", ref.Name,
 					"err", err,
@@ -102,10 +107,7 @@ func (r *Resolver) Resolve(obj runtime.Object) Chain {
 		if i == 0 {
 			chain["ownerController"] = parent
 		}
-		chain[ref.Kind] = parent
-		if _, top := topControllerKinds[ref.Kind]; top {
-			chain["topController"] = parent
-		}
+		r.addChainObject(chain, parentInfo, parent)
 		parentMeta, ok := metaAccessor(parent)
 		if !ok {
 			break
@@ -116,6 +118,36 @@ func (r *Resolver) Resolve(obj runtime.Object) Chain {
 	}
 
 	return chain
+}
+
+func (r *Resolver) addChainObject(chain Chain, info config.ResourceInfo, obj runtime.Object) {
+	chain[info.Name] = obj
+	if byKind, err := r.registry.ResourceFor(info.Kind); err == nil && byKind.Name == info.Name {
+		chain[info.Kind] = obj
+	}
+	if info.Owner.TopController {
+		chain["topController"] = obj
+	}
+}
+
+func (r *Resolver) resourceForOwnerRef(ref *metav1.OwnerReference) (config.ResourceInfo, bool) {
+	if ref.APIVersion == "" {
+		info, err := r.registry.ResourceFor(ref.Kind)
+		return info, err == nil
+	}
+	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil {
+		return config.ResourceInfo{}, false
+	}
+	return r.registry.ResourceForGVK(gv.WithKind(ref.Kind))
+}
+
+func (r *Resolver) resourceForObject(obj runtime.Object) (config.ResourceInfo, bool) {
+	gvk := gvkOf(obj)
+	if gvk.Empty() {
+		return config.ResourceInfo{}, false
+	}
+	return r.registry.ResourceForGVK(gvk)
 }
 
 // findControllerRef returns the owner reference with Controller=true, or the
@@ -130,11 +162,6 @@ func findControllerRef(refs []metav1.OwnerReference) *metav1.OwnerReference {
 		return &refs[0]
 	}
 	return nil
-}
-
-func isSupportedKind(kind string) bool {
-	_, ok := config.SupportedResource(kind)
-	return ok
 }
 
 // kindOf returns the capitalised Kubernetes Kind for a typed object.
@@ -161,6 +188,31 @@ func kindOf(obj runtime.Object) string {
 		return "EndpointSlice"
 	}
 	return ""
+}
+
+func gvkOf(obj runtime.Object) schema.GroupVersionKind {
+	if u, ok := obj.(*unstructured.Unstructured); ok {
+		return u.GroupVersionKind()
+	}
+	switch obj.(type) {
+	case *corev1.Pod:
+		return schema.GroupVersionKind{Version: "v1", Kind: "Pod"}
+	case *corev1.Service:
+		return schema.GroupVersionKind{Version: "v1", Kind: "Service"}
+	case *appsv1.ReplicaSet:
+		return schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "ReplicaSet"}
+	case *appsv1.Deployment:
+		return schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+	case *appsv1.StatefulSet:
+		return schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "StatefulSet"}
+	case *appsv1.DaemonSet:
+		return schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "DaemonSet"}
+	case *corev1.Node:
+		return schema.GroupVersionKind{Version: "v1", Kind: "Node"}
+	case *discoveryv1.EndpointSlice:
+		return schema.GroupVersionKind{Group: "discovery.k8s.io", Version: "v1", Kind: "EndpointSlice"}
+	}
+	return schema.GroupVersionKind{}
 }
 
 // metaAccessor returns the metav1.Object view of a runtime.Object.

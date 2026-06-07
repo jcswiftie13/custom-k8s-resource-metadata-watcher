@@ -5,7 +5,8 @@ metadata:
   labels:
     app.kubernetes.io/name: metadata-exporter-integration
 data:
-  # Default base config: cluster-wide watch.
+  # Default base config: explicit cluster-wide watch.
+  # Omitting watch.resources now means "watch nothing".
   # Go e2e tests rewrite this ConfigMap to switch between topology modes.
   config.yaml: |
     metricPrefix: "it_"

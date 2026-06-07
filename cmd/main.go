@@ -19,6 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -46,7 +47,7 @@ func main() {
 		log.Error("load config failed", "err", err)
 		os.Exit(1)
 	}
-	log.Info("config loaded", "rules", len(cfg.Rules), "watchKinds", cfg.Watch.EffectiveKinds(), "watchResources", cfg.Watch.EffectiveResources())
+	log.Info("config parsed", "rules", len(cfg.Rules), "discoveryEnabled", cfg.Discovery.Enabled)
 
 	restCfg, err := buildRestConfig(*kubeconfig)
 	if err != nil {
@@ -61,6 +62,23 @@ func main() {
 		log.Error("dynamic kubernetes client failed", "err", err)
 		os.Exit(1)
 	}
+	if cfg.Discovery.Enabled {
+		disco, err := discovery.NewDiscoveryClientForConfig(restCfg)
+		if err != nil {
+			log.Error("discovery client failed", "err", err)
+			os.Exit(1)
+		}
+		if err := cfg.ResolveDiscovery(disco); err != nil {
+			log.Error("discovery resolution failed", "err", err)
+			os.Exit(1)
+		}
+	}
+	registry, err := cfg.Registry()
+	if err != nil {
+		log.Error("resource registry build failed", "err", err)
+		os.Exit(1)
+	}
+	log.Info("config loaded", "rules", len(cfg.Rules), "watchResources", registry.Resources())
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector())

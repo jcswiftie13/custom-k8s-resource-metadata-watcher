@@ -113,7 +113,8 @@
 
 ```yaml
 metricPrefix: "custom_"    # 選填；加在每條 rule 的 name 之前
-watch: { ... }             # 選填；預設叢集全域、八種 kind 全 watch、無 selector
+discovery: { ... }         # 選填；預設 disabled
+watch: { ... }             # 選填；省略或 resources 空陣列時預設完全不 watch
 rules:
   - { ... }                # 每個元素對應一個 Prometheus metric
 ```
@@ -125,7 +126,8 @@ rules:
 | YAML 欄位 | 角色 |
 |-----------|------|
 | `metricPrefix` | 選填前綴；與各 `rules[].name` 組成註冊用 Prometheus metric 名稱，並受 metric 命名 regex 檢查。 |
-| `watch` | 選填 `WatchScope`：以 `watch.resources[]` 宣告每個 Kind 的 scope、namespace 與 selector。 |
+| `discovery` | 選填；`enabled: true` 時允許用 Kubernetes discovery 補齊缺少的 `resource` / `scope`。預設 `false`。 |
+| `watch` | 選填 `WatchScope`：以 `watch.resources[]` 宣告每個 resource 的 GVR/GVK、scope、namespace 與 selector。 |
 | `rules` | **必填**、非空之 `Rule` 陣列。 |
 
 ---
@@ -146,11 +148,35 @@ watch:
       labelSelector: "managed-by=argocd"
     - kind: Node
       scope: Cluster
+    - name: CronJob
+      group: batch
+      version: v1
+      resource: cronjobs
+      kind: CronJob
+      scope: Namespaced
 ```
 
-`resources[].kind` 必須是 `Pod` | `ReplicaSet` | `Deployment` | `StatefulSet` | `DaemonSet` | `Node` | `Service` | `EndpointSlice`。若某 Kind 不在 `resources` 中，該 Kind 不會建立 SharedInformer。
+`watch.resources[]` 支援兩種寫法：
 
-若省略 `resources` 或留空，等同 watch 全部支援 kind（含 `Node`）且無 selector。`Validate()` 會驗證每條 `rule` 的 `anchor` 及顯式 Kind source 有列在有效 watch set 內。
+- **Legacy kind-only**：內建資源可只寫 `kind`（可選 `scope`、`namespaces`、selector）。目前內建 catalog 包含 `Pod`、`ReplicaSet`、`Deployment`、`StatefulSet`、`DaemonSet`、`Node`、`Service`、`EndpointSlice`，程式會自動補齊 GVR/GVK/scope/owner 預設。
+- **任意 GVR**：非內建資源或 CRD 請寫完整 `name`、`group`、`version`、`resource`、`kind`、`scope`。`name` 是 `rules[].anchor` 與 `labels[].source` 使用的穩定引用鍵；省略時預設為 `kind`，但同 kind 多個 group/version 時建議明確設定。
+
+若省略 `resources` 或留空，預設為**完全不 watch**。此時若任何 `rules[].anchor` 或顯式 resource `source` 需要 informer cache，`Validate()` 會 fail fast 並提示補上 `watch.resources`。這是刻意的低負載預設，避免部署後意外對 apiserver 開啟全量 LIST/WATCH。
+
+`discovery.enabled` 預設為 `false`。啟用後可用 `apiVersion + kind` 讓 exporter 在啟動時向 apiserver discovery 查詢 `resource` 與 `scope`：
+
+```yaml
+discovery:
+  enabled: true
+
+watch:
+  resources:
+    - name: Ingress
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+```
+
+Discovery 只在啟動時針對設定中缺 GVR 的 `apiVersion` 查一次，不在 scrape 或 watch event 時呼叫。若 discovery 沒權限、查不到或有歧義，啟動會失敗並要求改寫完整 GVR。
 
 設定檔僅支援本文件所述欄位；`watch.selectors`、`watch.kinds`、`watch.namespaces` 等舊鍵**不**在 `WatchScope` schema 內，出現時會與其它未知 YAML 鍵一併在反序列化時被忽略。請使用 `watch.resources[]`。
 
@@ -167,7 +193,7 @@ watch:
 - **`labelSelector`**：在標準 Kubernetes label selector 語法中，**同一字串內**以英文逗號 **`,`** 連接多個 requirement，語意為 **AND**（例如 `app.kubernetes.io/name=api,env=prod`）。需要 OR 或集合條件時，使用 set-based 等寫法，同樣寫在這一個字串裡。
 - **`fieldSelector`**：同樣為單一字串；是否允許用 **`,`** 串接多個欄位條件，**依資源種類與叢集版本由 apiserver 決定**；不合法時啟動時的 dry-run `LIST` 會失敗並回錯。
 
-### 各資源 `fieldSelector` 白名單
+### 內建資源 `fieldSelector` 白名單
 
 | Kind        | 允許的 `fieldSelector` 鍵 |
 |-------------|---------------------------|
@@ -179,7 +205,7 @@ watch:
 | Service     | `metadata.name`、`metadata.namespace`、`spec.clusterIP`、`spec.type` |
 | EndpointSlice | `metadata.name`、`metadata.namespace` |
 
-超出白名單會被 apiserver 以 HTTP 400 拒絕。`metadata-exporter` 啟動時會對每組設定好的 selector 做一次小型 `LIST`（dry-run），以儘早暴露錯誤。
+超出白名單會被 apiserver 以 HTTP 400 拒絕。任意 GVR / CRD 的可用 field selector 由該 API server 與資源實作決定。`metadata-exporter` 啟動時會對每組設定好的 selector 做一次 `Limit: 1` 的小型 `LIST`（dry-run），以儘早暴露錯誤且避免放大啟動壓力。
 
 ### Owner 鏈與「過窄的 parent selector」風險
 
@@ -191,20 +217,23 @@ watch:
 
 - `namespaces` 空或省略 → 各支援資源為叢集全域 LIST/WATCH（需 `ClusterRoleBinding`，見 `deploy/manifests.yaml`）。
 - `namespaces: ["foo"]` → namespace 範圍 LIST/WATCH（仍可由叢集層級 RBAC 滿足）。若改 `RoleBinding`，須在每個列出的 namespace 綁定。
+- 任意 GVR / CRD 需要對該 `apiGroups` + plural `resources` 授予 `get`, `list`, `watch`。例如 `CronJob` 需 `apiGroups: ["batch"]`, `resources: ["cronjobs"]`。
+- 若啟用 `discovery.enabled=true`，ServiceAccount 還需要能讀 Kubernetes discovery endpoint；這只用於解析 schema，不代表已具備目標 GVR 的 `get/list/watch`。
 
 ### Watch 拓樸：叢集全域 vs 每 namespace
 
-令 `R = len(watch.resources)`（若 `resources` 省略或空，程式會展開為**全部**支援 kind）。
+令 `R = len(watch.resources)`（若 `resources` 省略或空，`R=0`，不建立任何 informer）。
 
 | 模式 | 觸發條件 | 開啟的 watch 量級（概念） | 取捨 |
 |------|----------|---------------------------|------|
 | 叢集全域 | 各 `WatchResource` 為 `scope: Cluster`，或 namespaced 資源未設 `namespaces` | 每個列入的 kind 約一路 informer | 對大型叢集通常最省；可對每個 kind 用 `labelSelector`／`fieldSelector` 縮流。 |
-| 每 namespace | `scope: Namespaced` 且 `namespaces` 非空 | 約 `len(namespaces) ×`（該列所涵蓋之 kind 數） | 隔離強；可搭配 `fieldSelector: metadata.name=...` 等縮到單一 Pod。 |
-| 僅部分 Kind | `resources` 只列部分 kind | 路數隨列出的 kind 變少 | 降低多餘 GVR watch；有 `topController`／`ownerController` 但未 watch 父 kind 時 owner 鏈易 miss。 |
+| 每 namespace | `scope: Namespaced` 且 `namespaces` 非空 | 約 `len(namespaces) ×`（該列所涵蓋之 resource 數） | 隔離強；可搭配 `fieldSelector: metadata.name=...` 等縮到單一 Pod。 |
+| 僅部分 resource | `resources` 只列部分 resource | 路數隨列出的 resource 變少 | 降低多餘 GVR watch；有 `topController`／`ownerController` 但未 watch 父 resource 時 owner 鏈易 miss。 |
+| 空 watch | `resources` 省略或空 | `0` | 預設最小 apiserver 負擔；rules 若引用 anchor/source 會啟動失敗並要求明確列出 resource。 |
 
 啟動日誌會印出 `watch mode = cluster-wide` 或 `per-namespace` 及 factory 數量。namespace 過濾發生在 client-go cache；叢集全域模式 **不會**因此線性增加「每次事件」的 CPU，主要影響的是對 apiserver 的 watch 扇出。
 
-**設計說明**：`watch` 只決定 **快取內有什麼**；rule 仍可引用 `topController`／`ownerController`，但若 parent 被 selector 切掉或沒有 watch 該 parent Kind，解析會 miss——這是 `watch` 與 `rules` 之間的**設定耦合**；`topController` 未強制在 schema 內，但若 rule 用到了，collector 在啟動時會在缺 `ReplicaSet` / `Deployment` / `StatefulSet` / `DaemonSet` 任一者時打 **Warn** 日誌（可能 miss owner 鏈）。
+**設計說明**：`watch` 只決定 **快取內有什麼**；rule 仍可引用 `topController`／`ownerController`，但若 parent 被 selector 切掉或沒有 watch 該 parent resource，解析會 miss——這是 `watch` 與 `rules` 之間的**設定耦合**；若 rule 使用 parent-chain source，collector 會在典型 Pod workload parent 未完整 watch 時打 **Warn** 日誌（可能 miss owner 鏈）。
 
 ---
 
@@ -216,7 +245,7 @@ watch:
 rules:
   - name: "pod_info"       # 必填；metric 全名 = metricPrefix + name
     help: "..."            # 選填；Prometheus HELP
-    anchor: Pod            # 必填；Pod|Deployment|StatefulSet|DaemonSet|ReplicaSet|Node|Service|EndpointSlice
+    anchor: Pod            # 必填；watch.resources 中的 name，或不歧義的 kind alias
     forEach: "spec.containers[*]"   # 選填；展開為 N 筆 series
     labels:                          # 選填；至少 labels 或 expandLabels 二者擇一
       <label_name>:
@@ -237,7 +266,7 @@ rules:
 
 ### `anchor`
 
-`anchor` 同時決定 **哪些 informer cache 會被 scrape 走訪**，以及 **每筆輸出 series 的主體**。允許值：`Pod`、`Deployment`、`StatefulSet`、`DaemonSet`、`ReplicaSet`、`Node`、`Service`、`EndpointSlice`。
+`anchor` 同時決定 **哪些 informer cache 會被 scrape 走訪**，以及 **每筆輸出 series 的主體**。允許值是 `watch.resources[]` 的 `name`，或在有效 watch set 內不歧義的 `kind` alias。若同一個 `kind` 出現在不同 group/version，請使用 `name`。
 
 ### `forEach`
 
@@ -258,8 +287,8 @@ rules:
 | `anchor`（預設） | anchor 物件本身。 |
 | `item` | 目前 `forEach` 元素；**僅**在設了 `forEach` 時合法。 |
 | `ownerController` | anchor 在 `ownerReferences` 上的直接 controller（若有）。 |
-| `topController` | owner 鏈上最深、且為 `Deployment`／`StatefulSet`／`DaemonSet` 的祖先；若 anchor 本身就是這些 Kind，回傳 anchor 自己。 |
-| `Pod`／`Deployment`／`Service`／… | 沿 owner 鏈走訪時**第一個**該 Kind；若 anchor 即該 Kind 則直接回傳 anchor。 |
+| `topController` | owner 鏈上最深、且 resource 設為 `owner.topController: true` 的祖先；內建 `Deployment`／`StatefulSet`／`DaemonSet` 保留此預設。 |
+| resource `name` 或唯一 `kind` alias | 沿 owner 鏈走訪時**第一個**該 resource；若 anchor 即該 resource 則直接回傳 anchor。 |
 
 > 相關物件**僅**從 informer 快取取得；**不**為走訪 owner 鏈額外打 API。
 > v1 的 `relations` 別名已移除；請直接寫 `source: topController` / `source: ownerController` / `source: Deployment` 等。
@@ -299,7 +328,7 @@ rules:
 
 ### 啟動時不變式（摘要）
 
-- 至少一條 rule；每條需非空 `name`、支援的 `anchor`，且 `labels` 與 `expandLabels` 至少有其一。
+- 至少一條 rule；每條需非空 `name`、且 `anchor` 必須解析到 `watch.resources` 中的 resource，`labels` 與 `expandLabels` 至少有其一。
 - `metricPrefix + name` 全叢集設定內唯一，且符合 Prometheus metric 命名。
 - 同一 rule 內 `labels` 的鍵不得重複（由 map 結構保證）；`expandLabels[].prefix` 不可與固定 label 名衝突。
 - `expandLabels` 中 `source: item` 必須搭配 `forEach`；`maxKeys >= 0`。
@@ -598,7 +627,7 @@ rules:
 | `expandLabels` 輸出 cardinality 暴衝 | 沒設 `allow` 或 `maxKeys`，annotation/label key 過多／不可預期。 | 嚴格收斂 `allow`；用 `maxKeys` 上限保護；必要時改回固定 `labels`。 |
 | 連續兩次 scrape 看到同一 anchor 的某 dynamic label 一下有一下沒有 | 該 key 不在所有 anchor 上出現，或 anchor 自己的 K8s metadata 在變動。 | 改用 `labels` 把該 key 釘為固定維度；或縮小 `expandLabels[].allow`。 |
 | 警告「pod selector combined with stricter parent selector …」 | parent 被 filter 掉，owner 鏈斷裂。 | 放寬或移除 parent 的過窄 selector。 |
-| 警告「rules reference ownerController/topController but not all parent kinds are watched」 | 規則使用 `topController`／`ownerController`，但 `watch.resources` 未納入典型 owner 鏈所要的 parent kind。 | 補上 `ReplicaSet` 等，或放寬 selector；屬可預期，指標中 parent 欄位可能空。 |
+| 警告「rules reference ownerController/topController but not all parent kinds are watched」 | 規則使用 `topController`／`ownerController`，但 `watch.resources` 未納入典型 owner 鏈所要的 parent resource。 | 補上 `ReplicaSet` 等，或放寬 selector；屬可預期，指標中 parent 欄位可能空。 |
 | `metrics-addr` 連不上 | 容器埠不符或程式在驗證階段即退出。 | 查日誌；readiness 通常打 `/healthz`。 |
 | Scrape 變慢 | rule 數 × anchor 數 × `expandLabels` key 數 過大。 | 縮小 `watch.resources`／selector；收斂 `expandLabels` allow；觀測 `exporter_collect_duration_seconds`。 |
 
@@ -610,7 +639,7 @@ rules:
 
 ### Informer 快取與 scrape time 求值
 
-- 每個列在 `watch.resources` 的 Kind 都會依固定 GVR registry 建立 dynamic SharedInformer，將 LIST/WATCH 結果以 unstructured 物件快取。
+- 每個列在 `watch.resources` 的 resource 都會依 runtime registry 中的 GVR 建立 dynamic SharedInformer，將 LIST/WATCH 結果以 unstructured 物件快取；省略 `watch.resources` 時不建立 informer。
 - `metadata-exporter` **不再** 以事件觸發 reconcile：cache 由 informer 自動更新，但 metric 完全在 `/metrics` 被 scrape 當下從 cache 重算。
 - 因此 scrape latency ≈ `O(rules × anchors × (label evals + dynamic key sanitize))`。Cache 建立成本攤在 startup 與 watch 事件處理上，與 scrape 解耦。
 
@@ -620,7 +649,7 @@ rules:
 |------|------|------|------|
 | `exporter_collect_total` | counter | `rule, result` | 每條 rule 在 scrape 時的成功／錯誤次數。 |
 | `exporter_collect_duration_seconds` | histogram | `rule` | 每條 rule 在單次 scrape 內 `Collect` 流程的耗時。 |
-| `exporter_anchor_count` | gauge | `rule, kind` | 該 rule 上次 scrape 時看到的 anchor 物件數，用於 cardinality 估算與排錯。 |
+| `exporter_anchor_count` | gauge | `rule, kind` | 該 rule 上次 scrape 時看到的 anchor 物件數；`kind` 值為 resolved resource name（舊內建設定通常等同 Kind），用於 cardinality 估算與排錯。 |
 
 > v1 的 `exporter_reconcile_*`、`exporter_parent_index_*`、`exporter_reconcile_queue_depth` 已停用（事件驅動架構移除）。儀表板需同步更新，建議改觀測 `exporter_collect_*` 與 `scrape_duration_seconds{job=...}`。
 
@@ -657,7 +686,7 @@ make bench-collect
 | Path 文法（`parsePath`、`evaluate`） | `pkg/collector/pathexpr.go` |
 | Custom `prometheus.Collector`（`Describe` / `Collect`）、scrape-time 組裝、union label set | `pkg/collector/collector.go` |
 | Owner 鏈解析（`Resolve`） | `pkg/collector/resolver.go` |
-| Scoped informer 群（每 (kind, namespace) 一份 factory） | `pkg/collector/listers.go` |
+| Scoped informer 群（每 (resource, namespace) 一份 factory） | `pkg/collector/listers.go` |
 | 整合測設定形狀 | `test/integration/e2e/config_yaml.go` |
 
 ---

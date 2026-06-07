@@ -18,12 +18,16 @@ resources through dynamic `SharedInformer` caches (no extra API calls), walks
   kubectl-style JSONPath.
 - **Zero extra API calls**: owner-chain resolution uses only cached listers.
 - **Scoped informers**: optionally restrict watches to specific namespaces, pick
-  which resource kinds to watch via `watch.resources[]`, declare per-resource
+  which resources to watch via `watch.resources[]`, declare per-resource
   scope (`Namespaced`/`Cluster`), and apply per-kind `labelSelector` /
   `fieldSelector` for apiserver-side filtering.
-- **Built-in Kubernetes resources**: supports `Pod`, `ReplicaSet`,
-  `Deployment`, `StatefulSet`, `DaemonSet`, `Node`, `Service`, and
-  `EndpointSlice`.
+- **Arbitrary GVR support**: built-in kind-only entries remain for `Pod`,
+  `ReplicaSet`, `Deployment`, `StatefulSet`, `DaemonSet`, `Node`, `Service`,
+  and `EndpointSlice`, while new Kubernetes resources or CRDs can be declared
+  in YAML with `group` / `version` / `resource` / `kind` / `scope`.
+- **No implicit full watch**: if `watch.resources` is omitted or empty, the
+  exporter watches nothing and fails fast when rules reference unwatched
+  anchors. This keeps the default apiserver footprint at zero LIST/WATCH calls.
 
 See [docs/CONFIG.md](docs/CONFIG.md) for the full configuration reference.
 
@@ -63,7 +67,7 @@ intervals against the cluster's cardinality:
 
 - `exporter_collect_total{rule,result}` — collect attempts per rule and outcome.
 - `exporter_collect_duration_seconds{rule}` — per-rule scrape build latency.
-- `exporter_anchor_count{rule,kind}` — anchor objects observed by the most recent collect.
+- `exporter_anchor_count{rule,kind}` — anchor objects observed by the most recent collect; `kind` is the resolved resource name.
 - `rest_client_requests_total{code,method,host}` + `rest_client_request_duration_seconds{verb,host}` — standard client-go metrics, handy for spotting apiserver pressure.
 
 Deploy to a cluster:

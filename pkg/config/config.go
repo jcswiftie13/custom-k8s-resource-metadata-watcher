@@ -13,25 +13,52 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/yaml"
 )
 
-// allSupportedKindOrder is the fixed order used for informers, validation, and
-// log output when watch.kinds is empty (watch all) or for merging explicit kinds.
+// allSupportedKindOrder is the legacy order used for built-in kind-only
+// entries. Empty watch.resources no longer expands to this list.
 var allSupportedKindOrder = []string{
 	"Pod", "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet", "Node", "Service", "EndpointSlice",
 }
 
-// ResourceInfo describes one Kubernetes resource supported by the exporter.
+// DiscoveryConfig controls optional startup-time API discovery. Discovery is
+// disabled by default so config validation remains deterministic and does not
+// require live-cluster permissions unless explicitly requested.
+type DiscoveryConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+}
+
+// OwnerConfig controls how ownerReferences are followed for a watched resource.
+type OwnerConfig struct {
+	// Follow defaults to true. Use follow: false for resources that should not
+	// participate in owner-chain walks even when ownerReferences point to them.
+	Follow *bool `json:"follow,omitempty"`
+	// TopController marks this resource as satisfying source: topController.
+	TopController bool `json:"topController,omitempty"`
+}
+
+// FollowEnabled returns the owner-following policy after applying defaults.
+func (o OwnerConfig) FollowEnabled() bool {
+	return o.Follow == nil || *o.Follow
+}
+
+// ResourceInfo describes one Kubernetes resource watched by the exporter.
 type ResourceInfo struct {
-	Kind     string
-	Group    string
-	Version  string
-	Resource string
-	Scope    string
+	Name string
+	Kind string
+	// APIVersion is the Kubernetes apiVersion string used by ownerReferences.
+	APIVersion string
+	Group      string
+	Version    string
+	Resource   string
+	Scope      string
+	Owner      OwnerConfig
 }
 
 // GVR returns the Kubernetes GroupVersionResource used by dynamic informers.
@@ -44,59 +71,86 @@ func (r ResourceInfo) GVK() schema.GroupVersionKind {
 	return schema.GroupVersionKind{Group: r.Group, Version: r.Version, Kind: r.Kind}
 }
 
+// GroupVersion returns the Kubernetes group/version string.
+func (r ResourceInfo) GroupVersion() string {
+	if r.APIVersion != "" {
+		return r.APIVersion
+	}
+	return schema.GroupVersion{Group: r.Group, Version: r.Version}.String()
+}
+
 var supportedResources = map[string]ResourceInfo{
 	"Pod": {
-		Kind:     "Pod",
-		Version:  "v1",
-		Resource: "pods",
-		Scope:    ScopeNamespaced,
+		Name:       "Pod",
+		Kind:       "Pod",
+		APIVersion: "v1",
+		Version:    "v1",
+		Resource:   "pods",
+		Scope:      ScopeNamespaced,
 	},
 	"ReplicaSet": {
-		Kind:     "ReplicaSet",
-		Group:    "apps",
-		Version:  "v1",
-		Resource: "replicasets",
-		Scope:    ScopeNamespaced,
+		Name:       "ReplicaSet",
+		Kind:       "ReplicaSet",
+		APIVersion: "apps/v1",
+		Group:      "apps",
+		Version:    "v1",
+		Resource:   "replicasets",
+		Scope:      ScopeNamespaced,
 	},
 	"Deployment": {
-		Kind:     "Deployment",
-		Group:    "apps",
-		Version:  "v1",
-		Resource: "deployments",
-		Scope:    ScopeNamespaced,
+		Name:       "Deployment",
+		Kind:       "Deployment",
+		APIVersion: "apps/v1",
+		Group:      "apps",
+		Version:    "v1",
+		Resource:   "deployments",
+		Scope:      ScopeNamespaced,
+		Owner:      OwnerConfig{TopController: true},
 	},
 	"StatefulSet": {
-		Kind:     "StatefulSet",
-		Group:    "apps",
-		Version:  "v1",
-		Resource: "statefulsets",
-		Scope:    ScopeNamespaced,
+		Name:       "StatefulSet",
+		Kind:       "StatefulSet",
+		APIVersion: "apps/v1",
+		Group:      "apps",
+		Version:    "v1",
+		Resource:   "statefulsets",
+		Scope:      ScopeNamespaced,
+		Owner:      OwnerConfig{TopController: true},
 	},
 	"DaemonSet": {
-		Kind:     "DaemonSet",
-		Group:    "apps",
-		Version:  "v1",
-		Resource: "daemonsets",
-		Scope:    ScopeNamespaced,
+		Name:       "DaemonSet",
+		Kind:       "DaemonSet",
+		APIVersion: "apps/v1",
+		Group:      "apps",
+		Version:    "v1",
+		Resource:   "daemonsets",
+		Scope:      ScopeNamespaced,
+		Owner:      OwnerConfig{TopController: true},
 	},
 	"Node": {
-		Kind:     "Node",
-		Version:  "v1",
-		Resource: "nodes",
-		Scope:    ScopeCluster,
+		Name:       "Node",
+		Kind:       "Node",
+		APIVersion: "v1",
+		Version:    "v1",
+		Resource:   "nodes",
+		Scope:      ScopeCluster,
 	},
 	"Service": {
-		Kind:     "Service",
-		Version:  "v1",
-		Resource: "services",
-		Scope:    ScopeNamespaced,
+		Name:       "Service",
+		Kind:       "Service",
+		APIVersion: "v1",
+		Version:    "v1",
+		Resource:   "services",
+		Scope:      ScopeNamespaced,
 	},
 	"EndpointSlice": {
-		Kind:     "EndpointSlice",
-		Group:    "discovery.k8s.io",
-		Version:  "v1",
-		Resource: "endpointslices",
-		Scope:    ScopeNamespaced,
+		Name:       "EndpointSlice",
+		Kind:       "EndpointSlice",
+		APIVersion: "discovery.k8s.io/v1",
+		Group:      "discovery.k8s.io",
+		Version:    "v1",
+		Resource:   "endpointslices",
+		Scope:      ScopeNamespaced,
 	},
 }
 
@@ -128,6 +182,10 @@ var builtinSources = map[string]struct{}{
 var (
 	promLabelNameRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 	metricNameRe    = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
+	resourceNameRe  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]*$`)
+	kindNameRe      = regexp.MustCompile(`^[A-Z][A-Za-z0-9]*$`)
+	versionRe       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+	resourceRe      = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 )
 
 // Config is the root configuration model.
@@ -139,6 +197,10 @@ type Config struct {
 	// Watch narrows the informer scope to reduce apiserver load.
 	Watch WatchScope `json:"watch,omitempty"`
 
+	// Discovery optionally fills missing resource/scope fields from the
+	// apiserver. It is disabled by default.
+	Discovery DiscoveryConfig `json:"discovery,omitempty"`
+
 	// Rules declares the set of metrics to export.
 	Rules []Rule `json:"rules"`
 }
@@ -146,20 +208,29 @@ type Config struct {
 // WatchScope describes which kinds to watch, optional namespace limits, and
 // per-kind list/watch filters.
 type WatchScope struct {
-	// Resources declares per-kind watch conditions. Empty means watch all
-	// supported resources with default scopes/selectors.
+	// Resources declares resource watch conditions. Empty means watch nothing.
 	Resources []WatchResource `json:"resources,omitempty"`
 }
 
-// WatchResource holds list/watch options and scope for one resource kind.
+// WatchResource holds list/watch options and identity for one Kubernetes
+// resource. Legacy kind-only entries are accepted for built-in resources.
 type WatchResource struct {
-	Kind string `json:"kind"`
+	// Name is the logical reference used by rules[].anchor and labels[].source.
+	// It defaults to Kind when omitted.
+	Name string `json:"name,omitempty"`
+	// APIVersion is a shortcut for group/version, e.g. "batch/v1".
+	APIVersion string `json:"apiVersion,omitempty"`
+	Group      string `json:"group,omitempty"`
+	Version    string `json:"version,omitempty"`
+	Resource   string `json:"resource,omitempty"`
+	Kind       string `json:"kind"`
 	// Scope must be "Namespaced" or "Cluster".
 	Scope string `json:"scope"`
 	// Namespaces is only valid for namespaced resources when scope=Namespaced.
-	Namespaces    []string `json:"namespaces,omitempty"`
-	LabelSelector string   `json:"labelSelector,omitempty"`
-	FieldSelector string   `json:"fieldSelector,omitempty"`
+	Namespaces    []string    `json:"namespaces,omitempty"`
+	LabelSelector string      `json:"labelSelector,omitempty"`
+	FieldSelector string      `json:"fieldSelector,omitempty"`
+	Owner         OwnerConfig `json:"owner,omitempty"`
 }
 
 const (
@@ -167,42 +238,31 @@ const (
 	ScopeCluster    = "Cluster"
 )
 
-// EffectiveResources returns watched resources in stable kind order.
-// Empty Resources means every supported kind is watched with defaults.
+// EffectiveResources returns watched resources in declaration order after
+// applying legacy built-in defaults. Empty Resources means watch nothing.
 func (w WatchScope) EffectiveResources() []WatchResource {
 	if len(w.Resources) == 0 {
-		out := make([]WatchResource, 0, len(allSupportedKindOrder))
-		for _, k := range allSupportedKindOrder {
-			out = append(out, WatchResource{
-				Kind:  k,
-				Scope: defaultScopeForKind(k),
-			})
-		}
-		return out
+		return nil
 	}
-	byKind := make(map[string]WatchResource, len(w.Resources))
+	out := make([]WatchResource, 0, len(w.Resources))
 	for _, r := range w.Resources {
-		byKind[r.Kind] = r
-	}
-	var out []WatchResource
-	for _, k := range allSupportedKindOrder {
-		if r, ok := byKind[k]; ok {
-			out = append(out, r)
-		}
+		out = append(out, applyLegacyDefaults(r))
 	}
 	return out
 }
 
-// EffectiveKinds returns the kinds to watch, in a stable order.
+// EffectiveKinds returns the resource names to watch, in declaration order.
+// The method name is retained for compatibility with older call sites.
 func (w WatchScope) EffectiveKinds() []string {
 	var out []string
 	for _, r := range w.EffectiveResources() {
-		out = append(out, r.Kind)
+		out = append(out, resourceName(r))
 	}
 	return out
 }
 
-// EffectiveKindSet is a set view of EffectiveKinds.
+// EffectiveKindSet is a set view of EffectiveKinds. The method name is
+// retained for compatibility with older call sites.
 func (w WatchScope) EffectiveKindSet() map[string]struct{} {
 	eff := w.EffectiveKinds()
 	m := make(map[string]struct{}, len(eff))
@@ -212,10 +272,11 @@ func (w WatchScope) EffectiveKindSet() map[string]struct{} {
 	return m
 }
 
-// ResourceFor returns the effective watch resource for a kind.
-func (w WatchScope) ResourceFor(kind string) (WatchResource, bool) {
+// ResourceFor returns the effective watch resource for a resource name or a
+// unique legacy kind alias.
+func (w WatchScope) ResourceFor(name string) (WatchResource, bool) {
 	for _, r := range w.EffectiveResources() {
-		if r.Kind == kind {
+		if resourceName(r) == name || r.Kind == name {
 			return r, true
 		}
 	}
@@ -334,6 +395,341 @@ func (e ExpandLabel) EffectiveSource() string {
 	return e.Source
 }
 
+// Registry is the runtime resource index built from watch.resources.
+type Registry struct {
+	resources   []ResourceInfo
+	byName      map[string]ResourceInfo
+	byGVK       map[schema.GroupVersionKind]ResourceInfo
+	byGVR       map[schema.GroupVersionResource]ResourceInfo
+	kindToNames map[string][]string
+}
+
+// Resources returns watched resources in declaration order.
+func (r *Registry) Resources() []ResourceInfo {
+	if r == nil {
+		return nil
+	}
+	return append([]ResourceInfo(nil), r.resources...)
+}
+
+// Names returns watched resource names in declaration order.
+func (r *Registry) Names() []string {
+	if r == nil {
+		return nil
+	}
+	out := make([]string, 0, len(r.resources))
+	for _, res := range r.resources {
+		out = append(out, res.Name)
+	}
+	return out
+}
+
+// ResourceFor resolves a rule/source reference to a watched resource. The
+// reference may be a resource name or a Kind alias only when that alias is
+// unambiguous among watched resources.
+func (r *Registry) ResourceFor(ref string) (ResourceInfo, error) {
+	if r == nil || len(r.resources) == 0 {
+		return ResourceInfo{}, fmt.Errorf("resource %q is not watched: watch.resources is empty; default is to watch nothing; add the resource to watch.resources", ref)
+	}
+	if info, ok := r.byName[ref]; ok {
+		return info, nil
+	}
+	names := r.kindToNames[ref]
+	switch len(names) {
+	case 0:
+		return ResourceInfo{}, fmt.Errorf("resource %q is not recognised in watch.resources", ref)
+	case 1:
+		return r.byName[names[0]], nil
+	default:
+		sort.Strings(names)
+		return ResourceInfo{}, fmt.Errorf("resource reference %q is ambiguous across watched resources %v; use source/anchor with the resource name", ref, names)
+	}
+}
+
+// ResourceForGVK resolves an ownerReference GVK to a watched resource.
+func (r *Registry) ResourceForGVK(gvk schema.GroupVersionKind) (ResourceInfo, bool) {
+	if r == nil {
+		return ResourceInfo{}, false
+	}
+	info, ok := r.byGVK[gvk]
+	return info, ok
+}
+
+// ResourceForGVR resolves a GVR to a watched resource.
+func (r *Registry) ResourceForGVR(gvr schema.GroupVersionResource) (ResourceInfo, bool) {
+	if r == nil {
+		return ResourceInfo{}, false
+	}
+	info, ok := r.byGVR[gvr]
+	return info, ok
+}
+
+// SourceNames returns built-in source names plus watched resource names and
+// unambiguous Kind aliases.
+func (r *Registry) SourceNames() map[string]struct{} {
+	out := make(map[string]struct{}, len(builtinSources)+len(r.resources))
+	for k := range builtinSources {
+		out[k] = struct{}{}
+	}
+	for _, res := range r.resources {
+		out[res.Name] = struct{}{}
+		if names := r.kindToNames[res.Kind]; len(names) == 1 {
+			out[res.Kind] = struct{}{}
+		}
+	}
+	return out
+}
+
+// Registry returns the fully resolved runtime registry. It fails for discovery
+// placeholders that have not been resolved yet.
+func (c *Config) Registry() (*Registry, error) {
+	return c.buildRegistry(false)
+}
+
+// APIResourceResolver is the subset of Kubernetes discovery used by config.
+type APIResourceResolver interface {
+	ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error)
+}
+
+// ResolveDiscovery fills incomplete watch resources from Kubernetes discovery.
+// It performs no work unless discovery.enabled is true and at least one
+// resource omits resource/scope.
+func (c *Config) ResolveDiscovery(resolver APIResourceResolver) error {
+	if !c.Discovery.Enabled {
+		return c.Validate()
+	}
+	if resolver == nil {
+		return fmt.Errorf("discovery.enabled=true but no discovery client is available; provide complete group/version/resource/kind/scope or disable discovery")
+	}
+	cache := map[string]*metav1.APIResourceList{}
+	for i := range c.Watch.Resources {
+		r := &c.Watch.Resources[i]
+		if isCompleteResource(*r) {
+			continue
+		}
+		if isLegacyKindOnly(*r) {
+			continue
+		}
+		gv, err := groupVersionForResource(*r)
+		if err != nil {
+			return fmt.Errorf("watch.resources[%d]: discovery requires apiVersion + kind or complete group/version/resource/kind/scope: %w", i, err)
+		}
+		if strings.TrimSpace(r.Kind) == "" {
+			return fmt.Errorf("watch.resources[%d].kind: required for discovery", i)
+		}
+		list, ok := cache[gv.String()]
+		if !ok {
+			var err error
+			list, err = resolver.ServerResourcesForGroupVersion(gv.String())
+			if err != nil {
+				return fmt.Errorf("watch.resources[%d]: discovery lookup for apiVersion %q failed: %w; provide complete group/version/resource/kind/scope or disable discovery", i, gv.String(), err)
+			}
+			cache[gv.String()] = list
+		}
+		matches := matchingAPIResources(list.APIResources, r.Kind)
+		if len(matches) == 0 {
+			return fmt.Errorf("watch.resources[%d]: discovery found no resource for apiVersion=%q kind=%q; provide complete group/version/resource/kind/scope", i, gv.String(), r.Kind)
+		}
+		if len(matches) > 1 {
+			names := make([]string, 0, len(matches))
+			for _, m := range matches {
+				names = append(names, m.Name)
+			}
+			sort.Strings(names)
+			return fmt.Errorf("watch.resources[%d]: discovery found multiple resources for apiVersion=%q kind=%q: %v; provide complete resource/scope", i, gv.String(), r.Kind, names)
+		}
+		match := matches[0]
+		if !hasVerb(match.Verbs, "list") || !hasVerb(match.Verbs, "watch") {
+			return fmt.Errorf("watch.resources[%d]: discovered %s does not support list/watch verbs (verbs=%v)", i, match.Name, match.Verbs)
+		}
+		r.Group = gv.Group
+		r.Version = gv.Version
+		r.APIVersion = gv.String()
+		r.Resource = match.Name
+		if match.Namespaced {
+			r.Scope = ScopeNamespaced
+		} else {
+			r.Scope = ScopeCluster
+		}
+	}
+	_, err := c.buildRegistry(false)
+	if err != nil {
+		return err
+	}
+	return c.Validate()
+}
+
+func matchingAPIResources(resources []metav1.APIResource, kind string) []metav1.APIResource {
+	var out []metav1.APIResource
+	for _, r := range resources {
+		if r.Kind != kind || strings.Contains(r.Name, "/") {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func hasVerb(verbs metav1.Verbs, want string) bool {
+	for _, v := range verbs {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeResource(i int, raw WatchResource, allowDiscoveryPlaceholder bool) (ResourceInfo, error) {
+	r := applyLegacyDefaults(raw)
+	if strings.TrimSpace(r.Kind) == "" {
+		return ResourceInfo{}, fmt.Errorf("watch.resources[%d].kind: required", i)
+	}
+	if !kindNameRe.MatchString(r.Kind) {
+		return ResourceInfo{}, fmt.Errorf("watch.resources[%d].kind: invalid kind %q", i, r.Kind)
+	}
+	if r.Name == "" {
+		r.Name = r.Kind
+	}
+	if !resourceNameRe.MatchString(r.Name) {
+		return ResourceInfo{}, fmt.Errorf("watch.resources[%d].name: invalid resource name %q", i, r.Name)
+	}
+	if r.APIVersion == "" && r.Version == "" && !isLegacyKindOnly(raw) {
+		if allowDiscoveryPlaceholder && r.Kind != "" {
+			return ResourceInfo{
+				Name:  r.Name,
+				Kind:  r.Kind,
+				Owner: r.Owner,
+			}, nil
+		}
+		return ResourceInfo{}, fmt.Errorf("watch.resources[%d]: incomplete GVR for %q and discovery.enabled=false; provide group/version/resource/kind/scope or enable discovery", i, r.Name)
+	}
+	gv, err := groupVersionForResource(r)
+	if err != nil {
+		return ResourceInfo{}, fmt.Errorf("watch.resources[%d]: %w", i, err)
+	}
+	r.Group = gv.Group
+	r.Version = gv.Version
+	r.APIVersion = gv.String()
+	complete := r.Resource != "" && r.Scope != ""
+	if !complete {
+		if allowDiscoveryPlaceholder && r.APIVersion != "" && r.Kind != "" && !isLegacyKindOnly(raw) {
+			return ResourceInfo{
+				Name:       r.Name,
+				Kind:       r.Kind,
+				APIVersion: r.APIVersion,
+				Group:      r.Group,
+				Version:    r.Version,
+				Owner:      r.Owner,
+			}, nil
+		}
+		if _, legacy := SupportedResource(r.Kind); legacy {
+			// applyLegacyDefaults should have filled this; reaching this branch
+			// usually means the user overrode part of the identity inconsistently.
+			return ResourceInfo{}, fmt.Errorf("watch.resources[%d]: incomplete legacy resource %q; provide complete group/version/resource/kind/scope", i, r.Kind)
+		}
+		return ResourceInfo{}, fmt.Errorf("watch.resources[%d]: incomplete GVR for %q and discovery.enabled=false; provide group/version/resource/kind/scope or enable discovery", i, r.Name)
+	}
+	if err := validateResolvedResource(i, r); err != nil {
+		return ResourceInfo{}, err
+	}
+	return ResourceInfo{
+		Name:       r.Name,
+		Kind:       r.Kind,
+		APIVersion: r.APIVersion,
+		Group:      r.Group,
+		Version:    r.Version,
+		Resource:   r.Resource,
+		Scope:      r.Scope,
+		Owner:      r.Owner,
+	}, nil
+}
+
+func validateResolvedResource(i int, r WatchResource) error {
+	if r.Version == "" || !versionRe.MatchString(r.Version) {
+		return fmt.Errorf("watch.resources[%d].version: invalid version %q", i, r.Version)
+	}
+	if r.Group != "" && strings.ContainsAny(r.Group, " /") {
+		return fmt.Errorf("watch.resources[%d].group: invalid group %q", i, r.Group)
+	}
+	if !resourceRe.MatchString(r.Resource) {
+		return fmt.Errorf("watch.resources[%d].resource: invalid resource %q (use the lowercase plural resource name)", i, r.Resource)
+	}
+	if r.Scope != ScopeNamespaced && r.Scope != ScopeCluster {
+		return fmt.Errorf("watch.resources[%d].scope: must be %q or %q", i, ScopeNamespaced, ScopeCluster)
+	}
+	if r.Scope == ScopeCluster && len(r.Namespaces) > 0 {
+		return fmt.Errorf("watch.resources[%d]: scope=%q cannot set namespaces", i, ScopeCluster)
+	}
+	if legacy, ok := SupportedResource(r.Kind); ok && legacy.GVR() == (schema.GroupVersionResource{Group: r.Group, Version: r.Version, Resource: r.Resource}) {
+		if legacy.Scope == ScopeCluster && r.Scope != ScopeCluster {
+			return fmt.Errorf("watch.resources[%d]: kind %q must use scope=%q", i, r.Kind, ScopeCluster)
+		}
+	}
+	return nil
+}
+
+func groupVersionForResource(r WatchResource) (schema.GroupVersion, error) {
+	var gv schema.GroupVersion
+	if r.APIVersion != "" {
+		parsed, err := schema.ParseGroupVersion(r.APIVersion)
+		if err != nil {
+			return schema.GroupVersion{}, fmt.Errorf("apiVersion %q is invalid: %w", r.APIVersion, err)
+		}
+		gv = parsed
+	}
+	if r.Group != "" || r.Version != "" {
+		if r.Version == "" {
+			return schema.GroupVersion{}, fmt.Errorf("version: required when group is set")
+		}
+		if gv.Version != "" && (gv.Group != r.Group || gv.Version != r.Version) {
+			return schema.GroupVersion{}, fmt.Errorf("apiVersion %q conflicts with group/version %q/%q", r.APIVersion, r.Group, r.Version)
+		}
+		gv = schema.GroupVersion{Group: r.Group, Version: r.Version}
+	}
+	if gv.Version == "" {
+		return schema.GroupVersion{}, fmt.Errorf("apiVersion or version: required")
+	}
+	return gv, nil
+}
+
+func applyLegacyDefaults(r WatchResource) WatchResource {
+	if r.Name == "" {
+		r.Name = r.Kind
+	}
+	info, ok := SupportedResource(r.Kind)
+	if !ok || r.Resource != "" || r.APIVersion != "" || r.Group != "" || r.Version != "" {
+		return r
+	}
+	r.APIVersion = info.GroupVersion()
+	r.Group = info.Group
+	r.Version = info.Version
+	r.Resource = info.Resource
+	if r.Scope == "" {
+		r.Scope = info.Scope
+	}
+	if r.Owner.Follow == nil && !r.Owner.TopController {
+		r.Owner = info.Owner
+	}
+	return r
+}
+
+func isLegacyKindOnly(r WatchResource) bool {
+	_, ok := SupportedResource(r.Kind)
+	return ok && r.APIVersion == "" && r.Group == "" && r.Version == "" && r.Resource == ""
+}
+
+func isCompleteResource(r WatchResource) bool {
+	r = applyLegacyDefaults(r)
+	return r.Kind != "" && r.Version != "" && r.Resource != "" && r.Scope != ""
+}
+
+func resourceName(r WatchResource) string {
+	if r.Name != "" {
+		return r.Name
+	}
+	return r.Kind
+}
+
 // Load reads and validates a config file from disk.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
@@ -359,16 +755,17 @@ func (c *Config) Validate() error {
 	if c.MetricPrefix != "" && !metricNameRe.MatchString(c.MetricPrefix+"x") {
 		return fmt.Errorf("metricPrefix %q is not a valid Prometheus metric name prefix", c.MetricPrefix)
 	}
-	if err := c.validateWatchKinds(); err != nil {
+	reg, err := c.buildRegistry(c.Discovery.Enabled)
+	if err != nil {
 		return err
 	}
 	seenMetric := map[string]struct{}{}
 	for i := range c.Rules {
 		r := &c.Rules[i]
-		if err := r.validate(); err != nil {
+		if err := r.validate(reg); err != nil {
 			return fmt.Errorf("rules[%d] (name=%q): %w", i, r.Name, err)
 		}
-		if err := r.validateAgainstWatch(c.Watch); err != nil {
+		if err := r.validateAgainstWatch(reg); err != nil {
 			return fmt.Errorf("rules[%d] (name=%q): %w", i, r.Name, err)
 		}
 		metricName := c.MetricPrefix + r.Name
@@ -383,67 +780,90 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// validateWatchKinds checks watch.resources schema and kind/scope compatibility.
-func (c *Config) validateWatchKinds() error {
-	seen := map[string]struct{}{}
-	for i, r := range c.Watch.Resources {
-		if _, ok := SupportedResource(r.Kind); !ok {
-			return fmt.Errorf("watch.resources[%d].kind: unknown kind %q (allowed: %s)", i, r.Kind, allowedKindsString())
-		}
-		if _, dup := seen[r.Kind]; dup {
-			return fmt.Errorf("watch.resources[%d].kind: duplicated kind %q", i, r.Kind)
-		}
-		seen[r.Kind] = struct{}{}
-		if r.Scope != ScopeNamespaced && r.Scope != ScopeCluster {
-			return fmt.Errorf("watch.resources[%d].scope: must be %q or %q", i, ScopeNamespaced, ScopeCluster)
-		}
-		if r.Kind == "Node" {
-			if r.Scope != ScopeCluster {
-				return fmt.Errorf("watch.resources[%d]: kind %q must use scope=%q", i, r.Kind, ScopeCluster)
-			}
-			if len(r.Namespaces) > 0 {
-				return fmt.Errorf("watch.resources[%d]: kind %q cannot set namespaces (cluster-scoped resource)", i, r.Kind)
-			}
-			continue
-		}
-		if r.Scope == ScopeCluster && len(r.Namespaces) > 0 {
-			return fmt.Errorf("watch.resources[%d]: scope=%q cannot set namespaces", i, ScopeCluster)
-		}
+// buildRegistry checks watch.resources schema and constructs the resource
+// lookup tables used by validation, informers, and owner-chain resolution.
+func (c *Config) buildRegistry(allowDiscoveryPlaceholders bool) (*Registry, error) {
+	reg := &Registry{
+		byName:      map[string]ResourceInfo{},
+		byGVK:       map[schema.GroupVersionKind]ResourceInfo{},
+		byGVR:       map[schema.GroupVersionResource]ResourceInfo{},
+		kindToNames: map[string][]string{},
 	}
-	return nil
+	for i, raw := range c.Watch.Resources {
+		info, err := normalizeResource(i, raw, allowDiscoveryPlaceholders)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := reg.byName[info.Name]; dup {
+			return nil, fmt.Errorf("watch.resources[%d].name: duplicated resource name %q", i, info.Name)
+		}
+		if info.Resource != "" {
+			if prev, dup := reg.byGVR[info.GVR()]; dup {
+				return nil, fmt.Errorf("watch.resources[%d]: duplicated GVR %s (already used by %q)", i, info.GVR().String(), prev.Name)
+			}
+			reg.byGVR[info.GVR()] = info
+		}
+		if info.Version != "" && info.Kind != "" {
+			if prev, dup := reg.byGVK[info.GVK()]; dup {
+				return nil, fmt.Errorf("watch.resources[%d]: duplicated GVK %s (already used by %q)", i, info.GVK().String(), prev.Name)
+			}
+			reg.byGVK[info.GVK()] = info
+		}
+		reg.resources = append(reg.resources, info)
+		reg.byName[info.Name] = info
+		reg.kindToNames[info.Kind] = append(reg.kindToNames[info.Kind], info.Name)
+	}
+	return reg, nil
 }
 
-// requiredWatchKinds are kinds the rule's anchor and explicit label/expandLabel
-// sources need to have in the informer cache (excludes ownerController/topController).
-func (r *Rule) requiredWatchKinds() map[string]struct{} {
+// requiredWatchResources are resources the rule's anchor and explicit
+// label/expandLabel sources need to have in the informer cache (excludes
+// ownerController/topController).
+func (r *Rule) requiredWatchResources(reg *Registry) (map[string]struct{}, error) {
 	out := map[string]struct{}{}
-	out[r.Anchor] = struct{}{}
-	add := func(src string) {
+	anchor, err := reg.ResourceFor(r.Anchor)
+	if err != nil {
+		return nil, fmt.Errorf("anchor: %w", err)
+	}
+	out[anchor.Name] = struct{}{}
+	add := func(src string) error {
 		switch src {
 		case "", "anchor", "item", "ownerController", "topController":
-			return
+			return nil
 		}
-		if _, ok := SupportedResource(src); ok {
-			out[src] = struct{}{}
+		info, err := reg.ResourceFor(src)
+		if err != nil {
+			return err
 		}
+		out[info.Name] = struct{}{}
+		return nil
 	}
 	for _, ext := range r.Labels {
-		add(ext.EffectiveSource())
+		if err := add(ext.EffectiveSource()); err != nil {
+			return nil, err
+		}
 		for _, f := range ext.Fallbacks {
-			add(f.EffectiveSource())
+			if err := add(f.EffectiveSource()); err != nil {
+				return nil, err
+			}
 		}
 	}
 	for _, ex := range r.ExpandLabels {
-		add(ex.EffectiveSource())
+		if err := add(ex.EffectiveSource()); err != nil {
+			return nil, err
+		}
 	}
-	return out
+	return out, nil
 }
 
-func (r *Rule) validateAgainstWatch(w WatchScope) error {
-	eff := w.EffectiveKindSet()
-	for k := range r.requiredWatchKinds() {
-		if _, ok := eff[k]; !ok {
-			return fmt.Errorf("kind %q is required by anchor/sources but is not included in watch.resources (effective watch set does not include it)", k)
+func (r *Rule) validateAgainstWatch(reg *Registry) error {
+	required, err := r.requiredWatchResources(reg)
+	if err != nil {
+		return err
+	}
+	for name := range required {
+		if _, ok := reg.byName[name]; !ok {
+			return fmt.Errorf("resource %q is required by anchor/sources but is not included in watch.resources", name)
 		}
 	}
 	return nil
@@ -453,29 +873,16 @@ func (r *Rule) validateAgainstWatch(w WatchScope) error {
 // and expandLabels: built-ins plus every supported Kind name. Relation
 // aliases are no longer supported; refer to topController / ownerController
 // or a kind name directly.
-func validSourceSet() map[string]struct{} {
-	out := make(map[string]struct{}, len(builtinSources)+len(supportedResources))
-	for k, v := range builtinSources {
-		out[k] = v
-	}
-	for k := range supportedResources {
-		out[k] = struct{}{}
-	}
-	return out
-}
-
-func (r *Rule) validate() error {
+func (r *Rule) validate(reg *Registry) error {
 	if strings.TrimSpace(r.Name) == "" {
 		return fmt.Errorf("name: required")
 	}
-	if _, ok := SupportedResource(r.Anchor); !ok {
-		return fmt.Errorf("anchor: %q is not supported (allowed: %s)", r.Anchor, allowedKindsString())
+	if _, err := reg.ResourceFor(r.Anchor); err != nil {
+		return fmt.Errorf("anchor: %w", err)
 	}
 	if len(r.Labels) == 0 && len(r.ExpandLabels) == 0 {
 		return fmt.Errorf("labels: at least one fixed label or expandLabels entry is required")
 	}
-
-	validSources := validSourceSet()
 
 	// Validate forEach: only meaningful when the anchor has array fields.
 	if r.ForEach != "" {
@@ -494,14 +901,14 @@ func (r *Rule) validate() error {
 		if strings.HasPrefix(name, "__") {
 			return fmt.Errorf("labels[%q]: names starting with __ are reserved", name)
 		}
-		if err := extract.validate(validSources, hasForEach); err != nil {
+		if err := extract.validate(reg, hasForEach); err != nil {
 			return fmt.Errorf("labels[%q]: %w", name, err)
 		}
 		fixedNames[name] = struct{}{}
 	}
 
 	for i, ex := range r.ExpandLabels {
-		if err := ex.validate(validSources, hasForEach); err != nil {
+		if err := ex.validate(reg, hasForEach); err != nil {
 			return fmt.Errorf("expandLabels[%d]: %w", i, err)
 		}
 		// A prefix that exactly matches a fixed label name would create
@@ -514,13 +921,10 @@ func (r *Rule) validate() error {
 	return nil
 }
 
-func (e Extract) validate(validSources map[string]struct{}, forEachActive bool) error {
+func (e Extract) validate(reg *Registry, forEachActive bool) error {
 	src := e.EffectiveSource()
-	if _, ok := validSources[src]; !ok {
-		return fmt.Errorf("source %q is not recognised", src)
-	}
-	if src == "item" && !forEachActive {
-		return fmt.Errorf("source=item requires forEach on the rule")
+	if err := validateSource(reg, src, forEachActive); err != nil {
+		return err
 	}
 	if strings.TrimSpace(e.Path) == "" {
 		return fmt.Errorf("path: required")
@@ -529,20 +933,17 @@ func (e Extract) validate(validSources map[string]struct{}, forEachActive bool) 
 		if len(f.Fallbacks) > 0 {
 			return fmt.Errorf("fallbacks[%d]: nested fallbacks are not supported", i)
 		}
-		if err := f.validate(validSources, forEachActive); err != nil {
+		if err := f.validate(reg, forEachActive); err != nil {
 			return fmt.Errorf("fallbacks[%d]: %w", i, err)
 		}
 	}
 	return nil
 }
 
-func (e ExpandLabel) validate(validSources map[string]struct{}, forEachActive bool) error {
+func (e ExpandLabel) validate(reg *Registry, forEachActive bool) error {
 	src := e.EffectiveSource()
-	if _, ok := validSources[src]; !ok {
-		return fmt.Errorf("source %q is not recognised", src)
-	}
-	if src == "item" && !forEachActive {
-		return fmt.Errorf("source=item requires forEach on the rule")
+	if err := validateSource(reg, src, forEachActive); err != nil {
+		return err
 	}
 	if strings.TrimSpace(e.Path) == "" {
 		return fmt.Errorf("path: required")
@@ -569,9 +970,19 @@ func (c *Config) MetricName(r *Rule) string {
 	return c.MetricPrefix + r.Name
 }
 
-func defaultScopeForKind(kind string) string {
-	if info, ok := SupportedResource(kind); ok {
-		return info.Scope
+func validateSource(reg *Registry, src string, forEachActive bool) error {
+	switch src {
+	case "", "anchor", "ownerController", "topController":
+		return nil
+	case "item":
+		if !forEachActive {
+			return fmt.Errorf("source=item requires forEach on the rule")
+		}
+		return nil
+	default:
+		if _, err := reg.ResourceFor(src); err != nil {
+			return fmt.Errorf("source %q is not recognised: %w", src, err)
+		}
+		return nil
 	}
-	return ScopeNamespaced
 }

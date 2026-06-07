@@ -235,9 +235,37 @@ rules:
 `
 }
 
-// renderConfigYAML emits the full exporter config body. When namespaces is
-// nil/empty the watch block uses `namespaces: []` which the collector
-// interprets as cluster-wide.
+func customGVRConfigYAML(namespace string) string {
+	return `metricPrefix: "it_"
+
+watch:
+  resources:
+    - name: Widget
+      group: integration.metadata-exporter.example.com
+      version: v1
+      resource: widgets
+      kind: Widget
+      scope: Namespaced
+      namespaces:
+        - ` + namespace + `
+
+rules:
+  - name: "widget_info"
+    help: "Integration test: one series per custom Widget."
+    anchor: Widget
+    labels:
+      namespace:
+        path: "metadata.namespace"
+      widget:
+        path: "metadata.name"
+      size:
+        path: "spec.size"
+`
+}
+
+// renderConfigYAML emits the full exporter config body with an explicit
+// watch.resources set. When namespaces is nil/empty, omitted namespaces mean
+// each namespaced resource is watched cluster-wide.
 func renderConfigYAML(namespaces []string) string {
 	var podNsBlock string
 	if len(namespaces) > 0 {

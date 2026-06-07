@@ -34,6 +34,7 @@ type Options struct {
 // state — every scrape rebuilds output from the informer cache.
 type Collector struct {
 	cfg       *config.Config
+	registry  *config.Registry
 	informers *ScopedInformers
 	resolver  *Resolver
 	evaluator *Evaluator
@@ -59,11 +60,16 @@ func New(cfg *config.Config, client dynamic.Interface, log *slog.Logger, opts Op
 	if log == nil {
 		log = slog.Default()
 	}
-	infs := NewScopedInformers(client, cfg.Watch, log)
+	registry, err := cfg.Registry()
+	if err != nil {
+		return nil, err
+	}
+	infs := NewScopedInformers(client, cfg.Watch, registry, log)
 	c := &Collector{
 		cfg:         cfg,
+		registry:    registry,
 		informers:   infs,
-		resolver:    NewResolver(infs, log),
+		resolver:    NewResolver(infs, registry, log),
 		evaluator:   NewEvaluator(),
 		log:         log,
 		metricNames: map[string]string{},
@@ -72,13 +78,17 @@ func New(cfg *config.Config, client dynamic.Interface, log *slog.Logger, opts Op
 	ruleAnchors := map[string]string{}
 	for i := range cfg.Rules {
 		rule := &cfg.Rules[i]
+		anchor, err := registry.ResourceFor(rule.Anchor)
+		if err != nil {
+			return nil, fmt.Errorf("rule %q anchor: %w", rule.Name, err)
+		}
 		compiled, err := Compile(rule)
 		if err != nil {
 			return nil, err
 		}
 		c.rules = append(c.rules, compiled)
 		c.metricNames[rule.Name] = cfg.MetricName(rule)
-		ruleAnchors[rule.Name] = rule.Anchor
+		ruleAnchors[rule.Name] = anchor.Name
 	}
 
 	c.self = newSelfMetrics(opts.Registerer, ruleAnchors)
@@ -140,8 +150,14 @@ func (c *Collector) collectRule(cr *CompiledRule, ch chan<- prometheus.Metric) {
 		c.self.observeCollectDuration(cr.Rule.Name, time.Since(started))
 	}()
 
-	anchors := c.informers.ListAll(cr.Rule.Anchor)
-	c.self.observeAnchorCount(cr.Rule.Name, cr.Rule.Anchor, len(anchors))
+	anchor, err := c.registry.ResourceFor(cr.Rule.Anchor)
+	if err != nil {
+		c.self.incCollect(cr.Rule.Name, "error")
+		c.log.Warn("rule anchor lookup failed", "rule", cr.Rule.Name, "anchor", cr.Rule.Anchor, "err", err)
+		return
+	}
+	anchors := c.informers.ListAll(anchor.Name)
+	c.self.observeAnchorCount(cr.Rule.Name, anchor.Name, len(anchors))
 	if len(anchors) == 0 {
 		c.self.incCollect(cr.Rule.Name, "ok")
 		return
@@ -283,7 +299,12 @@ func (c *Collector) logParentChainKindGaps() {
 	en := c.informers.EnabledKindSet()
 	var missing []string
 	for _, k := range []string{"ReplicaSet", "Deployment", "StatefulSet", "DaemonSet"} {
-		if _, ok := en[k]; !ok {
+		info, err := c.registry.ResourceFor(k)
+		if err != nil {
+			missing = append(missing, k)
+			continue
+		}
+		if _, ok := en[info.Name]; !ok {
 			missing = append(missing, k)
 		}
 	}
