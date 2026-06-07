@@ -20,9 +20,13 @@ func watchResources(kinds ...string) WatchScope {
 type fakeDiscovery struct {
 	lists map[string]*metav1.APIResourceList
 	err   error
+	calls map[string]int
 }
 
 func (f fakeDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+	if f.calls != nil {
+		f.calls[groupVersion]++
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -350,6 +354,151 @@ func TestResolveDiscovery_ReportsDiscoveryFailure(t *testing.T) {
 	err := c.ResolveDiscovery(fakeDiscovery{err: fmt.Errorf("forbidden")})
 	if err == nil || !strings.Contains(err.Error(), "provide complete group/version/resource/kind/scope") {
 		t.Fatalf("expected actionable discovery failure, got: %v", err)
+	}
+}
+
+func TestResolveDiscovery_DoesNotCallResolverWhenDisabled(t *testing.T) {
+	c := &Config{
+		Watch: WatchScope{Resources: []WatchResource{{
+			Name:     "Job",
+			Group:    "batch",
+			Version:  "v1",
+			Resource: "jobs",
+			Kind:     "Job",
+			Scope:    ScopeNamespaced,
+		}}},
+		Rules: []Rule{{
+			Name:   "job_info",
+			Anchor: "Job",
+			Labels: map[string]Extract{
+				"name": {Path: "metadata.name"},
+			},
+		}},
+	}
+	calls := map[string]int{}
+	err := c.ResolveDiscovery(fakeDiscovery{err: fmt.Errorf("should not be called"), calls: calls})
+	if err != nil {
+		t.Fatalf("ResolveDiscovery: %v", err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("resolver was called with discovery disabled: %v", calls)
+	}
+}
+
+func TestResolveDiscovery_CachesByAPIVersion(t *testing.T) {
+	c := &Config{
+		Discovery: DiscoveryConfig{Enabled: true},
+		Watch: WatchScope{Resources: []WatchResource{
+			{Name: "Job", APIVersion: "batch/v1", Kind: "Job"},
+			{Name: "CronJob", APIVersion: "batch/v1", Kind: "CronJob"},
+		}},
+		Rules: []Rule{
+			{
+				Name:   "job_info",
+				Anchor: "Job",
+				Labels: map[string]Extract{
+					"name": {Path: "metadata.name"},
+				},
+			},
+			{
+				Name:   "cronjob_info",
+				Anchor: "CronJob",
+				Labels: map[string]Extract{
+					"name": {Path: "metadata.name"},
+				},
+			},
+		},
+	}
+	calls := map[string]int{}
+	err := c.ResolveDiscovery(fakeDiscovery{
+		calls: calls,
+		lists: map[string]*metav1.APIResourceList{
+			"batch/v1": {
+				GroupVersion: "batch/v1",
+				APIResources: []metav1.APIResource{
+					{Name: "jobs", Kind: "Job", Namespaced: true, Verbs: metav1.Verbs{"get", "list", "watch"}},
+					{Name: "cronjobs", Kind: "CronJob", Namespaced: true, Verbs: metav1.Verbs{"get", "list", "watch"}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ResolveDiscovery: %v", err)
+	}
+	if got := calls["batch/v1"]; got != 1 {
+		t.Fatalf("discovery calls for batch/v1 = %d, want 1 (all calls: %v)", got, calls)
+	}
+}
+
+func TestResolveDiscovery_RejectsAmbiguousKind(t *testing.T) {
+	c := &Config{
+		Discovery: DiscoveryConfig{Enabled: true},
+		Watch: WatchScope{Resources: []WatchResource{{
+			Name:       "Widget",
+			APIVersion: "example.com/v1",
+			Kind:       "Widget",
+		}}},
+		Rules: []Rule{{
+			Name:   "widget_info",
+			Anchor: "Widget",
+			Labels: map[string]Extract{
+				"name": {Path: "metadata.name"},
+			},
+		}},
+	}
+	err := c.ResolveDiscovery(fakeDiscovery{lists: map[string]*metav1.APIResourceList{
+		"example.com/v1": {
+			GroupVersion: "example.com/v1",
+			APIResources: []metav1.APIResource{
+				{Name: "widgets", Kind: "Widget", Namespaced: true, Verbs: metav1.Verbs{"get", "list", "watch"}},
+				{Name: "widgetaliases", Kind: "Widget", Namespaced: true, Verbs: metav1.Verbs{"get", "list", "watch"}},
+			},
+		},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "found multiple resources") {
+		t.Fatalf("expected ambiguous discovery error, got: %v", err)
+	}
+}
+
+func TestResolveDiscovery_RequiresListWatchVerbs(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		verbs metav1.Verbs
+	}{
+		{name: "missing list", verbs: metav1.Verbs{"get", "watch"}},
+		{name: "missing watch", verbs: metav1.Verbs{"get", "list"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{
+				Discovery: DiscoveryConfig{Enabled: true},
+				Watch: WatchScope{Resources: []WatchResource{{
+					Name:       "Widget",
+					APIVersion: "example.com/v1",
+					Kind:       "Widget",
+				}}},
+				Rules: []Rule{{
+					Name:   "widget_info",
+					Anchor: "Widget",
+					Labels: map[string]Extract{
+						"name": {Path: "metadata.name"},
+					},
+				}},
+			}
+			err := c.ResolveDiscovery(fakeDiscovery{lists: map[string]*metav1.APIResourceList{
+				"example.com/v1": {
+					GroupVersion: "example.com/v1",
+					APIResources: []metav1.APIResource{{
+						Name:       "widgets",
+						Kind:       "Widget",
+						Namespaced: true,
+						Verbs:      tc.verbs,
+					}},
+				},
+			}})
+			if err == nil || !strings.Contains(err.Error(), "does not support list/watch verbs") {
+				t.Fatalf("expected list/watch verbs error, got: %v", err)
+			}
+		})
 	}
 }
 

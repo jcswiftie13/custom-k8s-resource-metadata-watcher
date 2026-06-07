@@ -263,6 +263,34 @@ rules:
 `
 }
 
+func customGVRDiscoveryConfigYAML(namespace string) string {
+	return `metricPrefix: "it_"
+
+discovery:
+  enabled: true
+
+watch:
+  resources:
+    - name: Widget
+      apiVersion: integration.metadata-exporter.example.com/v1
+      kind: Widget
+      namespaces:
+        - ` + namespace + `
+
+rules:
+  - name: "widget_info"
+    help: "Integration test: one series per custom Widget."
+    anchor: Widget
+    labels:
+      namespace:
+        path: "metadata.namespace"
+      widget:
+        path: "metadata.name"
+      size:
+        path: "spec.size"
+`
+}
+
 // renderConfigYAML emits the full exporter config body with an explicit
 // watch.resources set. When namespaces is nil/empty, omitted namespaces mean
 // each namespaced resource is watched cluster-wide.

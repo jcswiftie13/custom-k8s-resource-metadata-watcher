@@ -58,6 +58,38 @@ func TestCorrectness_ArbitraryGVRWidget(t *testing.T) {
 	}
 }
 
+func TestCorrectness_DiscoveryResolvesCustomGVRWidget(t *testing.T) {
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpLogs(t)
+		}
+	})
+	ns := "e2e-custom-gvr-discovery-0"
+	createNamespaces(t, ns)
+	t.Cleanup(func() { deleteNamespaces(t, ns) })
+	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), nil) })
+
+	dyn := mustDynamicClient(t)
+	ensureWidgetCRD(t, dyn)
+	t.Cleanup(func() { deleteWidgetCRD(t, dyn) })
+	createWidget(t, dyn, ns, "w-discovery", "medium")
+
+	setExporterConfig(t, customGVRDiscoveryConfigYAML(ns))
+	restartExporter(t)
+	assertExporterLogContains(t, `"discoveryEnabled":true`)
+
+	if err := waitFor(context.Background(), 60*time.Second, func(ctx context.Context) (bool, error) {
+		mfs := scrapeExporterMetrics(t)
+		return metricHasExactLabels(mfs, "it_widget_info", map[string]string{
+			"namespace": ns,
+			"widget":    "w-discovery",
+			"size":      "medium",
+		}), nil
+	}); err != nil {
+		t.Fatalf("discovered custom GVR widget metric did not converge: %v", err)
+	}
+}
+
 func mustDynamicClient(t *testing.T) dynamic.Interface {
 	t.Helper()
 	client, err := dynamic.NewForConfig(shared.cfg)
