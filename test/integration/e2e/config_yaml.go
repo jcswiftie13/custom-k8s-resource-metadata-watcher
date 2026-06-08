@@ -235,16 +235,16 @@ rules:
 `
 }
 
-func customGVRConfigYAML(namespace string) string {
+func customGVRConfigYAML(namespace, group, version, resource, kind string) string {
 	return `metricPrefix: "it_"
 
 watch:
   resources:
-    - name: Widget
-      group: integration.metadata-exporter.example.com
-      version: v1
-      resource: widgets
-      kind: Widget
+    - name: ` + kind + `
+      group: ` + group + `
+      version: ` + version + `
+      resource: ` + resource + `
+      kind: ` + kind + `
       scope: Namespaced
       namespaces:
         - ` + namespace + `
@@ -252,7 +252,7 @@ watch:
 rules:
   - name: "widget_info"
     help: "Integration test: one series per custom Widget."
-    anchor: Widget
+    anchor: ` + kind + `
     labels:
       namespace:
         path: "metadata.namespace"
@@ -263,7 +263,7 @@ rules:
 `
 }
 
-func customGVRDiscoveryConfigYAML(namespace string) string {
+func customGVRDiscoveryConfigYAML(namespace, apiVersion, kind string) string {
 	return `metricPrefix: "it_"
 
 discovery:
@@ -271,16 +271,16 @@ discovery:
 
 watch:
   resources:
-    - name: Widget
-      apiVersion: integration.metadata-exporter.example.com/v1
-      kind: Widget
+    - name: ` + kind + `
+      apiVersion: ` + apiVersion + `
+      kind: ` + kind + `
       namespaces:
         - ` + namespace + `
 
 rules:
   - name: "widget_info"
     help: "Integration test: one series per custom Widget."
-    anchor: Widget
+    anchor: ` + kind + `
     labels:
       namespace:
         path: "metadata.namespace"

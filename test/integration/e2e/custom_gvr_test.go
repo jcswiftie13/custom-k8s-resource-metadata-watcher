@@ -14,17 +14,43 @@ import (
 	"k8s.io/client-go/dynamic"
 )
 
-const (
-	customGVRGroup   = "integration.metadata-exporter.example.com"
-	customGVRVersion = "v1"
-	customGVRPlural  = "widgets"
-	customGVRKind    = "Widget"
-	customCRDName    = customGVRPlural + "." + customGVRGroup
-)
+type customGVRFixture struct {
+	group    string
+	version  string
+	plural   string
+	singular string
+	kind     string
+}
+
+func (f customGVRFixture) apiVersion() string {
+	return f.group + "/" + f.version
+}
+
+func (f customGVRFixture) crdName() string {
+	return f.plural + "." + f.group
+}
+
+func (f customGVRFixture) gvr() schema.GroupVersionResource {
+	return schema.GroupVersionResource{Group: f.group, Version: f.version, Resource: f.plural}
+}
 
 var (
-	crdGVR    = schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
-	widgetGVR = schema.GroupVersionResource{Group: customGVRGroup, Version: customGVRVersion, Resource: customGVRPlural}
+	crdGVR = schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
+
+	arbitraryWidgetGVR = customGVRFixture{
+		group:    "integration.metadata-exporter.example.com",
+		version:  "v1",
+		plural:   "widgets",
+		singular: "widget",
+		kind:     "Widget",
+	}
+	discoveryWidgetGVR = customGVRFixture{
+		group:    "integration.metadata-exporter.example.com",
+		version:  "v1",
+		plural:   "discoverywidgets",
+		singular: "discoverywidget",
+		kind:     "DiscoveryWidget",
+	}
 )
 
 func TestCorrectness_ArbitraryGVRWidget(t *testing.T) {
@@ -39,12 +65,12 @@ func TestCorrectness_ArbitraryGVRWidget(t *testing.T) {
 	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), nil) })
 
 	dyn := mustDynamicClient(t)
-	ensureWidgetCRD(t, dyn)
-	t.Cleanup(func() { deleteWidgetCRD(t, dyn) })
-	createWidget(t, dyn, ns, "w1", "large")
+	fixture := arbitraryWidgetGVR
+	ensureWidgetCRD(t, dyn, fixture)
+	t.Cleanup(func() { deleteWidgetCRD(t, dyn, fixture) })
+	createWidget(t, dyn, fixture, ns, "w1", "large")
 
-	setExporterConfig(t, customGVRConfigYAML(ns))
-	restartExporter(t)
+	setExporterConfig(t, customGVRConfigYAML(ns, fixture.group, fixture.version, fixture.plural, fixture.kind))
 
 	if err := waitFor(context.Background(), 60*time.Second, func(ctx context.Context) (bool, error) {
 		mfs := scrapeExporterMetrics(t)
@@ -70,12 +96,12 @@ func TestCorrectness_DiscoveryResolvesCustomGVRWidget(t *testing.T) {
 	t.Cleanup(func() { printExporterMetricsSnapshotIfEnabled(t, t.Name(), nil) })
 
 	dyn := mustDynamicClient(t)
-	ensureWidgetCRD(t, dyn)
-	t.Cleanup(func() { deleteWidgetCRD(t, dyn) })
-	createWidget(t, dyn, ns, "w-discovery", "medium")
+	fixture := discoveryWidgetGVR
+	ensureWidgetCRD(t, dyn, fixture)
+	t.Cleanup(func() { deleteWidgetCRD(t, dyn, fixture) })
+	createWidget(t, dyn, fixture, ns, "w-discovery", "medium")
 
-	setExporterConfig(t, customGVRDiscoveryConfigYAML(ns))
-	restartExporter(t)
+	setExporterConfig(t, customGVRDiscoveryConfigYAML(ns, fixture.apiVersion(), fixture.kind))
 	assertExporterLogContains(t, `"discoveryEnabled":true`)
 
 	if err := waitFor(context.Background(), 60*time.Second, func(ctx context.Context) (bool, error) {
@@ -99,47 +125,35 @@ func mustDynamicClient(t *testing.T) dynamic.Interface {
 	return client
 }
 
-func ensureWidgetCRD(t *testing.T, dyn dynamic.Interface) {
+func ensureWidgetCRD(t *testing.T, dyn dynamic.Interface, fixture customGVRFixture) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	crd := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "apiextensions.k8s.io/v1",
-		"kind":       "CustomResourceDefinition",
-		"metadata": map[string]interface{}{
-			"name": customCRDName,
-		},
-		"spec": map[string]interface{}{
-			"group": customGVRGroup,
-			"scope": "Namespaced",
-			"names": map[string]interface{}{
-				"plural":   customGVRPlural,
-				"singular": "widget",
-				"kind":     customGVRKind,
-			},
-			"versions": []interface{}{map[string]interface{}{
-				"name":    customGVRVersion,
-				"served":  true,
-				"storage": true,
-				"schema": map[string]interface{}{
-					"openAPIV3Schema": map[string]interface{}{
-						"type": "object",
-						"properties": map[string]interface{}{
-							"spec": map[string]interface{}{
-								"type":                                 "object",
-								"x-kubernetes-preserve-unknown-fields": true,
-							},
-						},
-					},
-				},
-			}},
-		},
-	}}
-	if _, err := dyn.Resource(crdGVR).Create(ctx, crd, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		t.Fatalf("create widget CRD: %v", err)
+
+	for {
+		_, err := dyn.Resource(crdGVR).Create(ctx, widgetCRD(fixture), metav1.CreateOptions{})
+		if err == nil {
+			break
+		}
+		if !apierrors.IsAlreadyExists(err) {
+			t.Fatalf("create widget CRD: %v", err)
+		}
+		got, err := dyn.Resource(crdGVR).Get(ctx, fixture.crdName(), metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("get existing widget CRD: %v", err)
+		}
+		if got.GetDeletionTimestamp() == nil {
+			break
+		}
+		if err := waitForWidgetCRDDeleted(ctx, dyn, fixture); err != nil {
+			t.Fatalf("wait for deleting widget CRD: %v", err)
+		}
 	}
 	if err := waitFor(ctx, 2*time.Second, func(ctx context.Context) (bool, error) {
-		got, err := dyn.Resource(crdGVR).Get(ctx, customCRDName, metav1.GetOptions{})
+		got, err := dyn.Resource(crdGVR).Get(ctx, fixture.crdName(), metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -157,25 +171,90 @@ func ensureWidgetCRD(t *testing.T, dyn dynamic.Interface) {
 	}); err != nil {
 		t.Fatalf("wait for widget CRD established: %v", err)
 	}
-}
-
-func deleteWidgetCRD(t *testing.T, dyn dynamic.Interface) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	err := dyn.Resource(crdGVR).Delete(ctx, customCRDName, metav1.DeleteOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
-		t.Logf("delete widget CRD: %v", err)
+	if err := waitForWidgetAPIResource(ctx, dyn, fixture); err != nil {
+		t.Fatalf("wait for widget API resource: %v", err)
 	}
 }
 
-func createWidget(t *testing.T, dyn dynamic.Interface, namespace, name, size string) {
+func widgetCRD(fixture customGVRFixture) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "apiextensions.k8s.io/v1",
+		"kind":       "CustomResourceDefinition",
+		"metadata": map[string]interface{}{
+			"name": fixture.crdName(),
+		},
+		"spec": map[string]interface{}{
+			"group": fixture.group,
+			"scope": "Namespaced",
+			"names": map[string]interface{}{
+				"plural":   fixture.plural,
+				"singular": fixture.singular,
+				"kind":     fixture.kind,
+			},
+			"versions": []interface{}{map[string]interface{}{
+				"name":    fixture.version,
+				"served":  true,
+				"storage": true,
+				"schema": map[string]interface{}{
+					"openAPIV3Schema": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"spec": map[string]interface{}{
+								"type":                                 "object",
+								"x-kubernetes-preserve-unknown-fields": true,
+							},
+						},
+					},
+				},
+			}},
+		},
+	}}
+}
+
+func waitForWidgetAPIResource(ctx context.Context, dyn dynamic.Interface, fixture customGVRFixture) error {
+	return waitFor(ctx, 500*time.Millisecond, func(ctx context.Context) (bool, error) {
+		_, err := dyn.Resource(fixture.gvr()).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{Limit: 1})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return err == nil, err
+	})
+}
+
+func waitForWidgetCRDDeleted(ctx context.Context, dyn dynamic.Interface, fixture customGVRFixture) error {
+	return waitFor(ctx, 500*time.Millisecond, func(ctx context.Context) (bool, error) {
+		_, err := dyn.Resource(crdGVR).Get(ctx, fixture.crdName(), metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	})
+}
+
+func deleteWidgetCRD(t *testing.T, dyn dynamic.Interface, fixture customGVRFixture) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	err := dyn.Resource(crdGVR).Delete(ctx, fixture.crdName(), metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return
+	}
+	if err != nil {
+		t.Logf("delete widget CRD: %v", err)
+		return
+	}
+	if err := waitForWidgetCRDDeleted(ctx, dyn, fixture); err != nil {
+		t.Logf("wait for widget CRD deletion: %v", err)
+	}
+}
+
+func createWidget(t *testing.T, dyn dynamic.Interface, fixture customGVRFixture, namespace, name, size string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	widget := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": customGVRGroup + "/" + customGVRVersion,
-		"kind":       customGVRKind,
+		"apiVersion": fixture.apiVersion(),
+		"kind":       fixture.kind,
 		"metadata": map[string]interface{}{
 			"namespace": namespace,
 			"name":      name,
@@ -184,7 +263,16 @@ func createWidget(t *testing.T, dyn dynamic.Interface, namespace, name, size str
 			"size": size,
 		},
 	}}
-	if _, err := dyn.Resource(widgetGVR).Namespace(namespace).Create(ctx, widget, metav1.CreateOptions{}); err != nil {
+	if err := waitFor(ctx, 500*time.Millisecond, func(ctx context.Context) (bool, error) {
+		_, err := dyn.Resource(fixture.gvr()).Namespace(namespace).Create(ctx, widget, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			return true, nil
+		}
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return err == nil, err
+	}); err != nil {
 		t.Fatalf("create widget: %v", err)
 	}
 }
