@@ -30,6 +30,18 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+func legacyTestWatch(kinds ...string) config.WatchScope {
+	if len(kinds) == 0 {
+		kinds = config.SupportedKinds()
+	}
+	resources := make([]config.WatchResource, 0, len(kinds))
+	for _, kind := range kinds {
+		info, _ := config.SupportedResource(kind)
+		resources = append(resources, config.WatchResource{Kind: kind, Scope: info.Scope})
+	}
+	return config.WatchScope{Resources: resources}
+}
+
 func podWithOwner(name, ns, rsName string, labels, annotations map[string]string) *corev1.Pod {
 	ctrl := true
 	return &corev1.Pod{
@@ -77,6 +89,9 @@ func depObj(name, ns string, labels, annotations map[string]string) *appsv1.Depl
 // called by the caller (typically via defer) to stop informers.
 func startCollector(t *testing.T, cfg *config.Config, client dynamic.Interface) (*Collector, *prometheus.Registry, context.CancelFunc) {
 	t.Helper()
+	if len(cfg.Watch.Resources) == 0 {
+		cfg.Watch = legacyTestWatch()
+	}
 	col, err := New(cfg, client, discardLogger(), Options{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -134,12 +149,16 @@ func runtimeObjs(items ...runtime.Object) []runtime.Object {
 }
 
 func dynamicClientForObjects(t testing.TB, items ...runtime.Object) dynamic.Interface {
+	return dynamicClientForObjectsWithListKinds(t, dynamicListKinds(), items...)
+}
+
+func dynamicClientForObjectsWithListKinds(t testing.TB, listKinds map[schema.GroupVersionResource]string, items ...runtime.Object) dynamic.Interface {
 	t.Helper()
 	objs := make([]runtime.Object, 0, len(items))
 	for _, item := range items {
 		objs = append(objs, dynamicObject(t, item))
 	}
-	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), dynamicListKinds(), objs...)
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds, objs...)
 }
 
 func dynamicListKinds() map[schema.GroupVersionResource]string {
@@ -419,6 +438,55 @@ func TestCollect_ServiceAndEndpointSliceAnchors(t *testing.T) {
 	expectContain(t, out, `addr_type="IPv4"`)
 }
 
+func TestCollect_ArbitraryGVRAnchor(t *testing.T) {
+	widgetGVR := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	widget := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "example.com/v1",
+		"kind":       "Widget",
+		"metadata": map[string]interface{}{
+			"name":      "w1",
+			"namespace": "ns",
+			"labels": map[string]interface{}{
+				"team": "platform",
+			},
+		},
+		"spec": map[string]interface{}{
+			"size": "large",
+		},
+	}}
+	cfg := &config.Config{
+		MetricPrefix: "test_",
+		Watch: config.WatchScope{Resources: []config.WatchResource{{
+			Name:     "Widget",
+			Group:    "example.com",
+			Version:  "v1",
+			Resource: "widgets",
+			Kind:     "Widget",
+			Scope:    config.ScopeNamespaced,
+		}}},
+		Rules: []config.Rule{{
+			Name:   "widget_info",
+			Anchor: "Widget",
+			Labels: map[string]config.Extract{
+				"namespace": {Path: "metadata.namespace"},
+				"widget":    {Path: "metadata.name"},
+				"size":      {Path: "spec.size"},
+			},
+		}},
+	}
+	client := dynamicClientForObjectsWithListKinds(t, map[schema.GroupVersionResource]string{
+		widgetGVR: "WidgetList",
+	}, widget)
+	_, reg, cancel := startCollector(t, cfg, client)
+	defer cancel()
+
+	out := gatherText(t, reg)
+	expectContain(t, out, `test_widget_info{`)
+	expectContain(t, out, `namespace="ns"`)
+	expectContain(t, out, `widget="w1"`)
+	expectContain(t, out, `size="large"`)
+}
+
 // ---------------------------------------------------------------------------
 // Cardinality controls: allow/deny/maxKeys.
 // ---------------------------------------------------------------------------
@@ -541,6 +609,7 @@ func TestCollect_PerPodIndependence(t *testing.T) {
 func TestSelfMetrics_Names(t *testing.T) {
 	cfg := &config.Config{
 		MetricPrefix: "test_",
+		Watch:        legacyTestWatch("Pod"),
 		Rules: []config.Rule{{
 			Name:   "pod_info",
 			Anchor: "Pod",

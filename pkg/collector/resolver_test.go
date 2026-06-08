@@ -12,6 +12,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/example/metadata-exporter/pkg/config"
 )
 
 // fakeLister is a table-driven ListerGetter for tests.
@@ -29,6 +31,21 @@ func (f *fakeLister) Get(kind, namespace, name string) (runtime.Object, error) {
 }
 
 func ptrBool(b bool) *bool { return &b }
+
+func resolverRegistry(t *testing.T, kinds ...string) *config.Registry {
+	t.Helper()
+	resources := make([]config.WatchResource, 0, len(kinds))
+	for _, kind := range kinds {
+		info, _ := config.SupportedResource(kind)
+		resources = append(resources, config.WatchResource{Kind: kind, Scope: info.Scope})
+	}
+	cfg := &config.Config{Watch: config.WatchScope{Resources: resources}}
+	reg, err := cfg.Registry()
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+	return reg
+}
 
 func newPodOwnedBy(ns, name, parentKind, parentName string) *corev1.Pod {
 	return &corev1.Pod{
@@ -63,7 +80,7 @@ func TestResolve_PodToReplicaSetToDeployment(t *testing.T) {
 		"ReplicaSet/n/rs":  rs,
 		"Deployment/n/dep": dep,
 	}}
-	r := NewResolver(fl, slog.Default())
+	r := NewResolver(fl, resolverRegistry(t, "Pod", "ReplicaSet", "Deployment"), slog.Default())
 	chain := r.Resolve(pod)
 
 	if chain["anchor"] != pod {
@@ -84,7 +101,7 @@ func TestResolve_StaticPodHasNoOwnerChain(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "n", Name: "pod"},
 	}
-	r := NewResolver(&fakeLister{objects: map[string]runtime.Object{}}, slog.Default())
+	r := NewResolver(&fakeLister{objects: map[string]runtime.Object{}}, resolverRegistry(t, "Pod"), slog.Default())
 	chain := r.Resolve(pod)
 
 	if chain["anchor"] != pod {
@@ -100,7 +117,7 @@ func TestResolve_StaticPodHasNoOwnerChain(t *testing.T) {
 
 func TestResolve_StopsOnCacheMiss(t *testing.T) {
 	pod := newPodOwnedBy("n", "pod", "ReplicaSet", "missing-rs")
-	r := NewResolver(&fakeLister{objects: map[string]runtime.Object{}}, slog.Default())
+	r := NewResolver(&fakeLister{objects: map[string]runtime.Object{}}, resolverRegistry(t, "Pod", "ReplicaSet"), slog.Default())
 	chain := r.Resolve(pod)
 
 	if chain["anchor"] != pod {
@@ -118,7 +135,7 @@ func TestResolve_DeploymentAnchorIsItsOwnTop(t *testing.T) {
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "n", Name: "dep"},
 	}
-	r := NewResolver(&fakeLister{objects: map[string]runtime.Object{}}, slog.Default())
+	r := NewResolver(&fakeLister{objects: map[string]runtime.Object{}}, resolverRegistry(t, "Deployment"), slog.Default())
 	chain := r.Resolve(dep)
 	if chain["topController"] != dep {
 		t.Fatalf("expected topController == anchor for Deployment anchor")
@@ -134,7 +151,7 @@ func TestResolve_StatefulSetAnchor(t *testing.T) {
 	}
 	pod := newPodOwnedBy("n", "pod", "StatefulSet", "sts")
 	fl := &fakeLister{objects: map[string]runtime.Object{"StatefulSet/n/sts": sts}}
-	r := NewResolver(fl, slog.Default())
+	r := NewResolver(fl, resolverRegistry(t, "Pod", "StatefulSet"), slog.Default())
 
 	chain := r.Resolve(pod)
 	if chain["topController"] != sts {
@@ -165,7 +182,7 @@ func TestResolve_UnstructuredEndpointSliceToService(t *testing.T) {
 	}})
 
 	fl := &fakeLister{objects: map[string]runtime.Object{"Service/n/svc": svc}}
-	r := NewResolver(fl, slog.Default())
+	r := NewResolver(fl, resolverRegistry(t, "EndpointSlice", "Service"), slog.Default())
 	chain := r.Resolve(ep)
 
 	if got := kindOf(ep); got != "EndpointSlice" {

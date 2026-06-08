@@ -15,6 +15,10 @@ metadata:
   labels:
     app.kubernetes.io/name: metadata-exporter-integration
 rules:
+  # Integration defaults explicitly watch these built-in resources. Tests that
+  # add arbitrary GVR/CRD coverage must add matching get/list/watch rules for
+  # the CRD plural resource. Discovery opt-in does not replace target-resource
+  # LIST/WATCH permissions.
   - apiGroups: [""]
     resources: ["pods", "nodes", "services"]
     verbs: ["get", "list", "watch"]
@@ -23,6 +27,9 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["integration.metadata-exporter.example.com"]
+    resources: ["widgets", "discoverywidgets"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

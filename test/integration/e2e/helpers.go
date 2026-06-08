@@ -295,6 +295,9 @@ func waitForRollout(t *testing.T, ctx context.Context) {
 		if want == 0 {
 			return d.Status.Replicas == 0, nil
 		}
+		if d.Status.ObservedGeneration < d.Generation {
+			return false, nil
+		}
 		if d.Status.UpdatedReplicas < want {
 			return false, nil
 		}

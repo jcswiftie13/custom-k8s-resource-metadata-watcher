@@ -161,6 +161,7 @@ func startBenchCollectorAny(b *testing.B, cfg *config.Config, objs ...runtime.Ob
 func benchFixedLabelConfig() *config.Config {
 	return &config.Config{
 		MetricPrefix: "bench_",
+		Watch:        legacyTestWatch("Pod"),
 		Rules: []config.Rule{{
 			Name:   "pod_info",
 			Anchor: "Pod",
@@ -176,6 +177,7 @@ func benchFixedLabelConfig() *config.Config {
 func benchExpandLabelConfig() *config.Config {
 	return &config.Config{
 		MetricPrefix: "bench_",
+		Watch:        legacyTestWatch("Pod"),
 		Rules: []config.Rule{{
 			Name:   "pod_info",
 			Anchor: "Pod",
@@ -194,6 +196,7 @@ func benchExpandLabelConfig() *config.Config {
 func benchOwnerChainConfig() *config.Config {
 	return &config.Config{
 		MetricPrefix: "bench_",
+		Watch:        legacyTestWatch("Pod", "ReplicaSet", "Deployment"),
 		Rules: []config.Rule{{
 			Name:   "pod_info",
 			Anchor: "Pod",

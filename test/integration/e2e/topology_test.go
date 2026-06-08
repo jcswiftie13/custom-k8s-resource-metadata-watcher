@@ -14,8 +14,8 @@ import (
 )
 
 // watchedKinds are the plural resource names recorded by kube-apiserver in
-// `apiserver_longrunning_requests{resource=...}`. Keep in sync with
-// pkg/config/config.go:allSupportedKindOrder when the default is to watch all kinds.
+// `apiserver_longrunning_requests{resource=...}`. Keep in sync with the
+// explicit resources rendered by clusterWideConfigYAML/renderConfigYAML.
 var watchedKinds = []string{"pods", "replicasets", "deployments", "statefulsets", "daemonsets", "nodes", "services", "endpointslices"}
 
 // TestTopology_ClusterWide verifies that the exporter opens exactly one
