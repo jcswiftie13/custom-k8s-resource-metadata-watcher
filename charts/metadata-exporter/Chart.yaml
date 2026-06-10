@@ -1,0 +1,14 @@
+apiVersion: v2
+name: metadata-exporter
+description: Config-driven Kubernetes metadata exporter for Prometheus
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/example/metadata-exporter
+keywords:
+  - kubernetes
+  - prometheus
+  - metrics
+  - metadata
+maintainers: []

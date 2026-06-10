@@ -1,0 +1,23 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "metadata-exporter.fullname" . }}
+  labels:
+    {{- include "metadata-exporter.labels" . | nindent 4 }}
+rules:
+  {{- with .Values.rbac.rules }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+  {{- with .Values.rbac.extraRules }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+  {{- if eq (include "metadata-exporter.rbacDiscovery" .) "true" }}
+  - nonResourceURLs:
+      - /api
+      - /apis
+      - /apis/*
+      - /openapi/v2
+    verbs: ["get"]
+  {{- end }}
+{{- end }}

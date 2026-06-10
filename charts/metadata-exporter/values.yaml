@@ -1,0 +1,188 @@
+# Default values for metadata-exporter.
+# See docs/CONFIG.md for the full configuration reference.
+
+nameOverride: ""
+fullnameOverride: ""
+
+namespace:
+  # Create the target namespace via Helm.
+  create: true
+  name: metadata-exporter
+
+image:
+  repository: ghcr.io/example/metadata-exporter
+  tag: "" # defaults to Chart appVersion when empty
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+replicaCount: 1
+
+# Recreate avoids two replicas watching the same resources in parallel.
+strategy:
+  type: Recreate
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
+  # Grant discovery API access when config.discovery.enabled is true.
+  discovery: false
+  # Base get/list/watch rules covering the built-in kinds below.
+  rules:
+    - apiGroups: [""]
+      resources: ["pods", "nodes", "services"]
+      verbs: ["get", "list", "watch"]
+    - apiGroups: ["apps"]
+      resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
+      verbs: ["get", "list", "watch"]
+    - apiGroups: ["discovery.k8s.io"]
+      resources: ["endpointslices"]
+      verbs: ["get", "list", "watch"]
+  # Appended to rules above — add get/list/watch for every extra GVR (e.g. CRDs)
+  # declared in config.watch.resources without replacing the defaults.
+  extraRules: []
+
+# Exporter YAML config mounted at /etc/metadata-exporter/config.yaml
+config:
+  metricPrefix: "custom_"
+  discovery:
+    enabled: false
+  watch:
+    resources:
+      - kind: Pod
+        scope: Namespaced
+        fieldSelector: "status.phase!=Succeeded"
+      - kind: ReplicaSet
+        scope: Namespaced
+      - kind: Deployment
+        scope: Namespaced
+      - kind: StatefulSet
+        scope: Namespaced
+      - kind: DaemonSet
+        scope: Namespaced
+      - kind: Node
+        scope: Cluster
+      - kind: Service
+        scope: Namespaced
+      - kind: EndpointSlice
+        scope: Namespaced
+  rules:
+    - name: pod_info
+      help: One series per Pod.
+      anchor: Pod
+      labels:
+        namespace:
+          path: metadata.namespace
+        pod:
+          path: metadata.name
+        node:
+          path: spec.nodeName
+        phase:
+          path: status.phase
+        controller_kind:
+          source: topController
+          path: kind
+        controller_name:
+          source: topController
+          path: metadata.name
+        argocd_tracking_id:
+          source: topController
+          path: metadata.annotations["argocd.argoproj.io/tracking-id"]
+          fallbacks:
+            - source: anchor
+              path: metadata.annotations["argocd.argoproj.io/tracking-id"]
+    - name: pod_container_info
+      help: One series per (pod, container).
+      anchor: Pod
+      forEach: spec.containers[*]
+      labels:
+        namespace:
+          path: metadata.namespace
+        pod:
+          path: metadata.name
+        container:
+          source: item
+          path: name
+        image:
+          source: item
+          path: image
+        controller_kind:
+          source: topController
+          path: kind
+        controller_name:
+          source: topController
+          path: metadata.name
+        argocd_tracking_id:
+          source: topController
+          path: metadata.annotations["argocd.argoproj.io/tracking-id"]
+
+# Extra CLI flags passed to the binary (see cmd/main.go).
+args:
+  # containerPort, probes, and prometheus.io/port annotations all derive from this.
+  metricsAddr: ":8080"
+  logLevel: info
+  kubeApiQps: 20
+  kubeApiBurst: 40
+
+# Emit prometheus.io/{scrape,port,path} annotations on the Pod and Service,
+# with the port derived from args.metricsAddr / service.port.
+prometheusAnnotations: true
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+podAnnotations: {}
+
+podLabels: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Distroless nonroot image runs as UID/GID 65532.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+probes:
+  readiness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 1
+    failureThreshold: 3
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 1
+    failureThreshold: 3
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+extraVolumes: []
+extraVolumeMounts: []

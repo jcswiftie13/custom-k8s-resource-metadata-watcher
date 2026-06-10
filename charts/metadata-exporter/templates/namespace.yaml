@@ -1,0 +1,8 @@
+{{- if .Values.namespace.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "metadata-exporter.namespace" . }}
+  labels:
+    {{- include "metadata-exporter.labels" . | nindent 4 }}
+{{- end }}

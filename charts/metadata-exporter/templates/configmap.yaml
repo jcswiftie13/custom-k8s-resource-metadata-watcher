@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "metadata-exporter.fullname" . }}
+  namespace: {{ include "metadata-exporter.namespace" . }}
+  labels:
+    {{- include "metadata-exporter.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- toYaml .Values.config | nindent 4 }}

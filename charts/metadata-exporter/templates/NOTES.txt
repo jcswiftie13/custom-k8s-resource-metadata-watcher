@@ -1,0 +1,20 @@
+1. Get the application URL by running these commands:
+{{- if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get --namespace {{ include "metadata-exporter.namespace" . }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "metadata-exporter.fullname" . }})
+  export NODE_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo http://$NODE_IP:$NODE_PORT/metrics
+{{- else if contains "LoadBalancer" .Values.service.type }}
+  NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+        Watch status with: kubectl get svc -w --namespace {{ include "metadata-exporter.namespace" . }} {{ include "metadata-exporter.fullname" . }}
+  export SERVICE_IP=$(kubectl get svc --namespace {{ include "metadata-exporter.namespace" . }} {{ include "metadata-exporter.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  echo http://$SERVICE_IP:{{ .Values.service.port }}/metrics
+{{- else }}
+  kubectl port-forward --namespace {{ include "metadata-exporter.namespace" . }} svc/{{ include "metadata-exporter.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  echo "Scrape http://127.0.0.1:{{ .Values.service.port }}/metrics"
+{{- end }}
+
+2. Config is mounted from ConfigMap {{ include "metadata-exporter.fullname" . }} at /etc/metadata-exporter/config.yaml.
+   Edit values.yaml (config section) or override with a custom values file, then upgrade the release.
+
+3. Health check (the distroless image has no shell, so use the API server proxy):
+   kubectl get --raw "/api/v1/namespaces/{{ include "metadata-exporter.namespace" . }}/services/{{ include "metadata-exporter.fullname" . }}:metrics/proxy/healthz"
