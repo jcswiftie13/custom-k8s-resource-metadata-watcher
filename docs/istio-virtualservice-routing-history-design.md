@@ -184,6 +184,8 @@ graph TD
 
 writer 與 query 都只依賴一個 `Store` interface（`Put(version, validFrom, spec)` / `SetValidTo` / `AsOf(gvk,ns,name,T)` / `Overlap(gvk,ns,name,t0,t1)`），底層三選一：
 
+> **實作定案（2026-07）**：本案選項 1 以 **ClickHouse** 落地（非 PostgreSQL）——`jsonb`→ClickHouse 原生 `Array/Map` 抽出的 join 欄、`tstzrange`→`valid_from`/`valid_to` 兩欄 +「validity overlap」查詢（interval 模型，`valid_to` 用遠未來 sentinel）。動機之一是讓 ingress `IP→Gateway` 的 `hasAll` selector-join 與 config store 同引擎（三跳 SQL / 效能 / 調校見 [`ingress-traffic-gateway-resolution.md`](ingress-traffic-gateway-resolution.md)）。選項 2/3 保留為對照。ClickHouse 無多語句 ACID 交易，故「收前版 `valid_to` + 插新版」的原子性用 `ReplacingMergeTree(ingest_seq)` + 查詢端 `FINAL`/`argMax` 去重處理（取代 Postgres 的 tx / exclusion constraint 護欄）。
+
 **選項 1：PostgreSQL（jsonb + `tstzrange` + GIST）**
 - 執行方式：一張表 `config_versions(gvk, ns, name, generation, validity tstzrange, spec jsonb)`，GIST index on `validity`。writer 每次變更插一列並把前一列 `validity` 上界補上；query 用 `validity && tstzrange(t0,t1)` 一句撈出區間內全部版本。
 - 優點：單一存儲；valid-time **精確**且交易式（writer 一次 tx 寫新列+收前列，無一致性縫）；range/overlap 是原生能力；同表可一併存 DR/Service。

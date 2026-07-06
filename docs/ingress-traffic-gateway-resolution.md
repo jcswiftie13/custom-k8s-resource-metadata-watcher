@@ -22,11 +22,13 @@ POC 現況（`poc/route2a`）僅做 **L7 設定層** 的 host→Gateway 比對�
 | 議題 | 結論 |
 |------|------|
 | DNS / IP 能否取代 `gwresolve` host match？ | **不能**。IP 只縮候選；最終 Gateway 仍須 `servers[].hosts` most-specific 比對。 |
-| 查詢時逐步 watch 比對 vs 預建索引？ | **預建索引**（watch 事件驅動），查詢時 O(1) `IP → []Gateway`；勿在 query path 掃全 Service。 |
+| 查詢時重算 vs 預建索引？ | 本案（取證/低 QPS）**query-time 重算**：三次窄查詢（IP→Service→Deployment→Gateway），非掃全 Service；線上熱路徑才升級預建索引。 |
 | Service selector 與 Gateway selector 要完全相等？ | **不要**。安全關聯條件：`Gateway.selector ⊆ Service.selector`（子集，非 `DeepEqual`）。 |
 | 預建索引 vs per-resource 版本化 store？ | **不衝突**。per-resource store 是 source of truth；索引是 **derived view**（可記憶體、可重算、可選持久化）。 |
-| ingress LB IP 存在哪？ | `Service.status.loadBalancer`（非 `spec.externalIPs`）；status 變更須能版本化，否則 IP 映射不可靠。 |
+| ingress IP 存在哪？ | **多欄位 union**：`spec.externalIPs`（本環境即此）∪ `status.loadBalancer.ingress[]`（雲端 LB/MetalLB）∪（選配）NodePort+Node ExternalIP。`status` 來源須能版本化，否則 IP 映射不可靠。 |
 | OTEL ingest 是否一定要 DNS lookup？ | **優先使用 span 既有連線 IP**；僅在缺少 IP 時由 collector lookup processor 補 DNS。 |
+| IP→Gateway 有直接欄位嗎？ | **無**。ingressgateway workload/pod 無指向 Gateway CR 的欄位；唯一綁定是 `Gateway.spec.selector ⊆ ingress Deployment pod labels` 的 selector join。 |
+| 這個 join 怎麼存/算才有效率？ | **query-time 重算，selector 包含用 ClickHouse `hasAll` 下推**（三次窄查詢）；不建 binding 表，store 維持 per-resource。 |
 
 ---
 
@@ -117,18 +119,148 @@ K8s label selector 為 **AND** 語意；要比的是**選到的 pod 集合**，�
 同一 LB IP 上可能有多個 Gateway CR（相同 selector、不同 `servers[].hosts`）→ 索引為
 `IP → [gw-a, gw-b, …]`，**IP 無法消歧**，仍靠步驟 C 的 `gwresolve(host, candidates)`。
 
+### IP→Gateway 映射：為何無直接欄位、用什麼當 L
+
+`IP → ingressgateway workload` 容易（IP 比對 ingress Service → `.spec.selector` 選到 ingress pods），
+但 **ingressgateway workload → Gateway CR 沒有 back-reference 欄位**：唯一把 Gateway CR 綁到該 ingress 的
+是 `Gateway.spec.selector`（label selector，須匹配 ingress pods 的 labels）。所以 `IP → Gateway` 本質是
+一個 **label-selector 包含關係 join**，不是欄位查找。
+
+**用 Deployment pod-template labels 當正規 label 集合 L**（穩定、可版本化），測 `Gateway.spec.selector ⊆ L`。
+比只用 `Gateway.selector ⊆ Service.selector`（上表）更準：後者在「`Gateway.selector` 含一個 pod 有、
+`Service.selector` 沒有的 label」時會漏（上表 ❌ 列）。`⊆ Service.selector` 保留為輕量近似。
+
+**IP 來源是多欄位 union**（依暴露方式），反查時正規化成一個 `ingress_ips` 陣列欄、query 用
+`has(ingress_ips, <IP>)`：
+
+- `spec.externalIPs`（手動指派外部 IP；bare-metal / 無雲端 LB 常見）
+- `status.loadBalancer.ingress[].ip` / `.hostname`（type LoadBalancer：雲端 LB / MetalLB）
+- （選配）NodePort + Node `ExternalIP`
+
+版本化上，`spec.externalIPs` 在 spec（既有 spec-hash 版本化涵蓋）；`status.loadBalancer` 在 status
+（須 status 版本化，見主文件風險 #1）。
+
+### ClickHouse 三跳 SQL、效能與調校
+
+**核心前提：join key 在 ingest 期就抽好、正規化成 `Array(String)` 欄**（排序後的 `"k=v"` token；
+IP 抽成 union 陣列）。查詢期 `JSONExtract` 會主導延遲並讓 skip-index 失效，故 writer 先物化這些欄。
+
+**DDL（interval 模型；`valid_to` 用遠未來 sentinel，讓 live-at-T 是乾淨兩側 range）：**
+
+```sql
+-- 只存 ingress LB Service（非全 Service）
+CREATE TABLE svc_versions (
+  namespace   LowCardinality(String),
+  name        String,
+  valid_from  DateTime64(3),
+  valid_to    DateTime64(3),                    -- open 版填 '2999-01-01'
+  ingress_ips Array(String),                    -- spec.externalIPs ∪ status.LB.ingress ∪ (選配)NodePort+NodeIP
+  selector_kv Array(String),                    -- 排序 ["app=istio-ingressgateway","istio=ingressgateway"]
+  ingest_seq  UInt64,
+  INDEX idx_ips ingress_ips TYPE bloom_filter GRANULARITY 1
+) ENGINE = ReplacingMergeTree(ingest_seq)
+ORDER BY (namespace, name, valid_from);
+
+CREATE TABLE deploy_versions (
+  namespace LowCardinality(String), name String,
+  valid_from DateTime64(3), valid_to DateTime64(3),
+  pod_labels_kv Array(String),                  -- pod-template labels, 排序 "k=v" → 即 L
+  ingest_seq UInt64
+) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (namespace, name, valid_from);
+
+CREATE TABLE gw_versions (
+  namespace LowCardinality(String), name String,
+  valid_from DateTime64(3), valid_to DateTime64(3),
+  selector_kv Array(String),                    -- 排序 "k=v"
+  server_hosts Array(String),
+  ingest_seq UInt64,
+  INDEX idx_sel selector_kv TYPE bloom_filter GRANULARITY 1
+) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (namespace, name, valid_from);
+```
+
+**子集判斷 = `hasAll(set, subset)`（`set ⊇ subset` 回 1）。三跳：**
+
+```sql
+-- Hop 1：IP → ingress Service（as of T）→ ~1 列
+SELECT namespace AS ns, selector_kv AS svc_sel
+FROM svc_versions FINAL
+WHERE has(ingress_ips, {ip:String})
+  AND valid_from <= {t:DateTime64(3)} AND {t:DateTime64(3)} < valid_to;
+
+-- Hop 2：Service.selector → ingress Deployment pod labels L（as of T）→ ~1 列
+SELECT pod_labels_kv AS L
+FROM deploy_versions FINAL
+WHERE namespace = {ns:String}
+  AND hasAll(pod_labels_kv, {svc_sel:Array(String)})    -- svc.selector ⊆ pod labels
+  AND valid_from <= {t} AND {t} < valid_to;
+
+-- Hop 3：L → 候選 Gateway（as of T）
+SELECT namespace, name, server_hosts
+FROM gw_versions FINAL
+WHERE hasAll({L:Array(String)}, selector_kv)            -- Gateway.selector ⊆ L
+  AND valid_from <= {t} AND {t} < valid_to;
+```
+
+之後 `gwresolve(host, candidates)` 在 Go 做 most-specific host 消歧（或把 `server_hosts` 比對下推 Hop 3）。
+
+**單一 join 查詢（把 ClickHouse 固定 per-query overhead 只付一次）：**
+
+```sql
+WITH
+  svc AS (SELECT namespace ns, selector_kv svc_sel FROM svc_versions FINAL
+          WHERE has(ingress_ips,{ip}) AND valid_from<={t} AND {t}<valid_to),
+  dep AS (SELECT pod_labels_kv L FROM deploy_versions FINAL d INNER JOIN svc ON d.namespace=svc.ns
+          WHERE hasAll(d.pod_labels_kv, svc.svc_sel) AND d.valid_from<={t} AND {t}<d.valid_to)
+SELECT g.namespace, g.name, g.server_hosts
+FROM gw_versions FINAL g CROSS JOIN dep
+WHERE hasAll(dep.L, g.selector_kv) AND g.valid_from<={t} AND {t}<g.valid_to;
+```
+
+**效能（兩面誠實講）：**
+
+- **對 ClickHouse 而言資料極小**：ingress Service ~1–10、ingress Deployment ~1–10、Gateway ~數十–低百
+  （POC 壓到 600）× 每資源數版本 → 數千至最壞低百萬列。每跳只碰幾個 granule、`hasAll` 掃數百列，
+  **掃描本身是微秒級**。
+- **延遲下限是 ClickHouse 固定 per-query overhead（~1–5ms：規劃、thread、`FINAL` merge-on-read），非掃描**。
+  量級：單一 join 查詢 ≈ **1–5ms**；三次 round-trip ≈ **5–15ms**。對取證/低 QPS（Q1）完全夠。
+- **誠實 caveat**：ClickHouse 是大掃描 OLAP 引擎，這種小 keyed point-lookup 非其強項（無真正 PK point-get、
+  per-query 下限偏高）。它「可用，因為 config store 本來就在 ClickHouse、join 留在 store 內」，**非此形狀的最佳引擎**。
+  若日後變成**線上熱路徑（數百–千 QPS）**，下限 + `FINAL` 會咬人 → 退到 in-memory 索引或 ClickHouse
+  **dictionary**（真 O(1)）——即下節方案 2/3 的物化。
+
+**Fine-tune（依槓桿由大到小）：**
+
+1. **ingest 期就抽好並正規化 join 欄**（`selector_kv`/`pod_labels_kv`/`ingress_ips` 排序 `Array(String)`）——
+   最大槓桿，去掉查詢期 JSON parse、讓 skip-index 生效；排序也避免格式漂移害 `hasAll`。
+2. **`valid_to` sentinel**（interval 模型）給乾淨兩側 range。或無 mutation 的 **Model 2**：只存 `valid_from`，
+   查詢用 `... WHERE valid_from<=T ORDER BY valid_from DESC LIMIT 1 BY namespace,name`（或 `ASOF JOIN`）
+   還原 live-at-T，免維護 `valid_to`，代價是讀稍重。
+3. **ORDER BY = identity + `valid_from`**（同時是 ReplacingMergeTree dedup key），讓時間 range + namespace
+   等值走 sparse primary index；`bloom_filter` skip-index 放 `ingress_ips`（Hop1）、選配 `selector_kv`。
+   小資料時 skip-index 影響小，retention 長大後才顯著。
+4. **單一 join 查詢 + parameterized/prepared statement** 攤掉固定 per-query overhead 與規劃成本。
+5. **管好 `FINAL` 成本**：此規模可忽略；若浮現，改用 `argMax(col, ingest_seq)` + `GROUP BY identity,valid_from`
+   手動 dedup，或確保 parts 已合併；Model 2 直接免 `FINAL`。
+6. **`LowCardinality`** 放 `namespace`/`gvk`；**`PARTITION BY toYear(valid_from)`** 只在 retention 很長才用
+   （小資料過度分區反而害，parts 太多）。
+7. **變熱時的逃生口**：ClickHouse **dictionary**（key=IP）或 app in-memory 衍生索引，繞過 per-query 下限。
+
+**正確性註記**：Hop2 要 `svc.selector ⊆ pod_labels`、Hop3 要 `gateway.selector ⊆ pod_labels`，兩者都是
+**同一個 L** 的子集——這正是用 Deployment pod-template labels 當 L 為一致正確錨點的原因。若多個 ingress
+Deployment 命中（canary/blue-green），對 L 取 union 或逐 Deployment 評估。
+
 ### 三種索引落地方式（與 per-resource store 的關係）
 
-| 方案 | 做法 | 與 store 關係 |
-|------|------|----------------|
-| **1. Query-time 重算** | `AsOf(T)` 讀 Gateway + ingress Service → 記憶體建 map | 最貼 per-resource 設計；每次查詢或每時間切片重算 |
-| **2. In-process 預建（推薦起步）** | Consumer C 在 watch 事件時更新 RAM 中的 `IngressIndex` | store 仍為唯一持久真相；索引可丟棄、可重算 |
-| **3. 版本化 binding 記錄** | 另存 `IngressGatewayBinding{ip, gateway, valid_from, valid_to}` | 適合查詢服務獨立擴展、大量歷史區間查詢 |
+| 方案 | 做法 | 適用 |
+|------|------|------|
+| **1. Query-time 重算（本案推薦）** | `AsOf(T)` 三跳窄查詢（見上），selector 包含用 `hasAll` 下推 ClickHouse | 取證/低 QPS；store 維持純 per-resource、binding 即算即丟、時間一致 |
+| **2. In-memory 預建索引** | Consumer 在 watch 事件時更新 RAM 中 `IP→[]Gateway` | 只加速「當下時刻」線上查詢；對任意歷史 T 無用；store 仍唯一真相、可重算 |
+| **3. 版本化 binding 記錄** | 另存 `IngressGatewayBinding{ip, gateway, valid_from, valid_to}` | **打破 per-resource 設計**（衍生關係、需 temporal-join writer + 對帳）；僅在極大規模＋高 QPS＋要 binding 獨立查詢才升級 |
 
-**不要把 `IP → Gateway` 塞進 Prometheus label**（高基數關聯邊，重蹈 TSDB 不適合路由查詢的结论）。
+**不要把 `IP → Gateway` 塞進 Prometheus label**（高基數關聯邊，重蹈 TSDB 不適合路由查詢的結論）。
 
-POC 的 `gwresolve.New(gateways)` 已是「查詢端 in-memory 索引」先例；`IngressIndex` 同類，
-只是 key 從「全 Gateway host patterns」改為「先以 IP 縮候選」。
+POC 的 `gwresolve.New(gateways)` 已是「查詢端 in-memory 索引」先例；候選 Gateway 由上面三跳縮出後，
+`gwresolve(host, candidates)` 做最終 host 消歧。
 
 ---
 
@@ -187,8 +319,9 @@ POC 的 `gwresolve.New(gateways)` 已是「查詢端 in-memory 索引」先例�
 ## 待實作清單（參考）
 
 - [ ] OTEL collector：span 連線 IP 優先、DNS lookup processor + cache
-- [ ] `internal/ingressindex`：`Gateway.selector ⊆ Service.selector` 建 `IP → []Gateway`
+- [ ] ingest：版本化 ingress Deployment（pod-template labels 當 L 來源）+ ingress Service 的 IP 多欄位 union（`spec.externalIPs` ∪ `status.loadBalancer` ∪ 選配 NodePort+Node ExternalIP）
+- [ ] ClickHouse：ingest 期物化 `selector_kv` / `pod_labels_kv` / `ingress_ips`（排序 `Array(String)`）+ `bloom_filter` skip-index
+- [ ] query 端 IP→Gateway 三跳 `hasAll` 下推查詢（as-of-T）+ `gwresolve(host, candidates)`
 - [ ] `gwresolve`：支援 `ResolveAmong(host, candidates []string)`
-- [ ] history writer：ingress LB Service 的 status.loadBalancer 版本化
 - [ ] `simulate.Engine`：可切換 `config_only` / `traffic_simulation`
-- [ ] POC fixture：mock IngressIndex 對照 `scalegen` oracle
+- [ ] POC fixture：mock 三跳查詢結果對照 `scalegen` oracle
