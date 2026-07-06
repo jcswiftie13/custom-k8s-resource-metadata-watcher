@@ -1,6 +1,6 @@
 # Istio VirtualService 路由回溯查詢 — 儲存與架構建議
 
-> 狀態：設計討論紀錄（design note），尚未實作。彙整自一次架構討論，供後續實作與 review 參考。
+> 狀態：設計討論紀錄（design note）。**「引擎 2A」的解析切片已有可運作 POC（`poc/route2a`）**；其餘（版本化 temporal store、watch/ingest、時間回溯）尚未實作。POC 的落地細節與**與本設計的差異**見後述「[引擎 2A 的 POC 實作現況](#引擎-2a-的-poc-實作現況pocroute2a)」。彙整自一次架構討論，供後續實作與 review 參考。
 
 ## Context（為什麼要做這件事）
 
@@ -69,7 +69,7 @@ graph TD
     A[比對引擎選擇] --> B{忠實度 vs 輕量?}
     B -->|要最高忠實度<br/>免自寫維護 matcher| C[引擎2: Envoy router_check_tool]
     C --> D{RouteConfiguration 怎麼取得?}
-    D -->|接受離線重跑 istiod<br/>忠實度最高| E[2A: 離線 pilot-discovery 翻譯]
+    D -->|in-process link istiod<br/>ConfigGenerator 翻譯<br/>無外部執行檔| E[2A: in-process 翻譯<br/>本案選定]
     D -->|接受 per-proxy 基數大<br/>+ scrape 解析度有損| F[2B: 定期快照 proxy-config routes]
     B -->|要輕量,純 Go<br/>無外部執行檔<br/>可接受自行維護語意正確性風險| G[引擎1: 自寫 uri-match 子集<br/>+ 多 VS 合併]
 ```
@@ -103,7 +103,8 @@ graph TD
 擷取階段三個一定要處理的細節（前面討論釐清的）：
 
 - **初始 LIST 的 `valid_from`** 是「watcher 啟動時間」，非資源真正建立時間；要真實時間需讀 `metadata.creationTimestamp`。
-- **resync 去重**：informer 週期 resync 會重送 Update，必須用 `resourceVersion`/`generation`/spec hash 去重，否則會製造假版本。
+- **去重要用 spec-hash（不是只看 resourceVersion 變沒變）**：resourceVersion 是「**任何一次 etcd 寫入**都會變」，不只 spec。即使限縮在 VS/Gateway/Service，仍有**非 spec 的 bump 來源**：istiod 寫 VS/Gateway 的 reconciliation **status**（依 feature flag）、`type: LoadBalancer` Service 的 `status.loadBalancer`、server-side apply 的 `managedFields`、GitOps 改到 annotation。（真正 no-op 的 apply 算出無 diff 不會寫，故乾淨 re-apply 不 bump。）另外 informer 週期 **resync** 會重送 Update。因此判「是不是新的一版」要**比對 spec-hash（或 generation）**：resourceVersion 變了但 spec-hash 沒變 → 不開新版本，只是雜訊。
+- **版本身分用 resourceVersion（比 generation 抗撞）**：對同一資源，resourceVersion 底層是 etcd 全域 revision、**嚴格遞增、絕不重複**，且**刪除後重建不會重用**（重建拿更大的新值）——這正是它比 `generation` 好的地方：generation 刪除重建會歸 1 撞號，resourceVersion 不會。唯一的重複/倒退角落是 **etcd 從備份還原/遷移**（罕見維運事件）；要連這個都滴水不漏，record 再加 `metadata.uid`（順便乾淨區隔重建前後兩段生命）即可，非必需。
 - **跨 namespace 綁定**：VS 的 `spec.gateways` 可寫 `其他ns/gateway-name`，而 ingress 的 Gateway 常在 `istio-system`；watch scope 若只含 app namespace 會漏掉被引用的 Gateway，導致查詢時 host→Gateway 反查斷掉。
 
 ### 階段二：查詢（store → 三條消費路線）
@@ -119,8 +120,8 @@ graph TD
     S2 --> S3[找 hosts 命中 host<br/>且 gateways 含候選 Gateway 的 VS]
     S3 --> S4[VS 的 http 依序比對 first-match<br/>→ route.destination]
 
-    R -->|引擎2 - 2A 離線翻譯| T1[store.AsOf T<br/>取當時 VS+DR+Gateway+Service 快照]
-    T1 --> T2[離線跑 pilot-discovery<br/>翻譯出 RouteConfiguration]
+    R -->|引擎2 - 2A in-process 翻譯| T1[store.AsOf T<br/>取當時 VS+DR+Gateway+Service 快照]
+    T1 --> T2[in-process link istiod<br/>ConfigGenerator 翻出 RouteConfiguration]
     T2 --> U[router_check_tool<br/>比對 path → 命中 route/cluster]
 
     R -->|引擎2 - 2B 快照 RC| V1[[獨立 poll 管道<br/>非 watch]]
@@ -138,7 +139,7 @@ graph TD
 | 路線 | RouteConfiguration 來源 | 是否重用 watch+store | 時間精度 |
 |---|---|---|---|
 | **引擎1 自寫** | 不需要 RC，直接用 VS spec 自己比對 | ✅ 完全靠 watch+store | 事件級精確 |
-| **引擎2 / 2A** | store 取當時 spec 快照 → 離線 istiod 翻譯 | ✅ 靠 watch+store（多一步翻譯） | 事件級精確 |
+| **引擎2 / 2A** | store 取當時 spec 快照 → in-process istiod ConfigGenerator 翻譯 | ✅ 靠 watch+store（多一步翻譯） | 事件級精確 |
 | **引擎2 / 2B** | 直接 poll 實體 gateway 的 Envoy config | ❌ 繞過 watch，另一條 poll 管道 | scrape 解析度有損、per-proxy |
 
 > 收斂：**watch+store（階段一）直接餵「引擎1」與「2A」；只有「2B」是獨立的 config poll 管道**。三條路線最後都匯到同一步 destination 解析（`destination.host` → Service+ns+port+subset），差別只在「怎麼從 path 命中 route」與「RC 從哪來」。
@@ -163,6 +164,22 @@ graph TD
   這是 append-only 的 bitemporal log；`valid_to` 在下一版本到來或刪除時補上。
 - **要 watch 的 GVR**：`VirtualService`、`Gateway`（ingress 視角由 host 反查、必需）、`DestinationRule`（subset→labels）、`Service`（host→svc+port）、`EndpointSlice`（subset→實際 endpoint，選配）；`Sidecar`（僅 sidecar 視角未來才需要）。
 
+#### 資源分層：哪些進版本化 store、哪些留 TSDB
+
+判準是**「查詢時要不要逐一看該資源的 spec 內容」**（有內容比對/順序 → 版本化 store；只是身分/selector 查找、低基數扁平 → 留既有 TSDB 匯出即可）。
+
+| 資源 | 放哪 | 為什麼 |
+|---|---|---|
+| **VirtualService** | 版本化 store（全 spec） | 逐條看 `http[]`、**有順序**（first-match）、要 path 比對 |
+| **Gateway** | 版本化 store（全 spec） | 看 `servers.hosts`（含萬用）+ `selector` + `port`；**非順序**，是內容比對（host 綁定/vantage） |
+| **DestinationRule** | 版本化 store（全 spec，**條件式**） | subset→pod label 只存在 DR；要解析到 subset/pod 才需要，純 Service 導流可略 |
+| **Service** | **可留 TSDB 模式** | 不在關鍵路徑（見下）；只做 named-port / selector 查找，低基數扁平、少變 |
+| **EndpointSlice / pod** | 當下 / best-effort | endpoint 層、高易變，歷史精確本就困難 |
+
+**為什麼 Service 不在關鍵路徑**：「host+path → Service+ns+port」這個答案**光靠 VirtualService 就出來**——`route.destination.host` 就是 Service FQDN、`destination.port.number` 就是 port。Service / EndpointSlice 只在要**再往下走到 pod**（或解析 named port、驗證 Service 存在）時才用到；那是身分/selector 查找、無順序。
+
+> ⚠️ **時間精度接縫**：VS/GW/DR 走事件級精確 store、Service 走 scrape 解析度 TSDB，代表 join「時刻 T 的 Service」時混了兩種時間精度。因 Service 的 spec 很穩定（port rename 罕見），此接縫實務上可接受，但心裡要有數；若要求 Service 也事件級精確，就把它一起放進版本化 store。
+
 #### 儲存選型：三個候選（store interface 抽象，可換）
 
 writer 與 query 都只依賴一個 `Store` interface（`Put(version, validFrom, spec)` / `SetValidTo` / `AsOf(gvk,ns,name,T)` / `Overlap(gvk,ns,name,t0,t1)`），底層三選一：
@@ -180,9 +197,15 @@ writer 與 query 都只依賴一個 `Store` interface（`Put(version, validFrom,
 - **為什麼「要注意原子性」**：Mongo **單一文件**寫入才原子，但「收舊 doc + 插新 doc」跨**兩個文件**，預設非單一原子操作——兩次寫入間有小視窗，讀者可能看到「舊 doc 還開放 + 新 doc 也開放」的重疊（此即選項 1 用交易關掉的那道「縫」）。Mongo 4.0+ 有多文件交易可消除它，但屬**顯式 opt-in**（需 replica set、有成本），非單文件那套最自然用法；且無 range 型別/exclusion constraint，沒有 schema 層防重疊護欄。
 
 **選項 3：TSDB + NoSQL hybrid（重用現有 exporter）**
-- 執行方式：TSDB 存**低基數版本索引指標** `vs_version{namespace,name,generation}=1`（用 `generation` 不用 resourceVersion）；NoSQL（DynamoDB / Mongo / 物件儲存）以 key `(ns,name,generation)` 存**完整 spec**。query：先對 TSDB 在 `[t0,t1]` 查出現過的 generation 集合（`last_over_time`/staleness 還原存在區間），再用 generation 去 NoSQL 撈規則。
+- 執行方式：TSDB 存**低基數版本索引指標** `vs_version{namespace,name,uid,generation}=1`；NoSQL（DynamoDB / Mongo / 物件儲存）以**同一把 join key `(uid, generation)`** 存**完整 spec**。query：先對 TSDB 在 `[t0,t1]` 查出現過的 `(uid,generation)` 集合（`last_over_time`/staleness 還原存在區間），再用**同一把 key** 去 NoSQL 撈規則。
 - 優點：**直接重用現有 scrape-time exporter** 產生版本指標；版本時間軸可在 Grafana 與流量/延遲指標**對齊**；NoSQL 端只是 immutable KV，極單純。
 - 缺點：valid-time **受限於 scrape interval**（見下節，兩 scrape 間的短命版本會漏）；**兩套系統一致性**（TSDB 有但 NoSQL 無 / 反之）需對帳；從 presence 指標還原區間的 PromQL 較 fiddly。
+- **關鍵約束：TSDB label 必須 == NoSQL join key**（TSDB 只告訴你「哪幾版存在過」，要用同一把 key 回 NoSQL 撈 spec）。所以不能一邊 generation、一邊 resourceVersion——**對不起來**。挑 join key 有兩個要求：**低 churn**（否則 series 爆炸）+ **抗撞**（跨刪除重建不撞）。
+  - `resourceVersion` **不能當 label**：每次 etcd 寫入（含 status/managedFields 等非 spec 寫入）都變 → 基數爆炸。它抗撞，但 churn 太兇，不適合 join key。
+  - `generation` 單獨也不行：低 churn（只 spec 改才 +1），但**刪除重建歸 1 會撞號**。
+  - **正解：join key = `(uid, generation)`，兩邊都用**。`uid` 補掉 generation 的重建撞號、且**低 churn**（uid 只在重建變、generation 只在 spec 變，都不受 status/managedFields 影響）→ 同時滿足低 churn + 抗撞，又能 TSDB↔NoSQL 對得起來。
+  - `resourceVersion` 則存進 NoSQL doc **當 provenance**（精確溯源用），**不參與 join**。
+  - 註：選項 1/2 是事件驅動、writer 自控身分、沒有「label==key」約束，那裡用 `resourceVersion + spec-hash`（見「資料流」去重段）才是最抗撞的做法；此 `(uid, generation)` 的取捨是**選項 3 特有**，因為 label 由 scrape-time exporter 產生、被迫要低 churn。
 
 > 三者都滿足「回傳每個版本 + 完整解析」；差別在 valid-time 精度（選項 3 有損）與運維面（選項 3 重用既有、但多一套一致性負擔）。
 
@@ -283,17 +306,21 @@ history:                       # 新增
 
 不自己寫 matcher，改用 **Envoy `router_check_tool`**（離線二進位，吃 `RouteConfiguration` + 一組 path 測試，回命中的 route/cluster；**不需跑 Envoy、無流量**）。取得 RouteConfiguration 兩種子路線：
 
-- **2A：離線跑 istiod 翻譯** — 對某時刻的 VS+DR+Gateway+Sidecar+Service 快照，用 `pilot-discovery`（file/fake registry 模式）拉出指定 synthetic proxy（對應視角）的 xDS RC。忠實度最高；最好用**當時的 istiod 版本**。代價：離線重建翻譯環境，重。
+- **2A（本案選定）：in-process link istiod 的 ConfigGenerator 翻譯** — 對某時刻的 VS+DR+Gateway+Sidecar+Service 快照，在**同一個 Go process 內**直接呼叫 istiod 的 `ConfigGenerator`（`pilot/pkg/networking/core`），對指定 synthetic proxy（對應視角）build 出 xDS RC。**不起外部進程、不開網路連線**。詳細作法見下節「引擎 2A 詳解」。代價：直接 link istiod internal package，依賴重、跟 istiod 版本強耦合。
 - **2B：直接快照 RouteConfiguration** — 不（只）存 VS，改定期 `istioctl proxy-config routes <gateway/pod> -o json` 把**每個 proxy 的 RC** 存進 store（per-proxy = 天然帶視角）。query 時只跑 `router_check_tool`。代價：RC per-proxy 基數大、且 dump 是 **scrape 解析度有損**。
 
-- 優：等於線上 Envoy 行為，免自寫/維護 matcher。**命中結果是 Envoy cluster 名（格式 `outbound|PORT|SUBSET|SERVICE.NS.svc.cluster.local`），已編碼 Service+ns+port+subset → 步驟 4 destination 解析幾乎免費**。缺：2A 重（重跑 istiod）、2B 大且有損（per-proxy + scrape）。
+> **已否決：2A-重（外部 `pilot-discovery` file/fake registry 模式 + ADS gRPC）**。原本並列一條「把 `pilot-discovery` 當外部二進位跑、以 synthetic proxy 身分開 ADS 串流收 LDS/RDS」的重量級子路線；因為要離線重建整個翻譯環境（起 process、管 gRPC 生命週期、對每次查詢重跑），營運與延遲成本明顯高於 in-process link，且忠實度與 2A-輕**相同**（同一份 ConfigGenerator 邏輯），故移除，確定走 in-process。
+
+- 優：等於線上 Envoy 行為，免自寫/維護 matcher。**命中結果是 Envoy cluster 名（格式 `outbound|PORT|SUBSET|SERVICE.NS.svc.cluster.local`），已編碼 Service+ns+port+subset → 步驟 4 destination 解析幾乎免費**。缺：2A 直接 link istiod internal package、跟 istiod 版本強耦合；2B 大且有損（per-proxy + scrape）。
 
 > 取捨：要最高忠實度走引擎 2；要輕量走引擎 1。兩者共用步驟 1/4/5（store 查詢與 destination 解析），只差「step 2/3 怎麼比對」。
 > `istioctl x describe` / `proxy-config routes` 是 CLI、只反映當下，僅適合 live 驗證或引擎 2B 的 dump 來源，不適合直接當歷史查詢 API。
 
 #### 引擎 2A 詳解：VS+Gateway+DR+Service → RouteConfiguration → `router_check_tool` → Service
 
-上面把 2A 濃縮成一句「離線跑 istiod 翻譯」。這裡展開成可執行細節，分兩段：(1) 怎麼翻出 `RouteConfiguration`；(2) 怎麼對 `host+path` 跑 `router_check_tool` 拿到目標 Service。先給名詞解釋。
+上面把 2A 濃縮成一句「in-process link istiod ConfigGenerator 翻譯」。這裡展開成可執行細節，分兩段：(1) 怎麼翻出 `RouteConfiguration`；(2) 怎麼對 `host+path` 跑 `router_check_tool` 拿到目標 Service。先給名詞解釋。
+
+> ⚠️ 本節為**原始設計方案**。實際 POC（`poc/route2a`）在幾個地方做了不同的落地選擇（不用 `FakeDiscoveryServer`、略過 `BuildListeners` 兩跳、`router_check_tool` 需 sentinel 技巧等）——差異逐項見「[引擎 2A 的 POC 實作現況](#引擎-2a-的-poc-實作現況pocroute2a)」。
 
 **名詞解釋（xDS 家族與相關元件）**
 
@@ -311,23 +338,54 @@ history:                       # 新增
 | **pilot-discovery** | istiod 主二進位 | 平常連 kube-apiserver；也支援 **file/fake registry 模式**（吃檔案而非真 cluster），可離線翻譯。 |
 | **router_check_tool** | Envoy 附的離線測試二進位 | 載入一份 RouteConfiguration，用 **Envoy 真正的 route matching 碼**對測試案例比對，回命中的 route/cluster；**不跑 Envoy、無流量、無 istiod**。 |
 
-**步驟一：翻出 RouteConfiguration**（前提：`VS→RouteConfiguration` 是 istiod ConfigGenerator 做的，自己翻不了；要忠實只能借它。兩條子路線）
+**步驟一：翻出 RouteConfiguration（in-process，本案唯一路線）**
 
-- **2A-重：跑 `pilot-discovery`（file/fake registry 模式）**
-  1. `store.AsOf(T)` 取時刻 T 的 `VS + Gateway + DR + Service`（必要時 `ServiceEntry`/`Sidecar`）快照，輸出 YAML。
-  2. 以 file/fake registry 模式啟動 `pilot-discovery`，config source 指向那批 YAML（不連真 cluster）。
-  3. 建 **synthetic proxy**（`Type=Router`、對應 namespace、labels 對得上 Gateway 的 selector），跟它開一條 **ADS**。
-  4. 從 ADS 收該 proxy 的 **LDS**（listeners）與 **RDS**（RouteConfiguration）→ 取出 RC。
-  5. **版本對齊**：翻譯邏輯跨 Istio 版本會變，最好用「時刻 T 當時線上的 istiod 版本」翻。
-  - 特性：忠實度最高；代價是離線重建翻譯環境（重）。
-- **2A-輕：在 process 內 link istiod 的 Go package**（Istio 單元測試的做法，參考 `pilot/pkg/xds` 的 fake discovery server）
-  1. 同樣先 `store.AsOf(T)` 取快照。
-  2. 灌進 config store（VS/Gateway/DR）＋ service registry（Service）→ 建 **PushContext**。
-  3. 建 **synthetic proxy**（`model.Proxy`）。
-  4. 呼叫 **ConfigGenerator**（`pilot/pkg/networking/core`）build 出 listeners，取其中的 **RouteConfiguration**。
-  - 特性：不起外部進程；代價是這些是 **internal package、依賴重、跟 istiod 版本強耦合**。
+前提：`VS→RouteConfiguration` 是 istiod ConfigGenerator 做的，自己翻不了；要忠實只能借它。作法是**在查詢程式的同一個 Go process 內，直接 link istiod 的 Go package** 呼叫 `ConfigGenerator`——不起外部進程、不開網路連線、不跑 ADS gRPC。這是 Istio 單元測試自己在用的路徑（參考 `pilot/pkg/xds` 的 `FakeDiscoveryServer`）。
 
 要備齊的 component：**config store 快照**（VS+Gateway+**DR**+Service）、**service registry / PushContext**（istiod 要知道有哪些 Service 才能建 cluster）、**ConfigGenerator**、**synthetic proxy**。
+
+**主要用到的 package**
+
+| package | 用途 |
+|---|---|
+| `istio.io/istio/pkg/config` + `.../config/schema/collections` | 把 store 撈回的 spec 包成 istiod 認得的 `config.Config` |
+| `istio.io/istio/pilot/pkg/model` | `Proxy`、`PushContext`、`Environment`、`IstioConfigStore` 等核心型別 |
+| `istio.io/istio/pilot/pkg/networking/core` | `ConfigGenerator`——`VS→RouteConfiguration` 翻譯就在這 |
+| `istio.io/istio/pilot/pkg/xds`（選配） | `FakeDiscoveryServer` 測試工具，把下面 4 步全包好，直接 `s.Routes(proxy)` 拿 RC |
+
+**細步驟**
+
+1. **取快照並轉成 istiod config。** `store.AsOf(T)` 取時刻 T 的 `VS + Gateway + DR`（＋條件式 `Sidecar`/`ServiceEntry`）以及 `Service` 快照。把 VS/Gateway/DR 每筆 spec 轉成 `config.Config`（帶對的 `GroupVersionKind`、`Namespace`、`Name`、`CreationTimestamp`）；`Service` 轉成 istiod 的 `*model.Service`（或灌進 fake kube client 讓內建 registry 讀）。
+
+2. **建 config store 與 service registry。** 用 in-memory config store（`memory.Make(collections.Pilot)` → `crdclient`/`model.MakeIstioStore` 之類）把上一步的 configs 灌進去；service registry 用 memory registry 或 fake kube registry 提供 `Service`。兩者組成一個 `model.Environment`（`env.ConfigStore = ...`、`env.ServiceDiscovery = ...`）。
+
+3. **建 PushContext。** `pc := model.NewPushContext(); pc.InitContext(env, nil, nil)`。`InitContext` 會把 VS/Gateway/DR 依 namespace 與 gateway 綁定索引好、把 Service 整理成 cluster 候選——這是翻譯的輸入上下文（`env.PushContext = pc`）。
+
+4. **建 synthetic proxy 並綁定視角。** 對應 ingress gateway 視角：
+   ```go
+   proxy := &model.Proxy{
+       Type:            model.Router,                 // ingress gateway = Router
+       ConfigNamespace: candidateGateway.Namespace,   // 候選 Gateway 所在 ns
+       Metadata: &model.NodeMetadata{
+           Labels: candidateGateway.Spec.Selector,     // 要對得上 Gateway 的 selector
+       },
+       IstioVersion: parsedIstioVersion,
+   }
+   proxy.SetGatewaysForProxy(pc)   // 依 selector 把該 proxy 綁到候選 Gateway
+   proxy.SetSidecarScope(pc)       // 收斂該 proxy 可見的 VS/DR
+   ```
+   這兩個 `Set...` 呼叫就是「視角收斂」在 istiod 內的實作——等於前面「視角」小節手動做的 host→Gateway→VS 收斂，但用的是 istiod 原碼，語意保證一致。
+
+5. **呼叫 ConfigGenerator 翻出 RC。** RouteConfiguration 通常是被 Listener 用 **RDS 名字**引用、非 inline，所以是兩跳：
+   ```go
+   cg := core.NewConfigGenerator(nil)            // cache 可傳 nil
+   listeners := cg.BuildListeners(proxy, pc)     // 先 build LDS
+   routeNames := extractRDSNames(listeners)      // 從 HCM 的 Rds.RouteConfigName 收集名字
+   routes, _ := cg.BuildHTTPRoutes(proxy, pc, routeNames)  // 再 build 出 []*route.RouteConfiguration
+   ```
+   `routes` 就是要餵給 `router_check_tool` 的 RC。若用 `FakeDiscoveryServer`，上面 2–5 步等同一行 `routes := s.Routes(proxy)`。
+
+6. **版本對齊（強耦合，必須管）。** 翻譯邏輯跨 Istio 版本會變。因為是 link Go package，**query binary 相依的 `istio.io/istio` 版本就決定了翻譯行為**——要忠實還原時刻 T 的結果，query binary 的 istiod 版本應**釘到當時線上叢集的 istiod 版本**；叢集升級 istiod → query binary 要重新 vendor 對應版本並重建。這是 in-process 路線最主要的維運成本（換走 2A-重也躲不掉，因為忠實度本來就綁在 istiod 版本上）。
 
 > DR 為條件式必要：DestinationRule 只有在 route 引用 `subset` 時才必要——subset→pod label 的對應**只存在於 DR**；純 Service 導流（route 不帶 subset）可以沒有 DR。但查詢前不知哪條 route 用 subset，故仍照樣 watch/存 DR、翻譯時一併餵入。
 
@@ -353,11 +411,43 @@ history:                       # 新增
 ```
 1. store.AsOf(T) 取當時 VS + Gateway + DR + Service 快照
 2. 灌進 config store + service registry;合成對應 ingress gateway 視角的 synthetic proxy
-3. ConfigGenerator（2A-重 pilot-discovery / 2A-輕 in-process link）翻出該 proxy 的 RouteConfiguration（經 LDS/RDS）
+3. in-process link istiod ConfigGenerator 翻出該 proxy 的 RouteConfiguration（BuildListeners → 收 RDS 名字 → BuildHTTPRoutes）
 4. RouteConfiguration + 測試案例(:authority=host, :path=path) → router_check_tool
 5. 得 cluster 名 → 解析出 Service + ns + port + subset
 6.（選配）對 EndpointSlice 快照解到實際 endpoint
 ```
+
+### 引擎 2A 的 POC 實作現況（`poc/route2a`）
+
+> 狀態：**引擎 2A 的解析切片已有可運作 POC**（`poc/route2a`，獨立 Go module）。它落地了「VS+Gateway+Service → RouteConfiguration → `router_check_tool` → cluster(Service)」這條路徑與 host→Gateway 視角收斂，並附一個 600 gateway × 100 VS 的壓力/正確性測試。**尚未**實作 A（版本化 temporal store）、watch/ingest、時間回溯——POC 直接吃記憶體內、per-gateway 的 scoped 設定，不接 store。
+
+**POC 元件對照本設計：**
+
+| `poc/route2a` 元件 | 對應本文件概念 |
+|---|---|
+| `internal/gwresolve`（`Resolver.Resolve`） | 「視角」小節的 host→Gateway 反查，most-specific wildcard 消歧 |
+| `internal/translate`（`Translator.Translate`） | 引擎 2A 步驟一：in-process ConfigGenerator 翻 `RouteConfiguration` |
+| `internal/matchcheck`（`Runner.Resolve`） | 引擎 2A 步驟二：`router_check_tool` 比對 → cluster |
+| `internal/simulate`（`Engine.ResolveAll`） | 串起步驟 1→4 的解析引擎（對應「### B. 查詢／路由解析引擎」） |
+| `internal/rccache` | 每 gateway 的 `RouteConfiguration` 快取（見下方差異 3） |
+| `internal/scalegen` | 測試語料 + by-construction oracle（測試鷹架，非架構本體） |
+| `internal/report` | 延遲/吞吐量測 |
+
+**與本設計原文的重要差異（實作時的修正）：**
+
+1. **不使用 `FakeDiscoveryServer`（避免 goroutine leak）。** 原文步驟一/五建議用 `FakeDiscoveryServer` 一行 `s.Routes(proxy)` 包掉環境建置；但它（及 `core.NewConfigGenTest`）會把 stop channel 綁到測試生命週期並**啟兩條長駐 goroutine**，在「每次查詢翻一次」的迴圈裡會累積成 goroutine/記憶體洩漏。POC 改為**手工靜態組出最小 `model.Environment`**（memory config store + memory service registry，`buildScopedEnv`），翻完即丟、無 goroutine、可並發重用同一個 `Translator`。（`RoutesForScoped` 這個 `FakeDiscoveryServer` 風格的 helper 仍保留，但**只當測試 oracle** 用來反證 `Translator.Translate` 正確，非生產路徑。）
+
+2. **翻譯只呼叫一次 `BuildHTTPRoutes`、用固定 route config 名 `http.80`，略過 `BuildListeners`→抽 RDS 名的兩跳。** 原文步驟五示範 `BuildListeners → extractRDSNames → BuildHTTPRoutes`；POC 針對「HTTP :80 ingress gateway」這個固定情境，直接 `configGen.BuildHTTPRoutes(proxy, &model.PushRequest{Push: pc}, []string{"http.80"})`（`http.80` 是 istiod 對 HTTP:80 gateway RC 的固定命名）。若未來要支援多 port / HTTPS / 任意 listener，才需回到 LDS→RDS 動態收名。
+
+3. **多一層 per-gateway `RouteConfiguration` 快取（`rccache`）。** 原文步驟一每次查詢都重翻；POC 以 gateway 為 key 快取翻好的 RC，並用「相依 epoch」判失效（Gateway/VS/Service 沒變就重用）。量級：翻譯 ~2ms、`router_check_tool` 一次啟動 ~200ms（docker），所以快取主要省的是**重複翻譯的 CPU**，對單次延遲影響小；它對應本設計未來長駐服務的穩態場景。
+
+4. **`router_check_tool` 是「驗證器」，POC 用 sentinel 技巧把它當「解析器」。** 原文把 `router_check_tool` 說成「回命中的 route/cluster」；實際上它的原生模式是**驗證**——你給一個 expected cluster，它只回 pass/fail。POC 對每筆查詢塞一個**永不匹配的 sentinel** 當 expected，逼 `--details` 印出 `actual: [<真正的 cluster>]`（miss 印 `actual: []`）再解析出來，等於把 validator 轉成 resolver（`Runner.Resolve`）。另兩個必要細節：(a) 一律加 `--disable-deprecation-check`，因 istiod 翻出的 RC 帶棄用欄位（如 `RouteAction.max_grpc_timeout`）新版 Envoy 會拒載；(b) 測試案例 `:method` 為必填（≥3 字元），POC 固定填 `GET`。
+
+5. **執行方式：native binary 優先、docker fallback。** POC 先找本機 `router_check_tool`（`POC_ROUTERCHECK_BIN` 或 PATH），沒有才用 docker 跑預建 tools image（`envoyproxy/envoy:tools-*`）。**只有 native 的延遲數字有意義**；docker 每批要付 ~200ms container 啟動、會主導計時（正確性兩者一致）。（此亦意味著原文的「離線二進位」在營運上要嘛備妥 native binary，要嘛接受 docker 啟動成本。）
+
+6. **批次化：一個 gateway 一次 `router_check_tool`。** 該工具吃「一份 RC + 一批測試案例」，所以 `Engine.ResolveAll` 把多筆查詢**按 gateway 分組**，每 gateway 翻一次 RC、跑一次工具涵蓋該 gateway 全部查詢。單筆查詢（線上最差情境）＝ batch=1 + cold cache，延遲 ~200ms（docker）由工具啟動主導——這也是為什麼延遲基本上與翻譯無關、由 `router_check_tool` 的 process/container 啟動決定。
+
+> destination 解析如原文步驟四：直接切 cluster 名 `outbound|PORT|SUBSET|SERVICE.NS.svc.cluster.local`。POC **尚未**做 DestinationRule subset 套用與 EndpointSlice 那層（route 目前不帶 subset），未來要補時照原文步驟 4/6 加即可。
 
 ### C.（選配）保留 Prometheus 匯出
 
@@ -373,10 +463,12 @@ history:                       # 新增
 | `pkg/config/config.go` (`WatchResource`) | 加入 Istio GVR（virtualservices/destinationrules，視角需要再加 gateways/sidecars）+ Service/EndpointSlice |
 | `pkg/store/`（新增） | `Store` interface + 三實作（postgres / mongo / hybrid），`Put` / `SetValidTo` / `AsOf(T)` / `Overlap(t0,t1)` |
 | `pkg/resolve/`（新增） | 視角收斂（gateway/sidecar）、destination→Service/ns/port 解析、subset 套用；**比對引擎可插拔**：`engine=self`（自寫 uri-match + 多 VS 合併）或 `engine=envoy`（router_check_tool） |
-| `pkg/resolve/envoy/`（選配，引擎 2） | 取得 RouteConfiguration（2A: 離線 pilot-discovery 翻譯 / 2B: 快照 proxy-config routes）+ 呼叫 `router_check_tool` |
+| `pkg/resolve/envoy/`（選配，引擎 2） | 取得 RouteConfiguration（2A: in-process link istiod ConfigGenerator 翻譯 / 2B: 快照 proxy-config routes）+ 呼叫 `router_check_tool` |
 | `cmd/query/`（新增）或 CLI/HTTP | 接收 host/path/區間，呼叫 store + resolve，輸出 per-version 結果 |
 
 > 註：現行 `cmd/main.go` 是 scrape-time exporter；本案新增的是「ingest writer」+「query/resolve」兩個獨立路徑，與既有 exporter 解耦。
+>
+> 註：`pkg/resolve/envoy/`（引擎 2A）已有獨立 POC 原型 `poc/route2a`（見「[引擎 2A 的 POC 實作現況](#引擎-2a-的-poc-實作現況pocroute2a)」）。移植回主 repo 時，`Translator`（in-process 翻譯，無 goroutine leak）與 `Runner.Resolve`（`router_check_tool` sentinel 解析）可直接沿用；需補的是接上版本化 store 的 `AsOf(T)`（POC 目前吃記憶體內 scoped 設定）與 DestinationRule/EndpointSlice 解析層。
 
 ---
 
@@ -416,7 +508,7 @@ history:                       # 新增
 拆三塊：typed struct ✅（`istio.io/api`）；**多 VS 合併**⚠️ 在 istiod internal（`pilot/pkg/model`，依賴重、版本會變）；**給定 path→哪條 route** ❌ 控制面沒有——istiod 只把 match**翻譯**成 Envoy RouteConfiguration，實際比對是 Envoy runtime。故 matching 要嘛自寫、要嘛借 Envoy。（見「比對引擎」）
 
 **Q5. 能否啟動一個 Envoy 餵全部 VS、給 path 得結果？**
-不能直接餵——Envoy 不認識 VS，VS→RouteConfiguration 是 istiod 翻譯的。可行的等價做法：取得 RouteConfiguration（**2A** 離線跑 istiod 翻譯 / **2B** 快照 `proxy-config routes`）後，用 **Envoy `router_check_tool`**（離線、無流量）比對。且比對是**逐 proxy/逐視角**，須固定視角。（見「引擎 2」）
+不能直接餵——Envoy 不認識 VS，VS→RouteConfiguration 是 istiod 翻譯的。可行的等價做法：取得 RouteConfiguration（**2A** in-process link istiod ConfigGenerator 翻譯 / **2B** 快照 `proxy-config routes`）後，用 **Envoy `router_check_tool`**（離線、無流量）比對。且比對是**逐 proxy/逐視角**，須固定視角。（見「引擎 2」）
 
 **Q6. ingress gateway 視角 vs sidecar 視角差在哪？我只要 ingress。**
 Ingress = 邊緣獨立 Envoy 處理外部進來（north-south），套用 `spec.gateways` 含該 Gateway 的 VS；Sidecar = 注入 app pod 旁處理 mesh 內呼叫（east-west），套用 `gateways: [mesh]` 且受 `exportTo`/`Sidecar` 可見性限制。同一 host+path 兩視角可能不同結果。**本需求只做 ingress**，sidecar 降為未來選配。（見「視角」）
