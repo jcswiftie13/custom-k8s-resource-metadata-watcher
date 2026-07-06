@@ -521,3 +521,6 @@ gateway **不用猜、由 host 反查 `Gateway.servers[].hosts` 推導**（確�
 
 **Q9. 為何掃 Gateway 也掃 VS，不是掃 VS 就好？**
 route→destination 規則全在 VS；但 VS 只「引用」Gateway 名字，不知該 Gateway 是否真收這個 host、萬用 host 比對、多 gateway、綁哪顆實體 ingress——這些只在 Gateway。故 **VS 給規則、Gateway 給入口與綁定條件**。乖乖牌叢集只用 VS 也能拿 destination；Gateway 掃描是正確性/消歧層。（見「視角」）
+
+**Q10. OTEL span + DNS / LB IP 怎麼接到 Gateway 解析？預建索引會不會和 per-resource store 衝突？**
+見補充設計 [`ingress-traffic-gateway-resolution.md`](ingress-traffic-gateway-resolution.md)。摘要：**traffic_simulation** 在 host 反查前用 span 的 `dst_ip`（優先於即時 DNS）經 `IngressIndex` 縮 Gateway 候選，仍須候選內 `gwresolve` host match；索引是 informer 的衍生 consumer（或 query-time 重算），**不取代** per-resource 版本化 store 或 TSDB exporter。
