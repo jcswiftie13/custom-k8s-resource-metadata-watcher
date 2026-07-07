@@ -1,0 +1,275 @@
+// Command ipflow drives the ingress-traffic slice of the PoC end to end against
+// ClickHouse:
+//
+//	-mode=load    generate the multi-version corpus (program-generated, never
+//	              hand-written SQL) and stream it into ClickHouse.
+//	-mode=query   given a request host+path (+ optional dst IP), resolve the
+//	              gateway via the ClickHouse 3-hop (IP -> Gateway), then run the
+//	              existing gwresolve -> translate(from ClickHouse) -> router_check_tool
+//	              pipeline to the destination cluster.
+//	-mode=verify  sample the 3-hop against the by-construction oracle and check
+//	              multi-version AsOf(T) selection (no router_check_tool needed).
+//
+// The IP stands in for "host + path + DNS lookup landing IP"; when -ip is omitted
+// it is derived from -host by the same deterministic scheme (simulating the
+// collector-side DNS lookup). Real deployments get the IP from the OTEL span.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/example/metadata-exporter/poc/route2a/internal/chstore"
+	"github.com/example/metadata-exporter/poc/route2a/internal/gwresolve"
+	"github.com/example/metadata-exporter/poc/route2a/internal/ingload"
+	"github.com/example/metadata-exporter/poc/route2a/internal/matchcheck"
+	"github.com/example/metadata-exporter/poc/route2a/internal/rccache"
+	"github.com/example/metadata-exporter/poc/route2a/internal/scalegen"
+	"github.com/example/metadata-exporter/poc/route2a/internal/simulate"
+	"github.com/example/metadata-exporter/poc/route2a/internal/translate"
+)
+
+func main() {
+	log.SetFlags(0)
+	var (
+		addr = flag.String("ch", envStr("POC_CH_ADDR", "127.0.0.1:9000"), "ClickHouse native address host:port")
+		mode = flag.String("mode", "query", "load | query | verify")
+		ip   = flag.String("ip", "", "destination IP (post-DNS); empty => derive from -host")
+		host = flag.String("host", "svc00.gw000.example.com", "request :authority host")
+		path = flag.String("path", "/healthz", "request :path")
+	)
+	flag.Parse()
+
+	ctx := context.Background()
+	store, err := chstore.Open(ctx, *addr)
+	if err != nil {
+		log.Fatalf("open clickhouse: %v", err)
+	}
+	defer store.Close()
+
+	gen := scalegen.New(scalegen.Config{NumGateways: envInt("POC_GATEWAYS", 600), VSPerGW: envInt("POC_VS", 100)})
+
+	switch *mode {
+	case "load":
+		if err := load(ctx, store, gen); err != nil {
+			log.Fatalf("load: %v", err)
+		}
+	case "query":
+		if err := query(ctx, store, gen, *ip, *host, *path); err != nil {
+			log.Fatalf("query: %v", err)
+		}
+	case "verify":
+		if err := verify(ctx, store, gen); err != nil {
+			log.Fatalf("verify: %v", err)
+		}
+	default:
+		log.Fatalf("unknown -mode %q (load|query|verify)", *mode)
+	}
+}
+
+// envVersions reads the per-resource-type version counts (bitemporal depth).
+func envVersions() ingload.Versions {
+	return ingload.Versions{
+		Deploy: envInt("POC_VER_DEPLOY", 2),
+		Svc:    envInt("POC_VER_SVC", 2),
+		Gw:     envInt("POC_VER_GW", 2),
+		VS:     envInt("POC_VER_VS", 10),
+		KSvc:   envInt("POC_VER_KSVC", 100),
+	}
+}
+
+// load generates the corpus and streams it into ClickHouse as multi-version rows.
+func load(ctx context.Context, store *chstore.Store, gen *scalegen.Gen) error {
+	start := time.Now()
+	prog := func(done, total int) {
+		if done%100 == 0 || done == total {
+			log.Printf("  loaded %d/%d gateways...", done, total)
+		}
+	}
+	if err := ingload.Load(ctx, store, gen, envVersions(), prog); err != nil {
+		return err
+	}
+	log.Printf("load done in %s. row counts:", time.Since(start).Round(time.Millisecond))
+	for _, tbl := range []string{"service_versions", "deploy_versions", "gw_versions", "vs_versions"} {
+		cnt, err := store.CountRows(ctx, tbl)
+		if err != nil {
+			return err
+		}
+		log.Printf("  %-18s %d", tbl, cnt)
+	}
+	return nil
+}
+
+// query runs the full ingress-traffic pipeline for one request.
+func query(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, ip, host, path string) error {
+	t := time.Now().UTC()
+	if ip == "" {
+		got, ok := gen.IPForHost(host)
+		if !ok {
+			return fmt.Errorf("cannot derive IP from host %q (pass -ip)", host)
+		}
+		ip = got
+		log.Printf("DNS lookup (simulated): %s -> %s", host, ip)
+	}
+	log.Printf("request: host=%s path=%s dst_ip=%s  @T=%s", host, path, ip, t.Format(time.RFC3339))
+
+	// Stage 1: ClickHouse 3-hop IP -> candidate gateways.
+	cands, err := store.ResolveIPToGateways(ctx, ip, t)
+	if err != nil {
+		return err
+	}
+	names := make([]string, len(cands))
+	for i, c := range cands {
+		names[i] = c.Name
+	}
+	log.Printf("3-hop: %s -> candidate gateways %v", ip, names)
+	if len(cands) == 0 {
+		log.Printf("RESULT: traffic miss (no ingress serves this IP)")
+		return nil
+	}
+
+	// Stage 2: host reverse-lookup among the IP-narrowed candidates.
+	resolver := gwresolve.New(candsToGateways(cands))
+	gw, ok := resolver.Resolve(host)
+	if !ok {
+		log.Printf("RESULT: no candidate gateway serves host %s", host)
+		return nil
+	}
+	log.Printf("gwresolve: host %s -> gateway %s", host, gw)
+
+	// Oracle check for the gateway.
+	wantGW, _ := gen.GatewayForIP(ip)
+	gwOK := gw == wantGW
+
+	// Stage 3: translate (config from ClickHouse) + router_check_tool -> cluster.
+	runner, kind, ok := matchcheck.Detect()
+	if !ok {
+		log.Printf("router_check_tool unavailable (no native binary, no tools image) — skipping cluster resolution")
+		log.Printf("RESULT: gateway=%s (oracle expects %s) %s", gw, wantGW, pass(gwOK))
+		return nil
+	}
+	log.Printf("router_check_tool: %s", kind)
+	engine := simulate.New(simulate.Config{
+		Resolver:   resolver,
+		Cache:      rccache.New(rccache.ColdAlways, rccache.NewDepIndex()),
+		Translator: translate.NewTranslator(),
+		ScopedFor:  chScopedFor(ctx, store, t),
+		Runner:     runner,
+	})
+	res, _, err := engine.ResolveAll(ctx, []simulate.Query{{Host: host, Path: path}})
+	if err != nil {
+		return err
+	}
+	cluster := res[0].Cluster
+	wantCluster := gen.ExpectedCluster(host, path)
+	log.Printf("cluster: %s", cluster)
+	log.Printf("RESULT: gateway=%s cluster=%s  %s",
+		gw, cluster, pass(gwOK && cluster == wantCluster))
+	if !gwOK || cluster != wantCluster {
+		log.Printf("  oracle: gateway=%s cluster=%s", wantGW, wantCluster)
+		os.Exit(1)
+	}
+	return nil
+}
+
+// verify samples the 3-hop against the oracle and checks multi-version selection.
+func verify(ctx context.Context, store *chstore.Store, gen *scalegen.Gen) error {
+	t := time.Now().UTC()
+	n := gen.NumGateways()
+	step := n/20 + 1
+	fail := 0
+	for i := 0; i < n; i += step {
+		ip := scalegen.IPForGateway(i)
+		cands, err := store.ResolveIPToGateways(ctx, ip, t)
+		if err != nil {
+			return err
+		}
+		want := scalegen.GatewayName(i)
+		got := ""
+		if len(cands) == 1 {
+			got = cands[0].Name
+		}
+		ok := got == want
+		if !ok {
+			fail++
+		}
+		log.Printf("3-hop i=%d ip=%s -> %v (want [%s]) %s", i, ip, names(cands), want, pass(ok))
+	}
+
+	// Multi-version AsOf: a resource's version live at VersionMidTime(v) has rev==v.
+	vc := envVersions()
+	gw0 := scalegen.GatewayName(0)
+	for v := 0; v < vc.Gw; v++ {
+		rev, ok, err := store.AsOfRev(ctx, "gw_versions", scalegen.GatewayNamespace(), gw0, chstore.VersionMidTime(v))
+		if err != nil {
+			return err
+		}
+		hit := ok && int(rev) == v
+		if !hit {
+			fail++
+		}
+		log.Printf("AsOf gw_versions %s @rev-window %d -> rev=%d (ok=%v) %s", gw0, v, rev, ok, pass(hit))
+	}
+
+	if fail != 0 {
+		return fmt.Errorf("%d verification checks failed", fail)
+	}
+	log.Printf("verify: all checks passed")
+	return nil
+}
+
+// chScopedFor adapts the store's ScopedFor to simulate.ScopedSource (fixed ctx+T).
+func chScopedFor(ctx context.Context, store *chstore.Store, t time.Time) simulate.ScopedSource {
+	return func(gw string) (translate.ScopedInput, bool) {
+		in, ok, err := store.ScopedFor(ctx, gw, t)
+		if err != nil {
+			log.Printf("scopedFor %s: %v", gw, err)
+			return translate.ScopedInput{}, false
+		}
+		return in, ok
+	}
+}
+
+func candsToGateways(cands []chstore.GatewayCand) []gwresolve.Gateway {
+	out := make([]gwresolve.Gateway, len(cands))
+	for i, c := range cands {
+		out[i] = gwresolve.Gateway{Name: c.Name, Hosts: c.ServerHosts}
+	}
+	return out
+}
+
+func names(cands []chstore.GatewayCand) []string {
+	out := make([]string, len(cands))
+	for i, c := range cands {
+		out[i] = c.Name
+	}
+	return out
+}
+
+func pass(ok bool) string {
+	if ok {
+		return "PASS"
+	}
+	return "FAIL"
+}
+
+func envStr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}

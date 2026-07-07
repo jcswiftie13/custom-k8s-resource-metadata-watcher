@@ -291,3 +291,33 @@ throughput/latency only from a **native-binary or Linux** run; correctness
 make verify        # gen + gwresolve + warm (full-corpus correctness) + worst, writes out/report.md
 make bench-worst   # the honest single-request latency
 ```
+
+---
+
+## 7. Ingress `IP → Gateway` over ClickHouse (traffic simulation)
+
+The sections above resolve `host + path`. Real north-south traffic also carries a
+**destination IP** (from a DNS lookup / OTEL span). `cmd/ipflow` adds that front
+half: it stores the ingress resources in **ClickHouse** as bitemporal versions and
+resolves `IP → Gateway` with a 3-hop selector join, then hands off to the existing
+`gwresolve → translate → router_check_tool` pipeline — with `translate` now reading
+its config (Gateway + VirtualServices + Services) back **from ClickHouse**.
+
+```
+make ch-up      # start a ClickHouse container (waits until ready)
+make ch-load    # program-generate the multi-version corpus + stream it in
+make ch-flow    # IP -> 3-hop -> gateway -> translate(from CH) -> cluster
+make ch-verify  # 3-hop vs oracle + multi-version AsOf(T) checks (no router_check_tool)
+make ch-down    # stop the container
+```
+
+Scale/version knobs (shrink for dev — defaults are ~24M rows):
+`POC_GATEWAYS POC_VS POC_VER_DEPLOY POC_VER_SVC POC_VER_GW POC_VER_VS POC_VER_KSVC`,
+e.g. `make ch-load POC_GATEWAYS=20 POC_VS=5 POC_VER_KSVC=5`.
+
+The 3-hop is: `has(ingress_ips, ip)` (Service) → `hasAll(pod_labels ⊇ svc.selector)`
+(Deployment L) → `hasAll(L ⊇ gw.selector)` (Gateway), each filtered by
+`valid_from <= T < valid_to`. Design write-up + data model:
+[`docs/istio-virtualservice-routing-history-design.md`](../../docs/istio-virtualservice-routing-history-design.md)
+("Ingress `IP→Gateway` 流程的 POC"). Test: `go test -run TestIPFlowClickHouse .`
+(skips if ClickHouse is unreachable).
