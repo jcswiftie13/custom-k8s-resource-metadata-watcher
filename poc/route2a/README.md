@@ -333,3 +333,42 @@ For a quick correctness check (3-hop vs oracle + multi-version AsOf, no benchmar
 `go test -run TestIPFlowClickHouse .` (needs `make ch-up`). For the manual CLI —
 `go run ./cmd/ipflow -mode=load|query|verify` — see its package doc.
 (skips if ClickHouse is unreachable).
+
+---
+
+## 8. Dev Container（Mac 上跑 native `router_check_tool` + ClickHouse）
+
+On macOS the `router_check_tool` binary extracted from the Envoy tools image is a
+**Linux ELF** — it cannot run natively on the host. Use the repo's Dev Container
+to develop and benchmark inside Linux with a native binary and a pre-wired
+ClickHouse service.
+
+**Open:** Cursor / VS Code → *Dev Containers: Reopen in Container* (uses
+[`.devcontainer/`](../../.devcontainer/)).
+
+What it sets up automatically:
+
+| Item | Value |
+|------|-------|
+| Go toolchain | `mcr.microsoft.com/devcontainers/go:1.25-bookworm` |
+| ClickHouse | compose service `clickhouse` (no `make ch-up` needed) |
+| `POC_CH_ADDR` | `clickhouse:9000` |
+| `router_check_tool` | `post-create` runs `make routercheck-bin` → native mode |
+| Docker CLI | `docker-outside-of-docker` (for `TestMatchRouterCheckScale` + fallback) |
+
+**Quick checks inside the container:**
+
+```bash
+cd poc/route2a
+go test -run TestMatchRouterCheckScale -v .    # translate + tool oracle (no CH)
+go test -run TestIPFlowClickHouse -v .         # full IP→CH→cluster chain
+make bench-worst POC_GATEWAYS=20 POC_VS=5      # meaningful latency (native binary)
+```
+
+**Mac host note:** if you previously ran `make routercheck-bin` on macOS, the
+Linux ELF under `bin/router_check_tool` is ignored on the host (Makefile only
+exports `POC_ROUTERCHECK_BIN` when the binary actually runs). Inside the Dev
+Container the same file is used as the native binary.
+
+Outside the Dev Container on macOS, correctness tests still work via **docker
+fallback**; do not cite `bench-warm` / `bench-worst` latency numbers from macOS.

@@ -13,9 +13,12 @@ ROUTERCHECK_IMAGE ?= envoyproxy/envoy:tools-v1.34-latest
 ROUTERCHECK_BIN   := $(CURDIR)/bin/router_check_tool
 
 export POC_ROUTERCHECK_IMAGE = $(ROUTERCHECK_IMAGE)
-# Prefer the vendored native binary (no per-batch docker startup); see routercheck-bin.
-ifneq ($(wildcard $(ROUTERCHECK_BIN)),)
+# Only export when the binary actually runs on this OS (Linux ELF on macOS must not win).
+_ROUTERCHECK_RUNS := $(shell test -x '$(ROUTERCHECK_BIN)' && '$(ROUTERCHECK_BIN)' --version >/dev/null 2>&1 && echo yes)
+ifeq ($(_ROUTERCHECK_RUNS),yes)
 export POC_ROUTERCHECK_BIN = $(ROUTERCHECK_BIN)
+else
+unexport POC_ROUTERCHECK_BIN
 endif
 
 .PHONY: gen gwresolve spike bench-worst bench-warm bench-routercheck routercheck-bin verify clean \

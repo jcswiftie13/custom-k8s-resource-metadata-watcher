@@ -1,0 +1,28 @@
+services:
+  devcontainer:
+    image: mcr.microsoft.com/devcontainers/go:1.25-bookworm
+    volumes:
+      - ..:/workspaces:cached
+    command: sleep infinity
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      POC_CH_ADDR: clickhouse:9000
+      POC_ROUTERCHECK_IMAGE: envoyproxy/envoy:tools-v1.34-latest
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.5
+    hostname: clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ../poc/route2a/testdata/clickhouse-open-users.xml:/etc/clickhouse-server/users.d/zzz-open-networks.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
