@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/example/metadata-exporter/poc/route2a/internal/chstore"
 	"github.com/example/metadata-exporter/poc/route2a/internal/gwresolve"
+	"github.com/example/metadata-exporter/poc/route2a/internal/ingload"
 	"github.com/example/metadata-exporter/poc/route2a/internal/matchcheck"
 	"github.com/example/metadata-exporter/poc/route2a/internal/rccache"
 	"github.com/example/metadata-exporter/poc/route2a/internal/report"
@@ -46,9 +49,12 @@ func requireRouterCheck(t *testing.T) matchcheck.Runner {
 	return r
 }
 
-// buildEngine wires a simulate.Engine over the corpus with the given cache mode.
-// It returns the engine, the dependency index (for churn), and all gateway names.
-func buildEngine(g *scalegen.Gen, mode rccache.Mode, runner matchcheck.Runner) *simulate.Engine {
+// buildEngine wires a ClickHouse-backed simulate.Engine over the corpus with the
+// given cache mode: the request IP resolves candidate gateways via the ClickHouse
+// 3-hop (Lookup), gwresolve disambiguates among them, and the translate stage
+// pulls its scoped config from ClickHouse too (chScopedForBench). The whole chain
+// therefore runs off the store, at a fixed query time `now`.
+func buildEngine(ctx context.Context, g *scalegen.Gen, mode rccache.Mode, runner matchcheck.Runner, store *chstore.Store, now time.Time) *simulate.Engine {
 	gws := g.Gateways()
 	rgws := make([]gwresolve.Gateway, len(gws))
 	deps := rccache.NewDepIndex()
@@ -56,13 +62,82 @@ func buildEngine(g *scalegen.Gen, mode rccache.Mode, runner matchcheck.Runner) *
 		rgws[i] = gwresolve.Gateway{Name: gw.Name, Hosts: gw.Hosts}
 		deps.Own(gw.Name, gw.Name) // a gateway's own CR is a dependency of its RC
 	}
+	lookup := func(host string) ([]string, error) {
+		ip, ok := g.IPForHost(host)
+		if !ok {
+			return nil, nil // broad / unknown host has no traffic IP -> no candidates -> miss
+		}
+		cands, err := store.ResolveIPToGateways(ctx, ip, now)
+		if err != nil {
+			return nil, err
+		}
+		return candNames(cands), nil
+	}
 	return simulate.New(simulate.Config{
 		Resolver:   gwresolve.New(rgws),
 		Cache:      rccache.New(mode, deps),
 		Translator: translate.NewTranslator(),
-		ScopedFor:  g.ScopedFor,
+		ScopedFor:  chScopedForBench(ctx, store, now),
+		Lookup:     lookup,
 		Runner:     runner,
 	})
+}
+
+// chScopedForBench adapts the store's ScopedFor to simulate.ScopedSource at a
+// fixed time, so the translate stage's config comes from ClickHouse.
+func chScopedForBench(ctx context.Context, store *chstore.Store, now time.Time) simulate.ScopedSource {
+	return func(gw string) (translate.ScopedInput, bool) {
+		in, ok, err := store.ScopedFor(ctx, gw, now)
+		if err != nil {
+			log.Printf("scopedFor %s: %v", gw, err)
+			return translate.ScopedInput{}, false
+		}
+		return in, ok
+	}
+}
+
+// requireClickHouse opens the store or skips when ClickHouse is unreachable
+// (same "skip when a dependency is absent" style as requireRouterCheck).
+func requireClickHouse(ctx context.Context, t *testing.T) *chstore.Store {
+	t.Helper()
+	addr := envOr("POC_CH_ADDR", "127.0.0.1:9000")
+	store, err := chstore.Open(ctx, addr)
+	if err != nil {
+		t.Skipf("ClickHouse not reachable at %s (%v); start it with `make ch-up`", addr, err)
+	}
+	return store
+}
+
+// benchVersions is the bitemporal depth the benchmark loads into ClickHouse.
+// Single version by default (fastest load; the benchmark only ever queries "now"),
+// overridable per resource type with POC_VER_*.
+func benchVersions() ingload.Versions {
+	return ingload.Versions{
+		Deploy: envInt("POC_VER_DEPLOY", 1),
+		Svc:    envInt("POC_VER_SVC", 1),
+		Gw:     envInt("POC_VER_GW", 1),
+		VS:     envInt("POC_VER_VS", 1),
+		KSvc:   envInt("POC_VER_KSVC", 1),
+	}
+}
+
+// ensureLoaded makes sure ClickHouse holds the current benchmark corpus before
+// timing begins. It compares gw_versions' row count against the expected
+// NumGateways × Gw-versions and only regenerates+loads on mismatch, so re-running
+// a benchmark against an already-loaded store skips the (untimed) load.
+func ensureLoaded(ctx context.Context, t *testing.T, store *chstore.Store, g *scalegen.Gen, vers ingload.Versions) {
+	t.Helper()
+	want := uint64(g.NumGateways() * vers.Gw)
+	if got, err := store.CountRows(ctx, "gw_versions"); err == nil && got == want {
+		t.Logf("ClickHouse already holds this corpus (gw_versions=%d); skipping load", got)
+		return
+	}
+	t.Logf("loading corpus into ClickHouse: %d gateways, versions %+v ...", g.NumGateways(), vers)
+	start := time.Now()
+	if err := ingload.Load(ctx, store, g, vers, nil); err != nil {
+		t.Fatalf("load corpus: %v", err)
+	}
+	t.Logf("corpus loaded in %s (not counted in report Wall)", time.Since(start).Round(time.Millisecond))
 }
 
 func toQueries(cases []scalegen.Case) []simulate.Query {
@@ -186,7 +261,12 @@ func TestResolveWarm(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	eng := buildEngine(g, rccache.WarmLazy, runner)
+	store := requireClickHouse(ctx, t)
+	defer store.Close()
+	ensureLoaded(ctx, t, store, g, benchVersions())
+	now := time.Now().UTC()
+
+	eng := buildEngine(ctx, g, rccache.WarmLazy, runner, store, now)
 	prewarm(ctx, t, eng, queries)
 
 	start := time.Now()
@@ -222,9 +302,14 @@ func TestResolveSingleWorst(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	// ColdAlways => every query re-translates its RC (true worst case). Get always
-	// misses, so a single shared engine is fine (nothing is ever cached).
-	eng := buildEngine(g, rccache.ColdAlways, runner)
+	store := requireClickHouse(ctx, t)
+	defer store.Close()
+	ensureLoaded(ctx, t, store, g, benchVersions())
+	now := time.Now().UTC()
+
+	// ColdAlways => every query re-fetches (ScopedFor) and re-translates its RC (true
+	// worst case). Get always misses, so a single shared engine is fine.
+	eng := buildEngine(ctx, g, rccache.ColdAlways, runner, store, now)
 
 	agg := &report.Result{Mode: "SINGLE-WORST (per-request, cold, batch=1)", Queries: len(cases)}
 	agg.Notes = "Worst-case ONLINE latency: full pipeline per single host+path (resolve + translate + ONE router_check_tool invocation). The total-per-query p50/p99 below is the real single-request cost."
@@ -240,8 +325,10 @@ func TestResolveSingleWorst(t *testing.T) {
 		}
 		logResolutions(t, res)
 		agg.Stages.Total.Add(perQuery)
+		agg.Stages.Lookup.Add(m.Stages.Lookup.Mean())
 		agg.Stages.Resolve.Add(m.Stages.Resolve.Mean())
 		if m.CacheMisses > 0 {
+			agg.Stages.ScopedFetch.Add(m.Stages.ScopedFetch.Mean())
 			agg.Stages.Translate.Add(m.Stages.Translate.Mean())
 		}
 		agg.Stages.Check.Add(m.Stages.Check.Mean())

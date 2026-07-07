@@ -46,14 +46,16 @@ func (h *Hist) Mean() time.Duration {
 	return time.Duration(sum / int64(len(h.ns)))
 }
 
-// Stages holds one histogram per pipeline stage. Resolve is sampled per query;
-// Translate and Check are sampled per gateway batch (router_check_tool runs once
-// per gateway over all that gateway's queries).
+// Stages holds one histogram per pipeline stage. Lookup and Resolve are sampled
+// per query; ScopedFetch, Translate and Check are sampled per gateway batch
+// (router_check_tool runs once per gateway over all that gateway's queries).
 type Stages struct {
-	Resolve   Hist // host -> gateway (per query)
-	Translate Hist // scoped istiod translation (per gateway; only on cache miss)
-	Check     Hist // router_check_tool batch resolution (per gateway)
-	Total     Hist // whole run, per gateway batch
+	Lookup      Hist // IP -> candidate gateways (ClickHouse 3-hop; per query; empty when no Lookup wired)
+	Resolve     Hist // host -> gateway (per query)
+	ScopedFetch Hist // ClickHouse ScopedFor config fetch (per gateway; only on cache miss)
+	Translate   Hist // istiod translation (per gateway; only on cache miss)
+	Check       Hist // router_check_tool batch resolution (per gateway)
+	Total       Hist // whole run, per gateway batch
 }
 
 // Result is the full benchmark outcome for one mode/run.
@@ -109,8 +111,10 @@ func (r *Result) Markdown() string {
 		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n", name,
 			h.Pct(50).Round(time.Microsecond), h.Pct(99).Round(time.Microsecond), h.Mean().Round(time.Microsecond))
 	}
+	row("lookup (IP→candidates 3-hop, per query)", &r.Stages.Lookup)
 	row("resolve (host→gw, per query)", &r.Stages.Resolve)
-	row("translate (scoped, per gw)", &r.Stages.Translate)
+	row("scopedfetch (CH config, per gw)", &r.Stages.ScopedFetch)
+	row("translate (istiod, per gw)", &r.Stages.Translate)
 	row("check (router_check_tool, per gw)", &r.Stages.Check)
 	row("total (per gw batch)", &r.Stages.Total)
 	if r.Notes != "" {

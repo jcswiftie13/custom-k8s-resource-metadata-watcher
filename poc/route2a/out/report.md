@@ -246,3 +246,75 @@ Worst-case ONLINE latency: full pipeline per single host+path (resolve + transla
 
 Worst-case ONLINE latency: full pipeline per single host+path (resolve + translate + ONE router_check_tool invocation). The total-per-query p50/p99 below is the real single-request cost.
 
+
+### SINGLE-WORST (per-request, cold, batch=1)
+
+- queries: **3**, mismatches: **0**, wall: **2.099s**, throughput: **1 q/s** (serialized single replica)
+- cache hit rate: **0.0%** (0 hits / 3 misses)
+- peak RSS: **65 MB**
+
+| stage | p50 | p99 | mean |
+|---|---|---|---|
+| lookup (IP→candidates 3-hop, per query) | 13.391ms | 13.391ms | 16.418ms |
+| resolve (host→gw, per query) | 4µs | 4µs | 5µs |
+| scopedfetch (CH config, per gw) | 14.762ms | 14.762ms | 15.552ms |
+| translate (istiod, per gw) | 1.307ms | 1.307ms | 2.646ms |
+| check (router_check_tool, per gw) | 664.785ms | 664.785ms | 665.013ms |
+| total (per gw batch) | 694.263ms | 694.263ms | 699.647ms |
+
+Worst-case ONLINE latency: full pipeline per single host+path (resolve + translate + ONE router_check_tool invocation). The total-per-query p50/p99 below is the real single-request cost.
+
+
+### SINGLE-WORST (per-request, cold, batch=1)
+
+- queries: **200**, mismatches: **0**, wall: **3m45.923s**, throughput: **1 q/s** (serialized single replica)
+- cache hit rate: **0.0%** (0 hits / 199 misses)
+- peak RSS: **730 MB**
+
+| stage | p50 | p99 | mean |
+|---|---|---|---|
+| lookup (IP→candidates 3-hop, per query) | 87.825ms | 279.383ms | 104.248ms |
+| resolve (host→gw, per query) | 27µs | 71µs | 31µs |
+| scopedfetch (CH config, per gw) | 98.245ms | 261.875ms | 113.085ms |
+| translate (istiod, per gw) | 19.144ms | 124.126ms | 24.596ms |
+| check (router_check_tool, per gw) | 765.213ms | 2.00802s | 888.144ms |
+| total (per gw batch) | 992.802ms | 2.557091s | 1.129602s |
+
+Worst-case ONLINE latency: full pipeline per single host+path (resolve + translate + ONE router_check_tool invocation). The total-per-query p50/p99 below is the real single-request cost.
+
+
+### SINGLE-WORST (per-request, cold, batch=1)
+
+- queries: **200**, mismatches: **0**, wall: **4m17.133s**, throughput: **1 q/s** (serialized single replica)
+- cache hit rate: **0.0%** (0 hits / 199 misses)
+- peak RSS: **734 MB**
+
+| stage | p50 | p99 | mean |
+|---|---|---|---|
+| lookup (IP→candidates 3-hop, per query) | 94.279ms | 281.64ms | 109.415ms |
+| resolve (host→gw, per query) | 15µs | 42µs | 17µs |
+| scopedfetch (CH config, per gw) | 104.13ms | 252.371ms | 117.057ms |
+| translate (istiod, per gw) | 20.455ms | 93.478ms | 27.784ms |
+| check (router_check_tool, per gw) | 802.9ms | 5.079498s | 1.032079s |
+| total (per gw batch) | 1.035429s | 5.417875s | 1.285648s |
+
+Worst-case ONLINE latency: full pipeline per single host+path (resolve + translate + ONE router_check_tool invocation). The total-per-query p50/p99 below is the real single-request cost.
+
+
+### SINGLE-WORST (per-request, cold, batch=1)
+
+- queries: **200**, mismatches: **0**, wall: **3m43.985s**, throughput: **1 q/s** (serialized single replica)
+- cache hit rate: **0.0%** (0 hits / 199 misses)
+- peak RSS: **756 MB**
+
+| stage | p50 | p99 | mean |
+|---|---|---|---|
+| lookup (IP→candidates 3-hop, per query) | 88.017ms | 227.541ms | 109.514ms |
+| resolve (host→gw, per query) | 17µs | 45µs | 18µs |
+| scopedfetch (CH config, per gw) | 99.781ms | 290.334ms | 121.594ms |
+| translate (istiod, per gw) | 19.869ms | 85.116ms | 25.168ms |
+| check (router_check_tool, per gw) | 732.905ms | 2.618417s | 864.33ms |
+| total (per gw batch) | 956.597ms | 3.763946s | 1.11991s |
+
+Worst-case ONLINE latency: full pipeline per single host+path (resolve + translate + ONE router_check_tool invocation). The total-per-query p50/p99 below is the real single-request cost.
+

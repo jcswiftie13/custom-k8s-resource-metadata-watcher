@@ -37,10 +37,18 @@ func (r *Resolver) ResolveAmong(reqHost string, candidates []string) (string, bo
 用既有 `r.pats`（建構時已依 most-specific 排序）掃描，只接受 `pat.gw ∈ candidates` 的 pattern；
 第一個命中即答案。`Resolve` 不動（`ResolveAmong` 只是多一個候選過濾條件）。
 
-### 2) `internal/report/report.go` — `Stages` 加 `Lookup`
+### 2) `internal/report/report.go` — `Stages` 加 `Lookup` 與 `ScopedFetch`
 
 - `Stages` 新增 `Lookup Hist`（IP→候選 gateway 的 3-hop，**per query** 取樣）。
-- `Markdown()` 在 `resolve` 之前多印一列：`lookup (IP→candidates 3-hop, per query)` 的 p50/p99/mean。
+- `Stages` 新增 `ScopedFetch Hist`（ClickHouse `ScopedFor` 取 translate 設定的 round-trip，**per gateway**、
+  僅 cache miss 時取樣，與 `Translate` 同粒度）。
+- `Markdown()` 在 `resolve` 之前多印 `lookup (IP→candidates 3-hop, per query)`；在 `translate` **之前**多印
+  `scopedfetch (CH config, per gw)`，兩者皆 p50/p99/mean。
+
+> 為何需要 `ScopedFetch`：本計畫把 `ScopedFor` 也接上 ClickHouse（見 §4），而 `simulate.ResolveAll` 目前在
+> `simulate.go:106` 呼叫 `ScopedFor`，**在** translate 計時（`t0`，`:110`）**之前**——若不另計，這第二個 CH query
+> 的時間會完全落在任何 stage 之外、只被默默計入 `Total`，造成 `sum(stages) < total` 的無解落差，且 CH 設定讀取
+> 成本無從量測。故獨立成一階段，`translate` 維持「純 istiod translation」語意。
 
 ### 3) `internal/simulate/simulate.go` — 加可選 `Lookup` 階段
 
@@ -50,11 +58,22 @@ func (r *Resolver) ResolveAmong(reqHost string, candidates []string) (string, bo
   // (the ClickHouse 3-hop) before host disambiguation. nil => resolve over all gateways.
   Lookup func(host string) ([]string, error)
   ```
-- `Metrics.Stages`（＝ `report.Stages`）自動帶 `Lookup`。
+- `Metrics.Stages`（＝ `report.Stages`）自動帶 `Lookup` 與 `ScopedFetch`。
 - `ResolveAll` 的 stage-1（逐 query）：
   - `Lookup != nil`：先計時 `cands, err := cfg.Lookup(q.Host)` → 記入 `Stages.Lookup`；再計時
     `cfg.Resolver.ResolveAmong(q.Host, cands)` → 記入 `Stages.Resolve`。
   - `Lookup == nil`：維持原本 `cfg.Resolver.Resolve(q.Host)` → `Stages.Resolve`。
+- `ResolveAll` 的 stage-2（cache miss 時，`simulate.go:104-118`）：把 `ScopedFor` 的呼叫**獨立計時**——
+  ```go
+  t0 := time.Now()
+  scoped, found := e.cfg.ScopedFor(gw)
+  m.Stages.ScopedFetch.Add(time.Since(t0))
+  // ...found 檢查照舊...
+  t0 = time.Now()
+  translated, err := e.cfg.Translator.Translate(scoped)   // translate 計時維持只圈純翻譯
+  m.Stages.Translate.Add(time.Since(t0))
+  ```
+  非 CH 路徑（`ScopedFor` 為記憶體內 `g.ScopedFor`）此計時近乎 0，不影響既有語意；CH 路徑則得到真實 round-trip。
 - **無介面重構**：`Config.Resolver` 仍是 `*gwresolve.Resolver`（§1 幫它加了 `ResolveAmong` 方法即可）。
 - 相容性：`Lookup == nil` 時行為與現況完全一致，既有非 CH 呼叫端（`ip_flow_test`、`cmd/ipflow` 的 per-case
   resolver）不受影響。
@@ -71,7 +90,8 @@ func (r *Resolver) ResolveAmong(reqHost string, candidates []string) (string, bo
   - 開頭 `store, err := chstore.Open(ctx, chAddr)`；**CH 不可達 → `t.Skip`**（與「無 router_check → skip」同風格）。
   - `ensureLoaded(ctx, store, g, vers)` 確保語料已在 ClickHouse（見下）。
   - 其餘計時／oracle 驗證邏輯不動；報表自然多出 `lookup` 一列。
-- `TestResolveSingleWorst` 的手動聚合補一行：`agg.Stages.Lookup.Add(m.Stages.Lookup.Mean())`。
+- `TestResolveSingleWorst` 的手動聚合補兩行：`agg.Stages.Lookup.Add(m.Stages.Lookup.Mean())`；並在
+  `if m.CacheMisses > 0 { ... }` 區塊（與 `Translate` 同條件）內補 `agg.Stages.ScopedFetch.Add(m.Stages.ScopedFetch.Mean())`。
 - **正確性不變**：broad（`direct-N.example.com`）與 unknown（`nope-N`）host 的 `IPForHost` 會失敗 → 無候選 →
   miss（cluster `""`），與 config_only 的 oracle（`""`）一致，故 full-corpus 仍 0 mismatch。
 
@@ -96,24 +116,27 @@ func (r *Resolver) ResolveAmong(reqHost string, candidates []string) (string, bo
 
 ## 報表樣貌（實作後）
 
-`out/report.md` 的每個 mode 區塊會由四階段變五階段：
+`out/report.md` 的每個 mode 區塊會由四階段變六階段：
 
 ```
 | stage | p50 | p99 | mean |
 |---|---|---|---|
 | lookup (IP→candidates 3-hop, per query) | … | … | … |   ← 新增
 | resolve (host→gw, per query)            | … | … | … |
-| translate (scoped, per gw)              | … | … | … |
+| scopedfetch (CH config, per gw)         | … | … | … |   ← 新增
+| translate (istiod, per gw)              | … | … | … |
 | check (router_check_tool, per gw)       | … | … | … |
 | total (per gw batch)                    | … | … | … |
 ```
 
+實作後 `sum(lookup+resolve+scopedfetch+translate+check) ≈ total`（無先前的無解落差）。
+
 ## 驗證方式（實作後）
 
 1. `make ch-up`。
-2. `make bench-worst`（sampled，快）→ 報表該段含 **lookup / resolve / translate / check / total** 五階段
-   p50/p99/mean，mismatches=0，路徑為 IP→3-hop→`ResolveAmong`→CH translate→router_check。需 native
-   `router_check_tool` 或 tools image。
+2. `make bench-worst`（sampled，快）→ 報表該段含 **lookup / resolve / scopedfetch / translate / check /
+   total** 六階段 p50/p99/mean，且 `sum(前五階段) ≈ total`，mismatches=0，路徑為
+   IP→3-hop→`ResolveAmong`→CH `ScopedFor`→translate→router_check。需 native `router_check_tool` 或 tools image。
 3. `make bench-warm`（60k，較久）→ 同樣多出 `lookup` 階段、full-corpus 0 mismatch。
 4. `POC_GATEWAYS=50 make bench-worst` dev 加速先驗一遍。
 5. `go test ./...`（未起 CH）→ `TestResolveWarm` / `TestResolveSingleWorst` / `TestIPFlowClickHouse` 皆 skip；

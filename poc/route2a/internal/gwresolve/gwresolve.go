@@ -68,3 +68,28 @@ func (r *Resolver) Resolve(reqHost string) (string, bool) {
 	}
 	return "", false
 }
+
+// ResolveAmong is Resolve limited to a candidate gateway set — the IP-narrowed
+// candidates from the ClickHouse 3-hop. It scans the same most-specific-first
+// patterns but only considers those whose gateway is in candidates, so the first
+// match is the most-specific gateway serving reqHost among the candidates. An
+// empty candidate set yields ("", false) — a traffic miss.
+func (r *Resolver) ResolveAmong(reqHost string, candidates []string) (string, bool) {
+	if len(candidates) == 0 {
+		return "", false
+	}
+	allow := make(map[string]struct{}, len(candidates))
+	for _, c := range candidates {
+		allow[c] = struct{}{}
+	}
+	h := host.Name(reqHost)
+	for _, p := range r.pats {
+		if _, ok := allow[p.gw]; !ok {
+			continue
+		}
+		if p.pattern.Matches(h) {
+			return p.gw, true
+		}
+	}
+	return "", false
+}

@@ -266,6 +266,14 @@ Not needed in production — replace with your store.
 | `make bench-warm` | `TestResolveWarm` | **bulk/steady-state throughput** — full corpus, cache warm (translation skipped). The scenario where the `rccache` warm path pays off; also asserts full-corpus 0 mismatches. |
 | `make bench-routercheck` | `TestMatchRouterCheckScale` | offline oracle agreement (correctness, not perf). |
 
+> Both `bench-worst` and `bench-warm` now run the **whole ClickHouse chain**
+> (IP 3-hop → `gwresolve` → translate-from-ClickHouse → `router_check_tool`), so
+> they need a running store — start it with `make ch-up` first (they auto-load the
+> corpus on first run, untimed, and skip the load when it is already present). The
+> report gains two ClickHouse stages: **`lookup`** (the per-query IP→candidates
+> 3-hop) and **`scopedfetch`** (the per-gateway `ScopedFor` config fetch), so
+> `sum(stages) ≈ total`. When ClickHouse is unreachable the benchmarks skip.
+
 > ⚠️ `bench-warm` reports throughput where one `router_check_tool` invocation is
 > amortized over a whole gateway's ~100 queries — the *bulk/offline route-simulation*
 > number, **not** single-request latency. For online cost read `bench-worst`.
@@ -297,27 +305,31 @@ make bench-worst   # the honest single-request latency
 ## 7. Ingress `IP → Gateway` over ClickHouse (traffic simulation)
 
 The sections above resolve `host + path`. Real north-south traffic also carries a
-**destination IP** (from a DNS lookup / OTEL span). `cmd/ipflow` adds that front
-half: it stores the ingress resources in **ClickHouse** as bitemporal versions and
-resolves `IP → Gateway` with a 3-hop selector join, then hands off to the existing
+**destination IP** (from a DNS lookup / OTEL span). This front half stores the
+ingress resources in **ClickHouse** as bitemporal versions and resolves
+`IP → Gateway` with a 3-hop selector join, then hands off to the existing
 `gwresolve → translate → router_check_tool` pipeline — with `translate` now reading
-its config (Gateway + VirtualServices + Services) back **from ClickHouse**.
+its config (Gateway + VirtualServices + Services) back **from ClickHouse**. This is
+the same chain the benchmarks (§5) exercise.
 
 ```
 make ch-up      # start a ClickHouse container (waits until ready)
-make ch-load    # program-generate the multi-version corpus + stream it in
-make ch-flow    # IP -> 3-hop -> gateway -> translate(from CH) -> cluster
-make ch-verify  # 3-hop vs oracle + multi-version AsOf(T) checks (no router_check_tool)
+make bench-worst # (or bench-warm) run the full chain; auto-loads the corpus once
 make ch-down    # stop the container
 ```
 
-Scale/version knobs (shrink for dev — defaults are ~24M rows):
-`POC_GATEWAYS POC_VS POC_VER_DEPLOY POC_VER_SVC POC_VER_GW POC_VER_VS POC_VER_KSVC`,
-e.g. `make ch-load POC_GATEWAYS=20 POC_VS=5 POC_VER_KSVC=5`.
+Scale/version knobs (shrink for dev): `POC_GATEWAYS POC_VS` and the bitemporal
+depth `POC_VER_DEPLOY POC_VER_SVC POC_VER_GW POC_VER_VS POC_VER_KSVC` (the
+benchmarks default each version count to **1** for a fast load; `cmd/ipflow`
+defaults to the multi-version corpus). e.g. `make bench-worst POC_GATEWAYS=20 POC_VS=5`.
 
 The 3-hop is: `has(ingress_ips, ip)` (Service) → `hasAll(pod_labels ⊇ svc.selector)`
 (Deployment L) → `hasAll(L ⊇ gw.selector)` (Gateway), each filtered by
 `valid_from <= T < valid_to`. Design write-up + data model:
 [`docs/istio-virtualservice-routing-history-design.md`](../../docs/istio-virtualservice-routing-history-design.md)
-("Ingress `IP→Gateway` 流程的 POC"). Test: `go test -run TestIPFlowClickHouse .`
+("Ingress `IP→Gateway` 流程的 POC").
+
+For a quick correctness check (3-hop vs oracle + multi-version AsOf, no benchmark):
+`go test -run TestIPFlowClickHouse .` (needs `make ch-up`). For the manual CLI —
+`go run ./cmd/ipflow -mode=load|query|verify` — see its package doc.
 (skips if ClickHouse is unreachable).

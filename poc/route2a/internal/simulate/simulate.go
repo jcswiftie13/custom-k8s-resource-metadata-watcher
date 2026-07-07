@@ -48,7 +48,12 @@ type Config struct {
 	Cache      *rccache.Cache
 	Translator *translate.Translator
 	ScopedFor  ScopedSource
-	Runner     matchcheck.Runner
+	// Lookup, when set, narrows a request to the candidate gateways served by its
+	// traffic IP (the ClickHouse 3-hop) before host disambiguation; Resolver then
+	// picks the most-specific match among those candidates. nil => resolve the host
+	// over all gateways (the original in-memory path).
+	Lookup func(host string) ([]string, error)
+	Runner matchcheck.Runner
 }
 
 // Engine resolves host+path to a destination service cluster.
@@ -72,12 +77,29 @@ func (e *Engine) ResolveAll(ctx context.Context, queries []Query) ([]Resolution,
 	m := &Metrics{}
 
 	// Stage 1: resolve host -> gateway (per query); bucket query indices by gateway.
+	// With Lookup wired, the IP 3-hop narrows the candidate gateways first (timed
+	// separately) and ResolveAmong disambiguates within them; otherwise Resolve
+	// scans all gateways.
 	byGW := map[string][]int{}
 	for i, q := range queries {
 		res[i].Query = q
-		t0 := time.Now()
-		gw, ok := e.cfg.Resolver.Resolve(q.Host)
-		m.Stages.Resolve.Add(time.Since(t0))
+		var gw string
+		var ok bool
+		if e.cfg.Lookup != nil {
+			t0 := time.Now()
+			cands, err := e.cfg.Lookup(q.Host)
+			m.Stages.Lookup.Add(time.Since(t0))
+			if err != nil {
+				return nil, nil, fmt.Errorf("lookup %s: %w", q.Host, err)
+			}
+			t1 := time.Now()
+			gw, ok = e.cfg.Resolver.ResolveAmong(q.Host, cands)
+			m.Stages.Resolve.Add(time.Since(t1))
+		} else {
+			t0 := time.Now()
+			gw, ok = e.cfg.Resolver.Resolve(q.Host)
+			m.Stages.Resolve.Add(time.Since(t0))
+		}
 		if !ok {
 			continue // no gateway -> miss (Gateway "", Cluster "")
 		}
@@ -103,11 +125,15 @@ func (e *Engine) ResolveAll(ctx context.Context, queries []Query) ([]Resolution,
 			m.CacheHits++
 		} else {
 			m.CacheMisses++
+			// ScopedFor may be ClickHouse-backed (a config-fetch round-trip), so time
+			// it as its own stage; Translate then measures only the istiod translation.
+			t0 := time.Now()
 			scoped, found := e.cfg.ScopedFor(gw)
+			m.Stages.ScopedFetch.Add(time.Since(t0))
 			if !found {
 				return nil, nil, fmt.Errorf("no scoped config for gateway %q", gw)
 			}
-			t0 := time.Now()
+			t0 = time.Now()
 			translated, err := e.cfg.Translator.Translate(scoped)
 			if err != nil {
 				return nil, nil, fmt.Errorf("translate %s: %w", gw, err)
