@@ -10,11 +10,26 @@
 # startup dominates timing, so don't cite perf numbers from a docker run).
 
 ROUTERCHECK_IMAGE ?= envoyproxy/envoy:tools-v1.34-latest
+ROUTERCHECK_BIN   := $(CURDIR)/bin/router_check_tool
 
 export POC_ROUTERCHECK_IMAGE = $(ROUTERCHECK_IMAGE)
+# Prefer the vendored native binary (no per-batch docker startup); see routercheck-bin.
+ifneq ($(wildcard $(ROUTERCHECK_BIN)),)
+export POC_ROUTERCHECK_BIN = $(ROUTERCHECK_BIN)
+endif
 
-.PHONY: gen gwresolve spike bench-worst bench-warm bench-routercheck verify clean \
+.PHONY: gen gwresolve spike bench-worst bench-warm bench-routercheck routercheck-bin verify clean \
         ch-up ch-down
+
+# Extract router_check_tool from the official Envoy tools image into bin/ (gitignored).
+routercheck-bin:
+	mkdir -p bin
+	docker pull $(ROUTERCHECK_IMAGE)
+	cid=$$(docker create $(ROUTERCHECK_IMAGE)); \
+	docker cp $$cid:/usr/local/bin/router_check_tool $(ROUTERCHECK_BIN); \
+	docker rm $$cid; \
+	chmod +x $(ROUTERCHECK_BIN)
+	@$(ROUTERCHECK_BIN) --version
 
 # Generate + spot-check the corpus (600 gw / 60k VS) WITHOUT materializing it all.
 gen:
@@ -61,7 +76,7 @@ clean:
 # Scale/version knobs: POC_GATEWAYS POC_VS
 #   POC_VER_DEPLOY POC_VER_SVC POC_VER_GW POC_VER_VS POC_VER_KSVC (default 1 each)
 
-CH_IMAGE ?= clickhouse/clickhouse-server:24.8
+CH_IMAGE ?= clickhouse/clickhouse-server:25.5
 CH_NAME  ?= route2a-ch
 CH_ADDR  ?= 127.0.0.1:9000
 

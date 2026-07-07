@@ -318,3 +318,21 @@ Worst-case ONLINE latency: full pipeline per single host+path (resolve + transla
 
 Worst-case ONLINE latency: full pipeline per single host+path (resolve + translate + ONE router_check_tool invocation). The total-per-query p50/p99 below is the real single-request cost.
 
+
+### SINGLE-WORST (per-request, cold, batch=1)
+
+- queries: **200**, mismatches: **0**, wall: **1m2.295s**, throughput: **3 q/s** (serialized single replica)
+- cache hit rate: **0.0%** (0 hits / 199 misses)
+- peak RSS: **687 MB**
+
+| stage | p50 | p99 | mean |
+|---|---|---|---|
+| lookup (IP→candidates 3-hop, per query) | 63.049ms | 134.752ms | 71.343ms |
+| resolve (host→gw, per query) | 16µs | 53µs | 17µs |
+| scopedfetch (CH config, per gw) | 69.276ms | 154.767ms | 76.071ms |
+| translate (istiod, per gw) | 17.871ms | 50.726ms | 20.11ms |
+| check (router_check_tool, per gw) | 130.559ms | 312.073ms | 144.378ms |
+| total (per gw batch) | 286.939ms | 609.246ms | 311.46ms |
+
+Worst-case ONLINE latency: full pipeline per single host+path (resolve + translate + ONE router_check_tool invocation). The total-per-query p50/p99 below is the real single-request cost.
+
