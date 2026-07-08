@@ -38,9 +38,6 @@ else
   exit 1
 fi
 
-go mod tidy
-make routercheck-bin
-
 echo ""
 echo "Dev container ready."
 echo "  POC_CH_ADDR=${POC_CH_ADDR:-clickhouse:9000}"
