@@ -26,6 +26,8 @@ import (
 
 	"github.com/example/metadata-exporter/pkg/collector"
 	"github.com/example/metadata-exporter/pkg/config"
+	"github.com/example/metadata-exporter/pkg/history"
+	"github.com/example/metadata-exporter/pkg/store"
 )
 
 func main() {
@@ -96,6 +98,60 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// History ingest is fully opt-in and decoupled from the scrape path. It
+	// registers event handlers on the SAME informer cache the collector owns,
+	// so it must be wired before col.Start (which starts the informers).
+	if cfg.History.Enabled {
+		compiled, err := history.CompileAll(cfg.History)
+		if err != nil {
+			log.Error("history compile failed", "err", err)
+			os.Exit(1)
+		}
+		sc := cfg.History.Store
+		user, err := sc.ResolveUsername()
+		if err != nil {
+			log.Error("history store username resolve failed", "err", err)
+			os.Exit(1)
+		}
+		pw, err := sc.ResolvePassword()
+		if err != nil {
+			log.Error("history store password resolve failed", "err", err)
+			os.Exit(1)
+		}
+		tok, err := sc.ResolveToken()
+		if err != nil {
+			log.Error("history store token resolve failed", "err", err)
+			os.Exit(1)
+		}
+		histStore, err := store.Open(ctx, store.Options{
+			DSN:           sc.DSN,
+			Username:      user,
+			Password:      pw,
+			Database:      sc.Database,
+			Token:         tok,
+			Secure:        sc.SecureEnabled(),
+			TLSSkipVerify: sc.TLSSkipVerify,
+			CreateSchema:  sc.CreateSchemaEnabled(),
+		})
+		if err != nil {
+			log.Error("history store open failed", "err", err)
+			os.Exit(1)
+		}
+		defer func() { _ = histStore.Close() }()
+		if err := histStore.EnsureSchema(ctx, history.TableSchemas(compiled)); err != nil {
+			log.Error("history schema ensure failed", "err", err)
+			os.Exit(1)
+		}
+		ing := history.NewIngester(histStore, col.Informers(), compiled, cfg.History.Store.Batch, log)
+		if err := ing.Register(); err != nil {
+			log.Error("history handler register failed", "err", err)
+			os.Exit(1)
+		}
+		ing.Start(ctx)
+		log.Info("history ingest enabled", "resources", len(compiled),
+			"createSchema", cfg.History.Store.CreateSchemaEnabled())
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg}))

@@ -133,7 +133,8 @@ var ddl = []string{
 		valid_to      DateTime64(3),
 		rev           UInt32,
 		pod_labels_kv Array(String),
-		ingest_seq    UInt64
+		ingest_seq    UInt64,
+		INDEX idx_pod pod_labels_kv TYPE bloom_filter GRANULARITY 1
 	) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (namespace, name, valid_from)`,
 	`CREATE TABLE gw_versions (
 		namespace    LowCardinality(String),
@@ -155,7 +156,8 @@ var ddl = []string{
 		rev            UInt32,
 		bound_gateways Array(String),
 		spec_json      String,
-		ingest_seq     UInt64
+		ingest_seq     UInt64,
+		INDEX idx_bg bound_gateways TYPE bloom_filter GRANULARITY 1
 	) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (namespace, name, valid_from)`,
 }
 

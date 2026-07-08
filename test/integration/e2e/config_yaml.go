@@ -3,8 +3,101 @@
 package e2e
 
 import (
+	"fmt"
 	"strings"
 )
+
+// istioHistoryConfigYAML renders an exporter config that mirrors the POC's
+// ClickHouse routing-history shape: it watches the POC resource set (Service,
+// Deployment, Istio Gateway, VirtualService) and materialises four version
+// tables (service_versions / deploy_versions / gw_versions / vs_versions) with
+// the same domain/join columns and bloom indexes as poc/route2a/internal/chstore
+// — reproduced purely through history config, with no import of poc code.
+//
+// It exercises all four required aspects in one scenario:
+//   - create table: createSchema:true builds the four tables + bloom indexes.
+//   - type: String / Int64 / Array(String) / encode:kv / encode:json columns.
+//   - filter: the Service history resource keeps only type in (LoadBalancer,NodePort).
+//   - labelSelector: the Gateway watch is narrowed server-side to istio=ingressgateway.
+func istioHistoryConfigYAML(namespace string) string {
+	return fmt.Sprintf(`metricPrefix: "it_"
+
+watch:
+  resources:
+    - kind: Service
+      scope: Namespaced
+      namespaces:
+        - %[1]s
+    - kind: Deployment
+      scope: Namespaced
+      namespaces:
+        - %[1]s
+    - name: Gateway
+      group: networking.istio.io
+      version: v1beta1
+      resource: gateways
+      kind: Gateway
+      scope: Namespaced
+      namespaces:
+        - %[1]s
+      labelSelector: "istio=ingressgateway"
+    - name: VirtualService
+      group: networking.istio.io
+      version: v1beta1
+      resource: virtualservices
+      kind: VirtualService
+      scope: Namespaced
+      namespaces:
+        - %[1]s
+
+rules:
+  - name: "service_info"
+    help: "Trivial rule so the config validates; history is the real subject."
+    anchor: Service
+    labels:
+      namespace:
+        path: "metadata.namespace"
+      service:
+        path: "metadata.name"
+
+history:
+  enabled: true
+  store:
+    type: clickhouse
+    dsn: "clickhouse://default@clickhouse:9000/default"
+    createSchema: true
+    batch:
+      maxRows: 100
+      flushIntervalMs: 200
+  resources:
+    - kind: Service
+      table: service_versions
+      columns:
+        - { name: ingress_ips, type: "Array(String)", path: "status.loadBalancer.ingress[*].ip", index: bloom_filter }
+        - { name: selector_kv, type: "Array(String)", path: "spec.selector", encode: kv }
+        - { name: port, type: "Int64", path: "spec.ports[0].port" }
+        - { name: port_name, type: "String", path: "spec.ports[0].name" }
+        - { name: protocol, type: "String", path: "spec.ports[0].protocol" }
+        - { name: hostname, type: "String", path: "metadata.name" }
+      filters:
+        - { path: "spec.type", op: in, values: ["LoadBalancer", "NodePort"] }
+    - kind: Deployment
+      table: deploy_versions
+      columns:
+        - { name: pod_labels_kv, type: "Array(String)", path: "spec.template.metadata.labels", encode: kv }
+    - kind: Gateway
+      table: gw_versions
+      columns:
+        - { name: selector_kv, type: "Array(String)", path: "spec.selector", encode: kv, index: bloom_filter }
+        - { name: server_hosts, type: "Array(String)", path: "spec.servers[*].hosts[*]" }
+        - { name: spec_json, type: "String", path: "spec", encode: json }
+    - kind: VirtualService
+      table: vs_versions
+      columns:
+        - { name: bound_gateways, type: "Array(String)", path: "spec.gateways[*]" }
+        - { name: spec_json, type: "String", path: "spec", encode: json }
+`, namespace)
+}
 
 // sharedRulesYAML is the integration test rule set for cluster-wide and
 // per-namespace topologies. The "controller_*" labels exercise the

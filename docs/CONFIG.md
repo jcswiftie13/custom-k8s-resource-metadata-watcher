@@ -688,6 +688,113 @@ make bench-collect
 | Owner 鏈解析（`Resolve`） | `pkg/collector/resolver.go` |
 | Scoped informer 群（每 (resource, namespace) 一份 factory） | `pkg/collector/listers.go` |
 | 整合測設定形狀 | `test/integration/e2e/config_yaml.go` |
+| `history`（`StoreConfig`/`HistoryResource`/`HistoryColumn`/`HistoryFilter`）| `pkg/config/config.go` |
+| 欄位/filter 編譯、client 端 filter、事件 handler、spec-hash 去重 | `pkg/history/`（`compiled.go`/`filter.go`/`ingest.go`/`hash.go`）|
+| ClickHouse writer、DDL 產生／驗證、批次寫入 | `pkg/store/`（`store.go`/`ddl.go`/`batch.go`）|
+| 共用抽取介面（`CompileExtract`/`EvaluateExtractAll`/`EvaluateExtractRaw`）| `pkg/collector/extract.go` |
+
+---
+
+## 14. `history`：事件驅動 ClickHouse 版本化儲存
+
+`history` 是**選配、且與 Prometheus scrape 路徑完全解耦**的區塊。啟用後，每個 informer 事件會對宣告的資源
+**append 一筆版本記錄**到 ClickHouse，供「回放到任意過去時間點」的歷史／取證查詢。`history.enabled: false`（或不設）
+時，exporter 行為與原本完全相同。
+
+它重用 `rules` 相同的 path 抽取引擎（`source` + `path` + `fallbacks` + `onMissing`），因此欄位宣告方式與
+label 一致。
+
+### 14.1 頂層結構
+
+```yaml
+history:
+  enabled: true
+  store:
+    type: clickhouse
+    dsn: "clickhouse://host:9000/db"
+    createSchema: true          # dev；prod 預設 false（見 14.4）
+    batch: { maxRows: 5000, flushIntervalMs: 1000 }
+    # --- 身分驗證（皆選填，見 14.6）---
+    username: default
+    passwordEnv: CH_PASSWORD    # 由 k8s Secret 注入的 env 變數（優先於 password）
+    secure: true                # 開啟 TLS
+  resources:
+    - kind: VirtualService      # 必須同時出現在 watch.resources
+      table: vs_versions        # 選填，預設 <kind 小寫>_versions
+      columns: [ ... ]          # 見 14.2
+      filters: [ ... ]          # 見 14.3
+```
+
+### 14.2 `columns`：宣告 ClickHouse 欄位
+
+每個 column = 一個 ClickHouse 欄位 + 其來源 json path（像 tsdb rule）。
+
+| 欄位 | 說明 |
+|------|------|
+| `name` | ClickHouse 欄位名（合法識別字，不可與 envelope 欄位衝突）|
+| `type` | `String` / `Array(String)` / `Int64` / `UInt64` / `Float64` / `Bool` / `DateTime64(3)` |
+| `path` / `source` / `fallbacks` / `onMissing` | 同 `rules` 的 `Extract`；wildcard `[*]` path 產生 `Array(String)` 多值 |
+| `encode` | `""`（scalar）、`json`（把抽出的子樹 marshal 成 JSON 字串，需 `type: String`）、`kv`（把 map 攤平成排序 `k=v`，需 `type: Array(String)`）|
+| `index` | `""` 或 `bloom_filter`（產生 skip index，加速 `has`/`hasAll` 查詢）|
+
+**Envelope 欄位為隱含、每張表都有**（不可重複宣告）：`namespace`、`name`、`uid`、`resource_version`、
+`valid_from`、`deleted`、`spec_hash`、`ingest_seq`。
+
+### 14.3 `filters`：client 端欄位過濾（支援 regex）
+
+除了 `watch.resources` 的 **server 端 `labelSelector`／`fieldSelector`**（只支援 k8s 的 `=`／`in`／`exists`，
+**不支援 regex**）之外，`filters` 可對「watch 回來的任意欄位值」再做一層 **client 端**過濾，**符合才寫入**。
+同一資源的多個 filter 為 **AND**。
+
+| 欄位 | 說明 |
+|------|------|
+| `path` / `source` | 要比對的欄位（同 `Extract`）；wildcard path 採 **match-any** |
+| `op` | `exists` / `equals` / `notEquals` / `prefix` / `suffix` / `contains` / `in` / `regex` |
+| `value` | scalar 運算元（`equals`/`prefix`/`suffix`/`contains`/`regex`）|
+| `values` | `op: in` 的集合 |
+| `negate` | 反轉結果 |
+
+**效能**：regex 用 Go RE2（線性時間、無 catastrophic backtracking）；編譯一次於啟動（壞 pattern 立即 fail）。
+執行時 **非 regex filter 先算、regex 最後**，遇第一個不符即短路；只抽取 filter 引用到的 path。regex **無法**
+下推給 apiserver，只能在此 client 端做——這也是本層存在的原因。
+
+### 14.4 Schema 由誰定義（`createSchema`）
+
+**config 是 schema 的唯一來源**（json path 取出的值無型別，只有 config 知道要對應成什麼 CH 型別）。exporter
+依 config 產生 DDL，行為由 `store.createSchema` 控制：
+
+- `true`（dev）→ `CREATE TABLE IF NOT EXISTS` + 加法式 `ADD COLUMN IF NOT EXISTS`（**永不** drop／改型別）。
+- `false`（**prod 預設**）→ 只查 `system.columns` **驗證**線上 schema 與 config 是否一致，**有偏差就 fail fast、不變更任何東西**。
+
+### 14.5 版本化語意（append-only）
+
+每個事件就是一筆 `INSERT`：`valid_from` 為觀測時間（Add 用 `creationTimestamp`），Delete 寫 `deleted=1` tombstone。
+**不儲存 `valid_to`**——查詢時以「下一版的 `valid_from`」推導（`AsOf(T)` = 最大的 `valid_from ≤ T`）。
+去重分兩層：ingest 端 **spec-hash**（丟棄 resync no-op），CH 端 `ReplacingMergeTree(ingest_seq)` +
+`ORDER BY (namespace, name, valid_from, resource_version, deleted)`（重啟 re-LIST 同版本冪等，且 tombstone 不會
+與其 live 版本碰撞）。
+
+範例完整設定見 `examples/history-clickhouse.yaml`。
+
+### 14.6 身分驗證（`store` 的 auth 欄位）
+
+`dsn` 仍可內嵌帳密（`clickhouse://user:pass@host:9000/db`），但以下**第一級欄位會覆寫** DSN 內嵌值，並提供
+安全的憑證來源。皆為選填；不設就沿用 DSN。
+
+| 欄位 | 說明 |
+|------|------|
+| `username` / `usernameEnv` | 使用者；`usernameEnv` 指定 env 變數名並**優先** |
+| `password` / `passwordEnv` | 密碼；`passwordEnv` 指定 env 變數名並**優先** |
+| `database` | 覆寫目標 database |
+| `token` / `tokenEnv` | JWT／access token（ClickHouse Cloud）；設定時**取代** basic auth |
+| `secure` | 開啟 TLS（ClickHouse Cloud 必需） |
+| `tlsSkipVerify` | 略過 server 憑證驗證（測試／自簽用） |
+
+- **密鑰別放 ConfigMap**：production 用 `passwordEnv`/`tokenEnv`／`usernameEnv` 指向由 **k8s Secret 注入的環境變數**，
+  避免明文落在 ConfigMap；`*Env` 設了但該 env 為空會在啟動時 fail fast。
+- **`token` 與 `username`/`password` 互斥**（JWT 在 `clickhouse-go` 會取代 basic auth）；同時設定會驗證失敗。
+- `secure` 未開時走明文；authenticated ClickHouse（尤其 Cloud）通常需 `secure: true`。
+- 未涵蓋：mTLS client 憑證、LDAP/Kerberos（未來如需再擴充）。
 
 ---
 

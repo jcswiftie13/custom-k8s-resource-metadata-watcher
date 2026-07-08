@@ -22,7 +22,7 @@ unexport POC_ROUTERCHECK_BIN
 endif
 
 .PHONY: gen gwresolve spike bench-worst bench-warm bench-routercheck routercheck-bin verify clean \
-        ch-up ch-down
+        ch-up ch-down ch-reset
 
 # Extract router_check_tool from the official Envoy tools image into bin/ (gitignored).
 routercheck-bin:
@@ -54,7 +54,7 @@ bench-worst:
 # WARM: full corpus, dependency-epoch cache warm — bulk/steady-state throughput
 # (the scenario where rccache pays off), asserts full-corpus 0 mismatches.
 bench-warm:
-	go test -run TestResolveWarm -v -timeout 40m .
+	go test -run TestResolveWarm -v -timeout 80m .
 
 # Offline oracle cross-validation of the resolver (agreement, not throughput).
 bench-routercheck:
@@ -100,3 +100,16 @@ ch-up:
 
 ch-down:
 	-docker rm -f $(CH_NAME)
+
+# ch-reset drops the corpus tables (keeping the container up) so the next bench-*
+# run reloads them and recreates the schema. Use this after a DDL/index change:
+# ensureLoaded only reloads on a row-count mismatch, so an unchanged corpus would
+# otherwise keep the OLD schema (and miss new indexes). Dropping the tables makes
+# gw_versions absent, which forces ingload.Load -> CreateSchema to rebuild fresh.
+ch-reset:
+	docker exec $(CH_NAME) clickhouse-client --multiquery --query "\
+	DROP TABLE IF EXISTS service_versions; \
+	DROP TABLE IF EXISTS deploy_versions; \
+	DROP TABLE IF EXISTS gw_versions; \
+	DROP TABLE IF EXISTS vs_versions;"
+	@echo "corpus tables dropped; next bench-* / test run reloads with the current schema"

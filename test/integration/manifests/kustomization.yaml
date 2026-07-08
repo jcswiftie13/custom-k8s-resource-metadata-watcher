@@ -11,3 +11,8 @@ resources:
   - configmap.yaml
   - exporter-deployment.yaml
   - exporter-service.yaml
+  # ClickHouse sink for the history/ClickHouse write e2e tests. Idle for all
+  # other tests (the default exporter config keeps history disabled).
+  - clickhouse-users.yaml
+  - clickhouse-deployment.yaml
+  - clickhouse-service.yaml

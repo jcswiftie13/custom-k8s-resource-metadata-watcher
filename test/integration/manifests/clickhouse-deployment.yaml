@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse
+  labels:
+    app.kubernetes.io/name: clickhouse-integration
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: clickhouse-integration
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: clickhouse-integration
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:25.5
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: native
+              containerPort: 9000
+              protocol: TCP
+            - name: http
+              containerPort: 8123
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: open-users
+              mountPath: /etc/clickhouse-server/users.d
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/clickhouse
+      volumes:
+        - name: open-users
+          configMap:
+            name: clickhouse-open-users
+        - name: data
+          emptyDir: {}

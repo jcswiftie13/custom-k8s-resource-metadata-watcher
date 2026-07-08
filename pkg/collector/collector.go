@@ -95,6 +95,12 @@ func New(cfg *config.Config, client dynamic.Interface, log *slog.Logger, opts Op
 	return c, nil
 }
 
+// Informers exposes the shared informer set so other subsystems (e.g. the
+// history ingest path) can register event handlers on the same cache before
+// Start is called. Handlers registered after Start miss the initial LIST
+// replay.
+func (c *Collector) Informers() *ScopedInformers { return c.informers }
+
 // Start launches informers, runs a one-shot LIST dry-run for selectors so
 // configuration mistakes surface immediately, and blocks until ctx is
 // cancelled. Start does NOT trigger metric emission; Prometheus pulls via

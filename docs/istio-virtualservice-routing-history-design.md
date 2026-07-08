@@ -228,12 +228,15 @@ CREATE TABLE gw_versions (
 
 
 
-#### Config（純加法）
+#### Config（純加法，**已實作**）
+
+每個資源可**宣告要寫入哪些 ClickHouse 欄位、型別、來源 json path**（像 tsdb rule），並可對 watch 回來的資料
+做 **client 端 filter（支援 regex）**，符合才寫入。完整語法見 [CONFIG.md §14](CONFIG.md)；範例見
+`examples/history-clickhouse.yaml`。
 
 ```yaml
 watch:
   resources:
-    - kind: Pod
     - name: VirtualService
       apiVersion: networking.istio.io/v1beta1
       kind: VirtualService
@@ -246,8 +249,22 @@ history:
   store:
     type: clickhouse
     dsn: "clickhouse://user:pass@host:9000/routing"
-  resources: [VirtualService, DestinationRule, Gateway, Service, EndpointSlice, Deployment]
+    createSchema: true          # dev；prod 預設 false → 只驗證 schema、drift 即 fail
+  resources:
+    - kind: VirtualService
+      table: vs_versions
+      columns:
+        - { name: spec_json, type: String, path: "spec", encode: json }
+        - { name: hosts, type: "Array(String)", path: "spec.hosts[*]" }
+        - { name: bound_gateways, type: "Array(String)", path: "spec.gateways[*]", index: bloom_filter }
+      filters:
+        - { path: "metadata.namespace", op: regex, value: "^(prod|staging)-" }
 ```
+
+**Schema 由 config 定義**（json path 值無型別，型別只能由 config 指定）；`createSchema` 開關控制 dev 自動建表 vs
+prod 驗證-only。**版本化為 append-only**：每事件一筆 `INSERT`（`valid_from`、`deleted`、`ingest_seq`），
+`valid_to` 於查詢時由「下一版 `valid_from`」推導。落地於 `pkg/config`（設定）、`pkg/history`（filter + 事件
+ingest）、`pkg/store`（ClickHouse writer + DDL）。
 
 
 
@@ -394,9 +411,10 @@ POC 落地差異（固定 `http.80`、無 `FakeDiscoveryServer`、sentinel 解�
 
 ## 10. 待實作清單
 
-- [ ] ingest：event handler + ClickHouse writer
-- [ ] `pkg/store` ClickHouse：`Put` / `SetValidTo` / `AsOf(T)` / `Overlap`
-- [ ] watch 新增 GVR：VS/Gateway/DR/Service/EndpointSlice/ingress Deployment
+- [x] ingest：event handler + ClickHouse writer（`pkg/history`）＋設定式欄位/型別/json path＋client 端 regex filter
+- [x] `pkg/store` ClickHouse：append-only writer + DDL 產生/驗證（`EnsureSchema` / `WriteBatch`）
+  - 查詢面 `AsOf(T)` / `Overlap(t0,t1)`（含 `valid_to` 推導）待查詢引擎階段實作
+- [ ] watch 新增 GVR：VS/Gateway/DR/Service/EndpointSlice/ingress Deployment（設定已支援；預設清單待補）
 - [x] POC：引擎 2A、`ResolveAmong`、IP→Gateway 三跳（`poc/route2a`）
 - [ ] 移植 POC `Translator` / `Runner.Resolve` → `pkg/resolve/envoy`
 - [ ] OTEL collector：span IP 優先、DNS lookup processor

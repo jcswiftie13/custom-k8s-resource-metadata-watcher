@@ -20,7 +20,9 @@
       "Bash(POC_GATEWAYS=20 POC_VS=20 POC_A_SAMPLE=200 go test -run TestMatchRouterCheckScale .)",
       "Bash(POC_LOG_QUERIES=1 POC_GATEWAYS=3 POC_VS=3 POC_WORST_SAMPLE=8 go test -run TestResolveSingleWorst -v .)",
       "Bash(python3 -)",
-      "Bash(go get *)"
+      "Bash(go get *)",
+      "Bash(make ch-reset *)",
+      "Bash(docker exec *)"
     ]
   }
 }
