@@ -1,8 +1,8 @@
 // Package mariastore is the MariaDB-backed implementation of store.Store. MariaDB
 // has no array type, so it is the "normalized relational" point of the storage
-// comparison: each selector/label/IP set is a child (junction) table keyed by the
-// version row's globally-unique ingest_seq, and set-containment (ClickHouse
-// has/hasAll) becomes an indexed JOIN + GROUP BY ... HAVING COUNT(DISTINCT ...).
+// comparison: set-containment (ClickHouse has/hasAll) becomes an indexed JOIN +
+// GROUP BY ... HAVING COUNT(DISTINCT ...) over a junction (child) table keyed by
+// the version row's globally-unique ingest_seq.
 //
 //   - membership  has(col, x)      -> JOIN child ON seq WHERE child.val = x
 //   - subset      hasAll(col, sub) -> JOIN child ON seq WHERE child.val IN (sub)
@@ -10,6 +10,18 @@
 //     (|sub| is a query constant; for hop3 the
 //     constant is the gateway's own selector size,
 //     stored as gw_versions.sel_count)
+//
+// Hybrid layout — a junction table is an inverted index, worth its cost only for
+// a set that is SEARCHED by containment; a set that is merely RETRIEVED by a
+// known key is cheaper as a JSON column on the main row (one read, no join):
+//
+//   - ingress_ip, deploy pod_labels, gw selector, vs bound_gateways -> SEARCHED
+//     (hop1/hop2/hop3/ScopedFor) => junction child table (indexed).
+//   - service selector -> only RETRIEVED (as hop2's query) => JSON on the main
+//     row; folded into hop1's join, so hop1 needs no second lookup.
+//   - deploy pod_labels -> SEARCHED (hop2) AND RETRIEVED (feeds hop3) => BOTH: a
+//     junction table for the subset search plus a JSON copy on the main row,
+//     returned by the hop2 GROUP BY so hop2 needs no second lookup either.
 //
 // Bitemporal versions coexist as rows with distinct valid_from; the
 // `valid_from <= T < valid_to` predicate selects the one live at T. The corpus is
@@ -75,7 +87,6 @@ func (s *Store) Close() error { return s.db.Close() }
 // joins. Version tables carry a (namespace,name,valid_from) btree for the
 // bitemporal predicate.
 var ddl = []string{
-	`DROP TABLE IF EXISTS service_selector_kv`,
 	`DROP TABLE IF EXISTS service_ingress_ip`,
 	`DROP TABLE IF EXISTS service_versions`,
 	`DROP TABLE IF EXISTS deploy_pod_labels_kv`,
@@ -84,18 +95,21 @@ var ddl = []string{
 	`DROP TABLE IF EXISTS gw_versions`,
 	`DROP TABLE IF EXISTS vs_bound_gateway`,
 	`DROP TABLE IF EXISTS vs_versions`,
+	`DROP TABLE IF EXISTS service_selector_kv`, // legacy (pre-hybrid): now a JSON column
 
+	// service selector is retrieve-only -> JSON column on the main row (no child).
 	`CREATE TABLE service_versions (
-		ingest_seq BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-		namespace  VARCHAR(255) NOT NULL,
-		name       VARCHAR(255) NOT NULL,
-		valid_from DATETIME(3)  NOT NULL,
-		valid_to   DATETIME(3)  NOT NULL,
-		rev        INT          NOT NULL,
-		hostname   VARCHAR(255) NOT NULL DEFAULT '',
-		port       INT          NOT NULL DEFAULT 0,
-		port_name  VARCHAR(64)  NOT NULL DEFAULT '',
-		protocol   VARCHAR(32)  NOT NULL DEFAULT '',
+		ingest_seq  BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+		namespace   VARCHAR(255) NOT NULL,
+		name        VARCHAR(255) NOT NULL,
+		valid_from  DATETIME(3)  NOT NULL,
+		valid_to    DATETIME(3)  NOT NULL,
+		rev         INT          NOT NULL,
+		selector_kv JSON         NOT NULL,
+		hostname    VARCHAR(255) NOT NULL DEFAULT '',
+		port        INT          NOT NULL DEFAULT 0,
+		port_name   VARCHAR(64)  NOT NULL DEFAULT '',
+		protocol    VARCHAR(32)  NOT NULL DEFAULT '',
 		KEY k_svc_nnv (namespace, name, valid_from),
 		KEY k_svc_host (namespace, hostname, valid_from)
 	)`,
@@ -104,19 +118,17 @@ var ddl = []string{
 		ip  VARCHAR(64) NOT NULL,
 		KEY k_sii_ip (ip), KEY k_sii_seq (seq)
 	)`,
-	`CREATE TABLE service_selector_kv (
-		seq BIGINT UNSIGNED NOT NULL,
-		kv  VARCHAR(255) NOT NULL,
-		KEY k_ssk_seq (seq), KEY k_ssk_kv (kv)
-	)`,
 
+	// deploy pod_labels is searched (hop2) AND retrieved (feeds hop3): junction
+	// child for the subset search + a JSON copy on the main row for retrieval.
 	`CREATE TABLE deploy_versions (
-		ingest_seq BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-		namespace  VARCHAR(255) NOT NULL,
-		name       VARCHAR(255) NOT NULL,
-		valid_from DATETIME(3)  NOT NULL,
-		valid_to   DATETIME(3)  NOT NULL,
-		rev        INT          NOT NULL,
+		ingest_seq    BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+		namespace     VARCHAR(255) NOT NULL,
+		name          VARCHAR(255) NOT NULL,
+		valid_from    DATETIME(3)  NOT NULL,
+		valid_to      DATETIME(3)  NOT NULL,
+		rev           INT          NOT NULL,
+		pod_labels_kv JSON         NOT NULL,
 		KEY k_dep_nnv (namespace, name, valid_from)
 	)`,
 	`CREATE TABLE deploy_pod_labels_kv (
@@ -223,20 +235,24 @@ func (b *insertBuf) flush() error {
 	return nil
 }
 
-type serviceBatch struct{ main, ips, sel *insertBuf }
+type serviceBatch struct{ main, ips *insertBuf }
 type deployBatch struct{ main, pod *insertBuf }
 type gwBatch struct{ main, sel *insertBuf }
 type vsBatch struct{ main, bound *insertBuf }
 
 func (s *Store) NewServiceBatch(ctx context.Context) (store.ServiceBatch, error) {
 	return &serviceBatch{
-		main: s.newInsertBuf(ctx, "service_versions", []string{"ingest_seq", "namespace", "name", "valid_from", "valid_to", "rev", "hostname", "port", "port_name", "protocol"}),
+		main: s.newInsertBuf(ctx, "service_versions", []string{"ingest_seq", "namespace", "name", "valid_from", "valid_to", "rev", "selector_kv", "hostname", "port", "port_name", "protocol"}),
 		ips:  s.newInsertBuf(ctx, "service_ingress_ip", []string{"seq", "ip"}),
-		sel:  s.newInsertBuf(ctx, "service_selector_kv", []string{"seq", "kv"}),
 	}, nil
 }
 func (b *serviceBatch) Append(r store.ServiceRow) error {
-	if err := b.main.add(r.IngestSeq, r.Namespace, r.Name, r.ValidFrom, r.ValidTo, r.Rev, r.Hostname, r.Port, r.PortName, r.Protocol); err != nil {
+	// selector is retrieve-only -> JSON column on the main row (no child table).
+	selJSON, err := marshalKV(r.Selector)
+	if err != nil {
+		return err
+	}
+	if err := b.main.add(r.IngestSeq, r.Namespace, r.Name, r.ValidFrom, r.ValidTo, r.Rev, selJSON, r.Hostname, r.Port, r.PortName, r.Protocol); err != nil {
 		return err
 	}
 	for _, ip := range r.IngressIPs {
@@ -244,23 +260,24 @@ func (b *serviceBatch) Append(r store.ServiceRow) error {
 			return err
 		}
 	}
-	for _, kv := range r.Selector {
-		if err := b.sel.add(r.IngestSeq, kv); err != nil {
-			return err
-		}
-	}
 	return nil
 }
-func (b *serviceBatch) Close() error { return flushAll(b.main, b.ips, b.sel) }
+func (b *serviceBatch) Close() error { return flushAll(b.main, b.ips) }
 
 func (s *Store) NewDeployBatch(ctx context.Context) (store.DeployBatch, error) {
 	return &deployBatch{
-		main: s.newInsertBuf(ctx, "deploy_versions", []string{"ingest_seq", "namespace", "name", "valid_from", "valid_to", "rev"}),
+		main: s.newInsertBuf(ctx, "deploy_versions", []string{"ingest_seq", "namespace", "name", "valid_from", "valid_to", "rev", "pod_labels_kv"}),
 		pod:  s.newInsertBuf(ctx, "deploy_pod_labels_kv", []string{"seq", "kv"}),
 	}, nil
 }
 func (b *deployBatch) Append(ns, name string, from, to time.Time, rev uint32, podLabels []string, seq uint64) error {
-	if err := b.main.add(seq, ns, name, from, to, rev); err != nil {
+	// pod_labels is searched (hop2, junction) AND retrieved (hop3): write BOTH a
+	// JSON copy on the main row and the child rows for the subset search.
+	podJSON, err := marshalKV(podLabels)
+	if err != nil {
+		return err
+	}
+	if err := b.main.add(seq, ns, name, from, to, rev, podJSON); err != nil {
 		return err
 	}
 	for _, kv := range podLabels {
@@ -271,6 +288,19 @@ func (b *deployBatch) Append(ns, name string, from, to time.Time, rev uint32, po
 	return nil
 }
 func (b *deployBatch) Close() error { return flushAll(b.main, b.pod) }
+
+// marshalKV encodes a kv set as a JSON array string for a retrieve-only column
+// (nil marshals to "[]", never SQL NULL, so the JSON NOT NULL column is happy).
+func marshalKV(kv []string) (string, error) {
+	if kv == nil {
+		kv = []string{}
+	}
+	b, err := json.Marshal(kv)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
 
 func (s *Store) NewGwBatch(ctx context.Context) (store.GwBatch, error) {
 	return &gwBatch{
@@ -341,44 +371,47 @@ func inClause(vals []string) (string, []any) {
 // (see store.Store), using junction-table joins with GROUP BY ... HAVING COUNT to
 // evaluate the set-containment hops.
 func (s *Store) ResolveIPToGateways(ctx context.Context, ip string, t time.Time) ([]store.GatewayCand, error) {
-	// Hop 1: IP -> ingress Service (its seq + namespace), then load its selector.
-	var svcSeq uint64
+	// Hop 1: IP -> ingress Service. The selector is a JSON column on the main row,
+	// so the ip join returns it inline (no second lookup).
 	var svcNS string
+	var svcSelJSON []byte
 	err := s.db.QueryRowContext(ctx,
-		`SELECT s.ingest_seq, s.namespace
+		`SELECT s.namespace, s.selector_kv
 		 FROM service_versions s JOIN service_ingress_ip i ON i.seq = s.ingest_seq
 		 WHERE i.ip = ? AND s.valid_from <= ? AND ? < s.valid_to
 		 ORDER BY s.ingest_seq DESC LIMIT 1`,
-		ip, t, t).Scan(&svcSeq, &svcNS)
+		ip, t, t).Scan(&svcNS, &svcSelJSON)
 	if err == sql.ErrNoRows {
 		return nil, nil // no ingress serves this IP -> traffic miss
 	}
 	if err != nil {
 		return nil, fmt.Errorf("hop1 (ip->service): %w", err)
 	}
-	svcSel, err := s.kvSet(ctx, "service_selector_kv", svcSeq)
+	svcSel, err := unmarshalKV(svcSelJSON)
 	if err != nil {
 		return nil, fmt.Errorf("hop1 selector: %w", err)
 	}
 
 	// Hop 2: Service selector -> ingress Deployment (svc.selector ⊆ pod_labels L).
+	// The junction table drives the subset search; the deployment's full pod_labels
+	// (needed for hop3) come back inline from the main row's JSON column.
 	inSel, selArgs := inClause(svcSel)
 	args := append([]any{svcNS, t, t}, selArgs...)
 	args = append(args, len(svcSel))
-	var depSeq uint64
+	var podJSON []byte
 	err = s.db.QueryRowContext(ctx,
-		`SELECT d.ingest_seq
+		`SELECT d.pod_labels_kv
 		 FROM deploy_versions d JOIN deploy_pod_labels_kv l ON l.seq = d.ingest_seq
 		 WHERE d.namespace = ? AND d.valid_from <= ? AND ? < d.valid_to AND l.kv IN `+inSel+`
 		 GROUP BY d.ingest_seq HAVING COUNT(DISTINCT l.kv) = ? LIMIT 1`,
-		args...).Scan(&depSeq)
+		args...).Scan(&podJSON)
 	if err == sql.ErrNoRows {
 		return nil, nil // ingress workload not found -> miss
 	}
 	if err != nil {
 		return nil, fmt.Errorf("hop2 (service->deployment L): %w", err)
 	}
-	podLabels, err := s.kvSet(ctx, "deploy_pod_labels_kv", depSeq)
+	podLabels, err := unmarshalKV(podJSON)
 	if err != nil {
 		return nil, fmt.Errorf("hop2 pod labels: %w", err)
 	}
@@ -415,22 +448,17 @@ func (s *Store) ResolveIPToGateways(ctx context.Context, ip string, t time.Time)
 	return cands, rows.Err()
 }
 
-// kvSet loads all kv values of one junction row (child table keyed by seq).
-func (s *Store) kvSet(ctx context.Context, table string, seq uint64) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT kv FROM "+table+" WHERE seq = ?", seq)
-	if err != nil {
+// unmarshalKV decodes a JSON-array kv column (selector_kv / pod_labels_kv) into a
+// slice. A NULL/empty column decodes to an empty slice.
+func unmarshalKV(js []byte) ([]string, error) {
+	if len(js) == 0 {
+		return nil, nil
+	}
+	var out []string
+	if err := json.Unmarshal(js, &out); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var kv string
-		if err := rows.Scan(&kv); err != nil {
-			return nil, err
-		}
-		out = append(out, kv)
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ScopedFor rebuilds one gateway's translate input from MariaDB at time t: its

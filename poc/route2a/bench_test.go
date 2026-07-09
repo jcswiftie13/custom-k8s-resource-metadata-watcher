@@ -134,8 +134,8 @@ func benchVersions() ingload.Versions {
 		Deploy: envInt("POC_VER_DEPLOY", 1),
 		Svc:    envInt("POC_VER_SVC", 1),
 		Gw:     envInt("POC_VER_GW", 1),
-		VS:     envInt("POC_VER_VS", 1),
-		KSvc:   envInt("POC_VER_KSVC", 1),
+		VS:     envInt("POC_VER_VS", 10),
+		KSvc:   envInt("POC_VER_KSVC", 10),
 	}
 }
 

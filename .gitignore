@@ -4,3 +4,4 @@ vendor/
 *.test
 *.out
 .DS_Store
+out/

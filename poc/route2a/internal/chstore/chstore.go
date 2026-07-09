@@ -240,7 +240,7 @@ func (s *Store) ResolveIPToGateways(ctx context.Context, ip string, t time.Time)
 	var svcNS string
 	var svcSel []string
 	err := s.conn.QueryRow(ctx,
-		`SELECT namespace, selector_kv FROM service_versions FINAL
+		`SELECT namespace, selector_kv FROM service_versions
 		 WHERE has(ingress_ips, ?) AND valid_from <= ? AND ? < valid_to LIMIT 1`,
 		ip, t, t).Scan(&svcNS, &svcSel)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -253,7 +253,7 @@ func (s *Store) ResolveIPToGateways(ctx context.Context, ip string, t time.Time)
 	// Hop 2: Service selector -> ingress Deployment pod labels L (svc.selector ⊆ L).
 	var podLabels []string
 	err = s.conn.QueryRow(ctx,
-		`SELECT pod_labels_kv FROM deploy_versions FINAL
+		`SELECT pod_labels_kv FROM deploy_versions
 		 WHERE namespace = ? AND hasAll(pod_labels_kv, ?) AND valid_from <= ? AND ? < valid_to LIMIT 1`,
 		svcNS, svcSel, t, t).Scan(&podLabels)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -265,7 +265,7 @@ func (s *Store) ResolveIPToGateways(ctx context.Context, ip string, t time.Time)
 
 	// Hop 3: L -> candidate gateways (gateway.selector ⊆ L).
 	rows, err := s.conn.Query(ctx,
-		`SELECT namespace, name, server_hosts FROM gw_versions FINAL
+		`SELECT namespace, name, server_hosts FROM gw_versions
 		 WHERE hasAll(?, selector_kv) AND valid_from <= ? AND ? < valid_to`,
 		podLabels, t, t)
 	if err != nil {
@@ -292,7 +292,7 @@ func (s *Store) ScopedFor(ctx context.Context, gwName string, t time.Time) (tran
 	// Gateway CR (1 current version).
 	var gwNS, gwJSON string
 	err := s.conn.QueryRow(ctx,
-		`SELECT namespace, spec_json FROM gw_versions FINAL
+		`SELECT namespace, spec_json FROM gw_versions 
 		 WHERE name = ? AND valid_from <= ? AND ? < valid_to LIMIT 1`,
 		gwName, t, t).Scan(&gwNS, &gwJSON)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -312,7 +312,7 @@ func (s *Store) ScopedFor(ctx context.Context, gwName string, t time.Time) (tran
 
 	// Bound VirtualServices (each 1 current version).
 	vsRows, err := s.conn.Query(ctx,
-		`SELECT namespace, name, spec_json FROM vs_versions FINAL
+		`SELECT namespace, name, spec_json FROM vs_versions 
 		 WHERE has(bound_gateways, ?) AND valid_from <= ? AND ? < valid_to`,
 		gwNS+"/"+gwName, t, t)
 	if err != nil {
@@ -356,7 +356,7 @@ func (s *Store) ScopedFor(ctx context.Context, gwName string, t time.Time) (tran
 // generator can build clusters for them.
 func (s *Store) backendServices(ctx context.Context, ns string, t time.Time) ([]*model.Service, error) {
 	rows, err := s.conn.Query(ctx,
-		`SELECT hostname, port, port_name FROM service_versions FINAL
+		`SELECT hostname, port, port_name FROM service_versions
 		 WHERE namespace = ? AND hostname != '' AND valid_from <= ? AND ? < valid_to`,
 		ns, t, t)
 	if err != nil {
@@ -392,7 +392,7 @@ func (s *Store) CountRows(ctx context.Context, table string) (uint64, error) {
 func (s *Store) AsOfRev(ctx context.Context, table, ns, name string, t time.Time) (uint32, bool, error) {
 	var rev uint32
 	err := s.conn.QueryRow(ctx,
-		"SELECT rev FROM "+table+" FINAL WHERE namespace = ? AND name = ? AND valid_from <= ? AND ? < valid_to LIMIT 1",
+		"SELECT rev FROM "+table+" WHERE namespace = ? AND name = ? AND valid_from <= ? AND ? < valid_to LIMIT 1",
 		ns, name, t, t).Scan(&rev)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
