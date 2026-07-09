@@ -5,6 +5,8 @@ go 1.25.5
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.47.0
 	github.com/envoyproxy/go-control-plane/envoy v1.36.0
+	github.com/go-sql-driver/mysql v1.8.1
+	github.com/jackc/pgx/v5 v5.7.2
 	google.golang.org/protobuf v1.36.10
 	istio.io/api v1.26.0-beta.0
 	istio.io/istio v0.0.0-20250506181944-c2e9871f340c
@@ -14,6 +16,7 @@ require (
 	cel.dev/expr v0.24.0 // indirect
 	cloud.google.com/go/compute/metadata v0.7.0 // indirect
 	dario.cat/mergo v1.0.2 // indirect
+	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/ClickHouse/ch-go v0.73.0 // indirect
 	github.com/Masterminds/goutils v1.1.1 // indirect
 	github.com/Masterminds/semver/v3 v3.3.1 // indirect
@@ -61,6 +64,9 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/huandu/xstrings v1.5.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect

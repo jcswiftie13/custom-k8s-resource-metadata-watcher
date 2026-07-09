@@ -34,54 +34,13 @@ import (
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
 
+	"github.com/example/metadata-exporter/poc/route2a/internal/store"
 	"github.com/example/metadata-exporter/poc/route2a/internal/translate"
 )
 
 // insertChunk bounds how many rows buffer client-side before a Send (the backend
 // service table is ~24M rows, so streaming in chunks keeps memory flat).
 const insertChunk = 100_000
-
-// farFuture is the open-ended `valid_to` sentinel for the current version. It
-// stays within ClickHouse DateTime64 range (max year 2299), unlike a literal
-// '2999', while being comfortably after any query time.
-var farFuture = time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)
-
-// versionBase/versionStep lay the K versions on a fixed early timeline so the
-// open (last) version is the only one live at "now".
-var versionBase = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-
-const versionStep = time.Hour
-
-// Version is one bitemporal slice of a resource.
-type Version struct {
-	Rev  int
-	From time.Time
-	To   time.Time
-}
-
-// Versions returns k contiguous, non-overlapping versions; the last is open
-// (To = farFuture = current).
-func Versions(k int) []Version {
-	if k < 1 {
-		k = 1
-	}
-	out := make([]Version, k)
-	for v := 0; v < k; v++ {
-		from := versionBase.Add(time.Duration(v) * versionStep)
-		to := versionBase.Add(time.Duration(v+1) * versionStep)
-		if v == k-1 {
-			to = farFuture
-		}
-		out[v] = Version{Rev: v, From: from, To: to}
-	}
-	return out
-}
-
-// VersionMidTime returns a timestamp inside version v's interval — used by the
-// multi-version AsOf verification to target a specific past version.
-func VersionMidTime(v int) time.Time {
-	return versionBase.Add(time.Duration(v)*versionStep + versionStep/2)
-}
 
 // Store wraps a ClickHouse connection.
 type Store struct{ conn driver.Conn }
@@ -106,6 +65,11 @@ func (s *Store) Close() error { return s.conn.Close() }
 // ddl is the four version tables. Selector/label/IP join keys are Array(String)
 // so `has`/`hasAll` compare them directly; spec_json carries the full proto for
 // gateways/VS reconstruction.
+//
+// Scale-out direction (not built here — this PoC benchmarks single node): swap
+// ReplacingMergeTree for ReplicatedReplacingMergeTree and front the tables with a
+// Distributed engine sharded by e.g. cityHash64(namespace, name); every read is
+// already namespace/name-scoped so the 3-hop stays shard-local.
 var ddl = []string{
 	`DROP TABLE IF EXISTS service_versions`,
 	`DROP TABLE IF EXISTS deploy_versions`,
@@ -219,36 +183,24 @@ func (bt *batch) flush() error {
 	return nil
 }
 
-// ServiceRow is one service_versions row (ingress LB: ingress_ips/selector set,
-// hostname empty; backend: hostname/port set, ingress_ips empty).
-type ServiceRow struct {
-	Namespace, Name      string
-	ValidFrom, ValidTo   time.Time
-	Rev                  uint32
-	IngressIPs, Selector []string
-	Hostname             string
-	Port                 uint32
-	PortName, Protocol   string
-	IngestSeq            uint64
-}
-
-// ServiceBatch / DeployBatch / GwBatch / VSBatch are typed, auto-chunked inserters.
+// ServiceBatch / DeployBatch / GwBatch / VSBatch are typed, auto-chunked
+// inserters satisfying the store.*Batch interfaces.
 type ServiceBatch struct{ *batch }
 type DeployBatch struct{ *batch }
 type GwBatch struct{ *batch }
 type VSBatch struct{ *batch }
 
-func (s *Store) NewServiceBatch(ctx context.Context) (*ServiceBatch, error) {
+func (s *Store) NewServiceBatch(ctx context.Context) (store.ServiceBatch, error) {
 	b, err := s.openBatch(ctx, "service_versions")
 	return &ServiceBatch{b}, err
 }
-func (b *ServiceBatch) Append(r ServiceRow) error {
+func (b *ServiceBatch) Append(r store.ServiceRow) error {
 	return b.append(r.Namespace, r.Name, r.ValidFrom, r.ValidTo, r.Rev,
 		r.IngressIPs, r.Selector, r.Hostname, r.Port, r.PortName, r.Protocol, r.IngestSeq)
 }
 func (b *ServiceBatch) Close() error { return b.flush() }
 
-func (s *Store) NewDeployBatch(ctx context.Context) (*DeployBatch, error) {
+func (s *Store) NewDeployBatch(ctx context.Context) (store.DeployBatch, error) {
 	b, err := s.openBatch(ctx, "deploy_versions")
 	return &DeployBatch{b}, err
 }
@@ -259,7 +211,7 @@ func (b *DeployBatch) Append(ns, name string, from, to time.Time, rev uint32, po
 }
 func (b *DeployBatch) Close() error { return b.flush() }
 
-func (s *Store) NewGwBatch(ctx context.Context) (*GwBatch, error) {
+func (s *Store) NewGwBatch(ctx context.Context) (store.GwBatch, error) {
 	b, err := s.openBatch(ctx, "gw_versions")
 	return &GwBatch{b}, err
 }
@@ -268,7 +220,7 @@ func (b *GwBatch) Append(ns, name string, from, to time.Time, rev uint32, select
 }
 func (b *GwBatch) Close() error { return b.flush() }
 
-func (s *Store) NewVSBatch(ctx context.Context) (*VSBatch, error) {
+func (s *Store) NewVSBatch(ctx context.Context) (store.VSBatch, error) {
 	b, err := s.openBatch(ctx, "vs_versions")
 	return &VSBatch{b}, err
 }
@@ -279,19 +231,11 @@ func (b *VSBatch) Close() error { return b.flush() }
 
 // ---- queries ----
 
-// GatewayCand is one candidate gateway from the 3-hop (name + server host
-// patterns, enough to build a gwresolve.Gateway).
-type GatewayCand struct {
-	Namespace   string
-	Name        string
-	ServerHosts []string
-}
-
 // ResolveIPToGateways runs the 3-hop selector join for a destination IP at time
 // t: IP -> ingress Service (selector) -> ingress Deployment pod labels L ->
 // gateways whose selector ⊆ L. Returns the candidate gateways ("" candidates =>
 // traffic miss). Each hop is a narrow, version-filtered query (no cross product).
-func (s *Store) ResolveIPToGateways(ctx context.Context, ip string, t time.Time) ([]GatewayCand, error) {
+func (s *Store) ResolveIPToGateways(ctx context.Context, ip string, t time.Time) ([]store.GatewayCand, error) {
 	// Hop 1: IP -> ingress Service (its namespace + selector).
 	var svcNS string
 	var svcSel []string
@@ -329,9 +273,9 @@ func (s *Store) ResolveIPToGateways(ctx context.Context, ip string, t time.Time)
 	}
 	defer rows.Close()
 
-	var cands []GatewayCand
+	var cands []store.GatewayCand
 	for rows.Next() {
-		var c GatewayCand
+		var c store.GatewayCand
 		if err := rows.Scan(&c.Namespace, &c.Name, &c.ServerHosts); err != nil {
 			return nil, err
 		}

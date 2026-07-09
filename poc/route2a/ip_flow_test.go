@@ -5,13 +5,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/metadata-exporter/poc/route2a/internal/chstore"
 	"github.com/example/metadata-exporter/poc/route2a/internal/gwresolve"
 	"github.com/example/metadata-exporter/poc/route2a/internal/ingload"
 	"github.com/example/metadata-exporter/poc/route2a/internal/matchcheck"
 	"github.com/example/metadata-exporter/poc/route2a/internal/rccache"
 	"github.com/example/metadata-exporter/poc/route2a/internal/scalegen"
 	"github.com/example/metadata-exporter/poc/route2a/internal/simulate"
+	"github.com/example/metadata-exporter/poc/route2a/internal/store"
 	"github.com/example/metadata-exporter/poc/route2a/internal/translate"
 )
 
@@ -22,20 +22,16 @@ import (
 // IP -> gateway -> translate(from ClickHouse) -> cluster pipeline against the
 // oracle. Skips cleanly when ClickHouse is unreachable.
 func TestIPFlowClickHouse(t *testing.T) {
-	addr := envOr("POC_CH_ADDR", "127.0.0.1:9000")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	store, err := chstore.Open(ctx, addr)
-	if err != nil {
-		t.Skipf("ClickHouse not reachable at %s (%v); skipping. Start it with `make ch-up`.", addr, err)
-	}
-	defer store.Close()
+	st := requireStore(ctx, t)
+	defer st.Close()
 
 	// Small, fast corpus (still exercises multi-version depth).
 	gen := scalegen.New(scalegen.Config{NumGateways: 20, VSPerGW: 5})
 	vers := ingload.Versions{Deploy: 2, Svc: 2, Gw: 2, VS: 3, KSvc: 3}
-	if err := ingload.Load(ctx, store, gen, vers, nil); err != nil {
+	if err := ingload.Load(ctx, st, gen, vers, nil); err != nil {
 		t.Fatalf("load corpus: %v", err)
 	}
 	now := time.Now().UTC()
@@ -43,7 +39,7 @@ func TestIPFlowClickHouse(t *testing.T) {
 	// (1) 3-hop IP->Gateway == oracle, and unique (single candidate).
 	for i := 0; i < gen.NumGateways(); i++ {
 		ip := scalegen.IPForGateway(i)
-		cands, err := store.ResolveIPToGateways(ctx, ip, now)
+		cands, err := st.ResolveIPToGateways(ctx, ip, now)
 		if err != nil {
 			t.Fatalf("3-hop ip=%s: %v", ip, err)
 		}
@@ -56,7 +52,7 @@ func TestIPFlowClickHouse(t *testing.T) {
 	// (2) Multi-version AsOf: version live at VersionMidTime(v) has rev==v.
 	gw0 := scalegen.GatewayName(0)
 	for v := 0; v < vers.Gw; v++ {
-		rev, ok, err := store.AsOfRev(ctx, "gw_versions", scalegen.GatewayNamespace(), gw0, chstore.VersionMidTime(v))
+		rev, ok, err := st.AsOfRev(ctx, "gw_versions", scalegen.GatewayNamespace(), gw0, store.VersionMidTime(v))
 		if err != nil {
 			t.Fatalf("AsOfRev v=%d: %v", v, err)
 		}
@@ -65,7 +61,7 @@ func TestIPFlowClickHouse(t *testing.T) {
 		}
 	}
 	// And at now the open (last) version is selected.
-	if rev, ok, _ := store.AsOfRev(ctx, "gw_versions", scalegen.GatewayNamespace(), gw0, now); !ok || int(rev) != vers.Gw-1 {
+	if rev, ok, _ := st.AsOfRev(ctx, "gw_versions", scalegen.GatewayNamespace(), gw0, now); !ok || int(rev) != vers.Gw-1 {
 		t.Fatalf("AsOfRev now: got rev=%d ok=%v, want rev=%d (open)", rev, ok, vers.Gw-1)
 	}
 
@@ -83,7 +79,7 @@ func TestIPFlowClickHouse(t *testing.T) {
 		if !ok {
 			t.Fatalf("IPForHost(%s) failed", c.Host)
 		}
-		cands, err := store.ResolveIPToGateways(ctx, ip, now)
+		cands, err := st.ResolveIPToGateways(ctx, ip, now)
 		if err != nil {
 			t.Fatalf("3-hop %s: %v", ip, err)
 		}
@@ -93,7 +89,7 @@ func TestIPFlowClickHouse(t *testing.T) {
 			Cache:      rccache.New(rccache.ColdAlways, rccache.NewDepIndex()),
 			Translator: translate.NewTranslator(),
 			ScopedFor: func(gw string) (translate.ScopedInput, bool) {
-				in, ok, err := store.ScopedFor(ctx, gw, now)
+				in, ok, err := st.ScopedFor(ctx, gw, now)
 				if err != nil {
 					t.Errorf("ScopedFor %s: %v", gw, err)
 					return translate.ScopedInput{}, false
@@ -115,7 +111,7 @@ func TestIPFlowClickHouse(t *testing.T) {
 	}
 }
 
-func candNames(cands []chstore.GatewayCand) []string {
+func candNames(cands []store.GatewayCand) []string {
 	out := make([]string, len(cands))
 	for i, c := range cands {
 		out[i] = c.Name
@@ -123,7 +119,7 @@ func candNames(cands []chstore.GatewayCand) []string {
 	return out
 }
 
-func candGateways(cands []chstore.GatewayCand) []gwresolve.Gateway {
+func candGateways(cands []store.GatewayCand) []gwresolve.Gateway {
 	out := make([]gwresolve.Gateway, len(cands))
 	for i, c := range cands {
 		out[i] = gwresolve.Gateway{Name: c.Name, Hosts: c.ServerHosts}

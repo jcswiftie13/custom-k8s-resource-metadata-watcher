@@ -1,7 +1,8 @@
 // Package ingload generates the ingress-traffic corpus from scalegen and streams
-// it into ClickHouse as multi-version rows. It is the single loader shared by
-// cmd/ipflow (-mode=load) and the end-to-end test, so the "program-generated,
-// never hand-written SQL" test data is produced in exactly one place.
+// it into a store.Store (ClickHouse / PostgreSQL / MariaDB) as multi-version
+// rows. It is the single loader shared by cmd/ipflow (-mode=load) and the
+// end-to-end test, so the "program-generated, never hand-written SQL" test data
+// is produced in exactly one place, backend-agnostic.
 package ingload
 
 import (
@@ -12,8 +13,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"istio.io/istio/pkg/config"
 
-	"github.com/example/metadata-exporter/poc/route2a/internal/chstore"
 	"github.com/example/metadata-exporter/poc/route2a/internal/scalegen"
+	"github.com/example/metadata-exporter/poc/route2a/internal/store"
 )
 
 // Versions holds the per-resource-type version counts (bitemporal depth).
@@ -28,9 +29,9 @@ func DefaultVersions() Versions { return Versions{Deploy: 2, Svc: 2, Gw: 2, VS: 
 // Progress is an optional per-gateway progress callback (nil = silent).
 type Progress func(done, total int)
 
-// Load (re)creates the schema and streams the whole corpus into ClickHouse.
-func Load(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, v Versions, prog Progress) error {
-	if err := store.CreateSchema(ctx); err != nil {
+// Load (re)creates the schema and streams the whole corpus into the store.
+func Load(ctx context.Context, st store.Store, gen *scalegen.Gen, v Versions, prog Progress) error {
+	if err := st.CreateSchema(ctx); err != nil {
 		return err
 	}
 
@@ -38,19 +39,19 @@ func Load(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, v Versio
 	next := func() uint64 { seq++; return seq }
 	empty := []string{}
 
-	svcB, err := store.NewServiceBatch(ctx)
+	svcB, err := st.NewServiceBatch(ctx)
 	if err != nil {
 		return err
 	}
-	depB, err := store.NewDeployBatch(ctx)
+	depB, err := st.NewDeployBatch(ctx)
 	if err != nil {
 		return err
 	}
-	gwB, err := store.NewGwBatch(ctx)
+	gwB, err := st.NewGwBatch(ctx)
 	if err != nil {
 		return err
 	}
-	vsB, err := store.NewVSBatch(ctx)
+	vsB, err := st.NewVSBatch(ctx)
 	if err != nil {
 		return err
 	}
@@ -60,8 +61,8 @@ func Load(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, v Versio
 		// ingress LB Service.
 		svc := gen.IngressService(i)
 		sel := scalegen.SortedKV(svc.Selector)
-		for _, ver := range chstore.Versions(v.Svc) {
-			if err := svcB.Append(chstore.ServiceRow{
+		for _, ver := range store.Versions(v.Svc) {
+			if err := svcB.Append(store.ServiceRow{
 				Namespace: svc.Namespace, Name: svc.Name, ValidFrom: ver.From, ValidTo: ver.To, Rev: uint32(ver.Rev),
 				IngressIPs: []string{svc.IP}, Selector: sel, IngestSeq: next(),
 			}); err != nil {
@@ -70,8 +71,8 @@ func Load(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, v Versio
 		}
 		// backend destination Services.
 		for _, bs := range gen.BackendServices(i) {
-			for _, ver := range chstore.Versions(v.KSvc) {
-				if err := svcB.Append(chstore.ServiceRow{
+			for _, ver := range store.Versions(v.KSvc) {
+				if err := svcB.Append(store.ServiceRow{
 					Namespace: bs.Namespace, Name: bs.Name, ValidFrom: ver.From, ValidTo: ver.To, Rev: uint32(ver.Rev),
 					IngressIPs: empty, Selector: empty, Hostname: bs.Hostname, Port: uint32(bs.Port),
 					PortName: bs.PortName, Protocol: bs.Protocol, IngestSeq: next(),
@@ -83,7 +84,7 @@ func Load(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, v Versio
 		// ingress workload Deployment.
 		dep := gen.IngressDeployment(i)
 		pod := scalegen.SortedKV(dep.PodLabels)
-		for _, ver := range chstore.Versions(v.Deploy) {
+		for _, ver := range store.Versions(v.Deploy) {
 			if err := depB.Append(dep.Namespace, dep.Name, ver.From, ver.To, uint32(ver.Rev), pod, next()); err != nil {
 				return err
 			}
@@ -95,7 +96,7 @@ func Load(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, v Versio
 		}
 		gwSel := scalegen.SortedKV(gen.GatewaySelector(i))
 		hosts := []string{scalegen.GatewayHostPattern(i)}
-		for _, ver := range chstore.Versions(v.Gw) {
+		for _, ver := range store.Versions(v.Gw) {
 			if err := gwB.Append(scalegen.GatewayNamespace(), scalegen.GatewayName(i), ver.From, ver.To, uint32(ver.Rev), gwSel, hosts, gwJSON, next()); err != nil {
 				return err
 			}
@@ -108,7 +109,7 @@ func Load(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, v Versio
 			if err != nil {
 				return err
 			}
-			for _, ver := range chstore.Versions(v.VS) {
+			for _, ver := range store.Versions(v.VS) {
 				if err := vsB.Append(vsCfg.Meta.Namespace, vsCfg.Meta.Name, ver.From, ver.To, uint32(ver.Rev), bound, vsJSON, next()); err != nil {
 					return err
 				}

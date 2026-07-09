@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/metadata-exporter/poc/route2a/internal/chstore"
 	"github.com/example/metadata-exporter/poc/route2a/internal/gwresolve"
 	"github.com/example/metadata-exporter/poc/route2a/internal/ingload"
 	"github.com/example/metadata-exporter/poc/route2a/internal/matchcheck"
@@ -19,6 +18,8 @@ import (
 	"github.com/example/metadata-exporter/poc/route2a/internal/report"
 	"github.com/example/metadata-exporter/poc/route2a/internal/scalegen"
 	"github.com/example/metadata-exporter/poc/route2a/internal/simulate"
+	"github.com/example/metadata-exporter/poc/route2a/internal/store"
+	"github.com/example/metadata-exporter/poc/route2a/internal/storeopen"
 	"github.com/example/metadata-exporter/poc/route2a/internal/translate"
 )
 
@@ -54,7 +55,7 @@ func requireRouterCheck(t *testing.T) matchcheck.Runner {
 // 3-hop (Lookup), gwresolve disambiguates among them, and the translate stage
 // pulls its scoped config from ClickHouse too (chScopedForBench). The whole chain
 // therefore runs off the store, at a fixed query time `now`.
-func buildEngine(ctx context.Context, g *scalegen.Gen, mode rccache.Mode, runner matchcheck.Runner, store *chstore.Store, now time.Time) *simulate.Engine {
+func buildEngine(ctx context.Context, g *scalegen.Gen, mode rccache.Mode, runner matchcheck.Runner, st store.Store, now time.Time) *simulate.Engine {
 	gws := g.Gateways()
 	rgws := make([]gwresolve.Gateway, len(gws))
 	deps := rccache.NewDepIndex()
@@ -67,7 +68,7 @@ func buildEngine(ctx context.Context, g *scalegen.Gen, mode rccache.Mode, runner
 		if !ok {
 			return nil, nil // broad / unknown host has no traffic IP -> no candidates -> miss
 		}
-		cands, err := store.ResolveIPToGateways(ctx, ip, now)
+		cands, err := st.ResolveIPToGateways(ctx, ip, now)
 		if err != nil {
 			return nil, err
 		}
@@ -77,17 +78,17 @@ func buildEngine(ctx context.Context, g *scalegen.Gen, mode rccache.Mode, runner
 		Resolver:   gwresolve.New(rgws),
 		Cache:      rccache.New(mode, deps),
 		Translator: translate.NewTranslator(),
-		ScopedFor:  chScopedForBench(ctx, store, now),
+		ScopedFor:  chScopedForBench(ctx, st, now),
 		Lookup:     lookup,
 		Runner:     runner,
 	})
 }
 
 // chScopedForBench adapts the store's ScopedFor to simulate.ScopedSource at a
-// fixed time, so the translate stage's config comes from ClickHouse.
-func chScopedForBench(ctx context.Context, store *chstore.Store, now time.Time) simulate.ScopedSource {
+// fixed time, so the translate stage's config comes from the store.
+func chScopedForBench(ctx context.Context, st store.Store, now time.Time) simulate.ScopedSource {
 	return func(gw string) (translate.ScopedInput, bool) {
-		in, ok, err := store.ScopedFor(ctx, gw, now)
+		in, ok, err := st.ScopedFor(ctx, gw, now)
 		if err != nil {
 			log.Printf("scopedFor %s: %v", gw, err)
 			return translate.ScopedInput{}, false
@@ -96,16 +97,33 @@ func chScopedForBench(ctx context.Context, store *chstore.Store, now time.Time) 
 	}
 }
 
-// requireClickHouse opens the store or skips when ClickHouse is unreachable
-// (same "skip when a dependency is absent" style as requireRouterCheck).
-func requireClickHouse(ctx context.Context, t *testing.T) *chstore.Store {
+// requireStore opens the store for the backend selected by POC_DB (default
+// clickhouse) or skips when it is unreachable (same "skip when a dependency is
+// absent" style as requireRouterCheck).
+func requireStore(ctx context.Context, t *testing.T) store.Store {
 	t.Helper()
-	addr := envOr("POC_CH_ADDR", "127.0.0.1:9000")
-	store, err := chstore.Open(ctx, addr)
+	backend, err := storeopen.Backend()
 	if err != nil {
-		t.Skipf("ClickHouse not reachable at %s (%v); start it with `make ch-up`", addr, err)
+		t.Fatal(err)
 	}
-	return store
+	addr := storeopen.Addr(backend)
+	st, err := storeopen.Open(ctx, backend, addr)
+	if err != nil {
+		t.Skipf("%s not reachable at %s (%v); start it with `make %s-up`", backend, addr, err, dbUpTarget(backend))
+	}
+	return st
+}
+
+// dbUpTarget maps a backend to its `make <x>-up` container target (for skip hints).
+func dbUpTarget(b store.Backend) string {
+	switch b {
+	case store.BackendPostgres:
+		return "pg"
+	case store.BackendMariaDB:
+		return "maria"
+	default:
+		return "ch"
+	}
 }
 
 // benchVersions is the bitemporal depth the benchmark loads into ClickHouse.
@@ -125,16 +143,16 @@ func benchVersions() ingload.Versions {
 // timing begins. It compares gw_versions' row count against the expected
 // NumGateways × Gw-versions and only regenerates+loads on mismatch, so re-running
 // a benchmark against an already-loaded store skips the (untimed) load.
-func ensureLoaded(ctx context.Context, t *testing.T, store *chstore.Store, g *scalegen.Gen, vers ingload.Versions) {
+func ensureLoaded(ctx context.Context, t *testing.T, st store.Store, g *scalegen.Gen, vers ingload.Versions) {
 	t.Helper()
 	want := uint64(g.NumGateways() * vers.Gw)
-	if got, err := store.CountRows(ctx, "gw_versions"); err == nil && got == want {
-		t.Logf("ClickHouse already holds this corpus (gw_versions=%d); skipping load", got)
+	if got, err := st.CountRows(ctx, "gw_versions"); err == nil && got == want {
+		t.Logf("store already holds this corpus (gw_versions=%d); skipping load", got)
 		return
 	}
-	t.Logf("loading corpus into ClickHouse: %d gateways, versions %+v ...", g.NumGateways(), vers)
+	t.Logf("loading corpus into store: %d gateways, versions %+v ...", g.NumGateways(), vers)
 	start := time.Now()
-	if err := ingload.Load(ctx, store, g, vers, nil); err != nil {
+	if err := ingload.Load(ctx, st, g, vers, nil); err != nil {
 		t.Fatalf("load corpus: %v", err)
 	}
 	t.Logf("corpus loaded in %s (not counted in report Wall)", time.Since(start).Round(time.Millisecond))
@@ -170,6 +188,16 @@ func checkOracle(cases []scalegen.Case, res []simulate.Resolution) (int, []strin
 // simulation over a large corpus, but NOT the single-request latency. For the
 // worst-case online cost see TestResolveSingleWorst.
 const batchNote = "BULK/BATCH throughput: one router_check_tool invocation per gateway amortizes tool startup over that gateway's queries. This is the offline route-simulation number, NOT single-request latency — for worst-case online cost run TestResolveSingleWorst."
+
+// modeLabel prefixes a benchmark mode name with the active backend (POC_DB,
+// default clickhouse) so out/report.md rows from different DBs are comparable.
+func modeLabel(mode string) string {
+	db := os.Getenv("POC_DB")
+	if db == "" {
+		db = string(store.BackendClickHouse)
+	}
+	return "[" + db + "] " + mode
+}
 
 // buildResult folds engine metrics into a report.Result.
 func buildResult(modeName string, cases []scalegen.Case, res []simulate.Resolution, m *simulate.Metrics, wall time.Duration) *report.Result {
@@ -261,12 +289,12 @@ func TestResolveWarm(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	store := requireClickHouse(ctx, t)
-	defer store.Close()
-	ensureLoaded(ctx, t, store, g, benchVersions())
+	st := requireStore(ctx, t)
+	defer st.Close()
+	ensureLoaded(ctx, t, st, g, benchVersions())
 	now := time.Now().UTC()
 
-	eng := buildEngine(ctx, g, rccache.WarmLazy, runner, store, now)
+	eng := buildEngine(ctx, g, rccache.WarmLazy, runner, st, now)
 	prewarm(ctx, t, eng, queries)
 
 	start := time.Now()
@@ -275,7 +303,7 @@ func TestResolveWarm(t *testing.T) {
 		t.Fatalf("ResolveAll: %v", err)
 	}
 	logResolutions(t, res)
-	result := buildResult("WARM (cache, steady state)", cases, res, m, time.Since(start))
+	result := buildResult(modeLabel("WARM (cache, steady state)"), cases, res, m, time.Since(start))
 	appendReport(t, result)
 	if result.Mismatches != 0 {
 		t.Fatalf("%d mismatches (want 0): %v", result.Mismatches, result.MismatchSamples)
@@ -302,16 +330,16 @@ func TestResolveSingleWorst(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	store := requireClickHouse(ctx, t)
-	defer store.Close()
-	ensureLoaded(ctx, t, store, g, benchVersions())
+	st := requireStore(ctx, t)
+	defer st.Close()
+	ensureLoaded(ctx, t, st, g, benchVersions())
 	now := time.Now().UTC()
 
 	// ColdAlways => every query re-fetches (ScopedFor) and re-translates its RC (true
 	// worst case). Get always misses, so a single shared engine is fine.
-	eng := buildEngine(ctx, g, rccache.ColdAlways, runner, store, now)
+	eng := buildEngine(ctx, g, rccache.ColdAlways, runner, st, now)
 
-	agg := &report.Result{Mode: "SINGLE-WORST (per-request, cold, batch=1)", Queries: len(cases)}
+	agg := &report.Result{Mode: modeLabel("SINGLE-WORST (per-request, cold, batch=1)"), Queries: len(cases)}
 	agg.Notes = "Worst-case ONLINE latency: full pipeline per single host+path (resolve + translate + ONE router_check_tool invocation). The total-per-query p50/p99 below is the real single-request cost."
 
 	start := time.Now()

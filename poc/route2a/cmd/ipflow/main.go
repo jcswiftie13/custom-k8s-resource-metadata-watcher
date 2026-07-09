@@ -24,20 +24,22 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/example/metadata-exporter/poc/route2a/internal/chstore"
 	"github.com/example/metadata-exporter/poc/route2a/internal/gwresolve"
 	"github.com/example/metadata-exporter/poc/route2a/internal/ingload"
 	"github.com/example/metadata-exporter/poc/route2a/internal/matchcheck"
 	"github.com/example/metadata-exporter/poc/route2a/internal/rccache"
 	"github.com/example/metadata-exporter/poc/route2a/internal/scalegen"
 	"github.com/example/metadata-exporter/poc/route2a/internal/simulate"
+	"github.com/example/metadata-exporter/poc/route2a/internal/store"
+	"github.com/example/metadata-exporter/poc/route2a/internal/storeopen"
 	"github.com/example/metadata-exporter/poc/route2a/internal/translate"
 )
 
 func main() {
 	log.SetFlags(0)
 	var (
-		addr = flag.String("ch", envStr("POC_CH_ADDR", "127.0.0.1:9000"), "ClickHouse native address host:port")
+		db   = flag.String("db", envStr("POC_DB", ""), "backend: clickhouse | postgres | mariadb (default clickhouse)")
+		addr = flag.String("addr", "", "backend connection string; empty => POC_<DB>_ADDR or per-DB default")
 		mode = flag.String("mode", "query", "load | query | verify")
 		ip   = flag.String("ip", "", "destination IP (post-DNS); empty => derive from -host")
 		host = flag.String("host", "svc00.gw000.example.com", "request :authority host")
@@ -45,26 +47,35 @@ func main() {
 	)
 	flag.Parse()
 
-	ctx := context.Background()
-	store, err := chstore.Open(ctx, *addr)
-	if err != nil {
-		log.Fatalf("open clickhouse: %v", err)
+	backend := store.BackendClickHouse
+	if *db != "" {
+		backend = store.Backend(*db)
 	}
-	defer store.Close()
+	connStr := *addr
+	if connStr == "" {
+		connStr = storeopen.Addr(backend)
+	}
+
+	ctx := context.Background()
+	st, err := storeopen.Open(ctx, backend, connStr)
+	if err != nil {
+		log.Fatalf("open %s: %v", backend, err)
+	}
+	defer st.Close()
 
 	gen := scalegen.New(scalegen.Config{NumGateways: envInt("POC_GATEWAYS", 600), VSPerGW: envInt("POC_VS", 100)})
 
 	switch *mode {
 	case "load":
-		if err := load(ctx, store, gen); err != nil {
+		if err := load(ctx, st, gen); err != nil {
 			log.Fatalf("load: %v", err)
 		}
 	case "query":
-		if err := query(ctx, store, gen, *ip, *host, *path); err != nil {
+		if err := query(ctx, st, gen, *ip, *host, *path); err != nil {
 			log.Fatalf("query: %v", err)
 		}
 	case "verify":
-		if err := verify(ctx, store, gen); err != nil {
+		if err := verify(ctx, st, gen); err != nil {
 			log.Fatalf("verify: %v", err)
 		}
 	default:
@@ -83,20 +94,20 @@ func envVersions() ingload.Versions {
 	}
 }
 
-// load generates the corpus and streams it into ClickHouse as multi-version rows.
-func load(ctx context.Context, store *chstore.Store, gen *scalegen.Gen) error {
+// load generates the corpus and streams it into the store as multi-version rows.
+func load(ctx context.Context, st store.Store, gen *scalegen.Gen) error {
 	start := time.Now()
 	prog := func(done, total int) {
 		if done%100 == 0 || done == total {
 			log.Printf("  loaded %d/%d gateways...", done, total)
 		}
 	}
-	if err := ingload.Load(ctx, store, gen, envVersions(), prog); err != nil {
+	if err := ingload.Load(ctx, st, gen, envVersions(), prog); err != nil {
 		return err
 	}
 	log.Printf("load done in %s. row counts:", time.Since(start).Round(time.Millisecond))
 	for _, tbl := range []string{"service_versions", "deploy_versions", "gw_versions", "vs_versions"} {
-		cnt, err := store.CountRows(ctx, tbl)
+		cnt, err := st.CountRows(ctx, tbl)
 		if err != nil {
 			return err
 		}
@@ -106,7 +117,7 @@ func load(ctx context.Context, store *chstore.Store, gen *scalegen.Gen) error {
 }
 
 // query runs the full ingress-traffic pipeline for one request.
-func query(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, ip, host, path string) error {
+func query(ctx context.Context, st store.Store, gen *scalegen.Gen, ip, host, path string) error {
 	t := time.Now().UTC()
 	if ip == "" {
 		got, ok := gen.IPForHost(host)
@@ -119,7 +130,7 @@ func query(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, ip, hos
 	log.Printf("request: host=%s path=%s dst_ip=%s  @T=%s", host, path, ip, t.Format(time.RFC3339))
 
 	// Stage 1: ClickHouse 3-hop IP -> candidate gateways.
-	cands, err := store.ResolveIPToGateways(ctx, ip, t)
+	cands, err := st.ResolveIPToGateways(ctx, ip, t)
 	if err != nil {
 		return err
 	}
@@ -158,7 +169,7 @@ func query(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, ip, hos
 		Resolver:   resolver,
 		Cache:      rccache.New(rccache.ColdAlways, rccache.NewDepIndex()),
 		Translator: translate.NewTranslator(),
-		ScopedFor:  chScopedFor(ctx, store, t),
+		ScopedFor:  chScopedFor(ctx, st, t),
 		Runner:     runner,
 	})
 	res, _, err := engine.ResolveAll(ctx, []simulate.Query{{Host: host, Path: path}})
@@ -178,14 +189,14 @@ func query(ctx context.Context, store *chstore.Store, gen *scalegen.Gen, ip, hos
 }
 
 // verify samples the 3-hop against the oracle and checks multi-version selection.
-func verify(ctx context.Context, store *chstore.Store, gen *scalegen.Gen) error {
+func verify(ctx context.Context, st store.Store, gen *scalegen.Gen) error {
 	t := time.Now().UTC()
 	n := gen.NumGateways()
 	step := n/20 + 1
 	fail := 0
 	for i := 0; i < n; i += step {
 		ip := scalegen.IPForGateway(i)
-		cands, err := store.ResolveIPToGateways(ctx, ip, t)
+		cands, err := st.ResolveIPToGateways(ctx, ip, t)
 		if err != nil {
 			return err
 		}
@@ -205,7 +216,7 @@ func verify(ctx context.Context, store *chstore.Store, gen *scalegen.Gen) error 
 	vc := envVersions()
 	gw0 := scalegen.GatewayName(0)
 	for v := 0; v < vc.Gw; v++ {
-		rev, ok, err := store.AsOfRev(ctx, "gw_versions", scalegen.GatewayNamespace(), gw0, chstore.VersionMidTime(v))
+		rev, ok, err := st.AsOfRev(ctx, "gw_versions", scalegen.GatewayNamespace(), gw0, store.VersionMidTime(v))
 		if err != nil {
 			return err
 		}
@@ -224,9 +235,9 @@ func verify(ctx context.Context, store *chstore.Store, gen *scalegen.Gen) error 
 }
 
 // chScopedFor adapts the store's ScopedFor to simulate.ScopedSource (fixed ctx+T).
-func chScopedFor(ctx context.Context, store *chstore.Store, t time.Time) simulate.ScopedSource {
+func chScopedFor(ctx context.Context, st store.Store, t time.Time) simulate.ScopedSource {
 	return func(gw string) (translate.ScopedInput, bool) {
-		in, ok, err := store.ScopedFor(ctx, gw, t)
+		in, ok, err := st.ScopedFor(ctx, gw, t)
 		if err != nil {
 			log.Printf("scopedFor %s: %v", gw, err)
 			return translate.ScopedInput{}, false
@@ -235,7 +246,7 @@ func chScopedFor(ctx context.Context, store *chstore.Store, t time.Time) simulat
 	}
 }
 
-func candsToGateways(cands []chstore.GatewayCand) []gwresolve.Gateway {
+func candsToGateways(cands []store.GatewayCand) []gwresolve.Gateway {
 	out := make([]gwresolve.Gateway, len(cands))
 	for i, c := range cands {
 		out[i] = gwresolve.Gateway{Name: c.Name, Hosts: c.ServerHosts}
@@ -243,7 +254,7 @@ func candsToGateways(cands []chstore.GatewayCand) []gwresolve.Gateway {
 	return out
 }
 
-func names(cands []chstore.GatewayCand) []string {
+func names(cands []store.GatewayCand) []string {
 	out := make([]string, len(cands))
 	for i, c := range cands {
 		out[i] = c.Name
