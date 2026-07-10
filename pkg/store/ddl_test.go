@@ -22,6 +22,7 @@ func TestCreateTableSQL(t *testing.T) {
   uid String,
   resource_version String,
   valid_from DateTime64(3),
+  valid_to DateTime64(3),
   deleted UInt8,
   spec_hash String,
   ingest_seq UInt64,
@@ -45,6 +46,23 @@ func TestCreateTableSQL_NoIndex(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "ORDER BY (namespace, name, valid_from, resource_version, deleted)") {
 		t.Fatalf("unexpected suffix:\n%s", got)
+	}
+}
+
+// valid_to must never join the sort key: the closing row re-inserts the open
+// row with valid_to set, and only an identical sort key lets ReplacingMergeTree
+// collapse the two.
+func TestCreateTableSQL_ValidToNotInOrderBy(t *testing.T) {
+	got := createTableSQL(TableSchema{Table: "t", Columns: []ColumnSchema{{Name: "c", Type: "String"}}})
+	if !strings.Contains(got, "valid_to DateTime64(3)") {
+		t.Fatalf("valid_to column missing:\n%s", got)
+	}
+	_, orderBy, ok := strings.Cut(got, "ORDER BY ")
+	if !ok {
+		t.Fatalf("no ORDER BY clause:\n%s", got)
+	}
+	if strings.Contains(orderBy, "valid_to") {
+		t.Fatalf("valid_to must stay out of ORDER BY, got %q", orderBy)
 	}
 }
 

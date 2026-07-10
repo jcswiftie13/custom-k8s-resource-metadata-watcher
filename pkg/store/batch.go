@@ -74,6 +74,7 @@ func rowArgs(schema TableSchema, r *Row) ([]any, error) {
 		r.UID,
 		r.ResourceVersion,
 		r.ValidFrom,
+		r.ValidTo,
 		deleted,
 		r.SpecHash,
 		r.IngestSeq,

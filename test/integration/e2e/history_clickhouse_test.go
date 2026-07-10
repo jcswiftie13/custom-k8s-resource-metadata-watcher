@@ -189,6 +189,7 @@ func TestHistory_ClickHouseIstioSchema(t *testing.T) {
 		assertColumnType(t, "service_versions", "ingress_ips", "Array(String)")
 		assertColumnType(t, "service_versions", "port", "Int64")
 		assertColumnType(t, "service_versions", "valid_from", "DateTime64(3)")
+		assertColumnType(t, "service_versions", "valid_to", "DateTime64(3)")
 		assertColumnType(t, "gw_versions", "spec_json", "String")
 		// Bloom skip indexes mirror the POC (idx on ingress_ips and selector_kv).
 		if got := chQuery(t, "SELECT count() FROM system.data_skipping_indices WHERE table='service_versions' AND name='idx_ingress_ips'"); got != "1" {
@@ -244,6 +245,53 @@ func TestHistory_ClickHouseIstioSchema(t *testing.T) {
 			t.Fatalf("gw-drop should be excluded by labelSelector, got count %q", got)
 		}
 	})
+
+	// Runs last: it mutates and then deletes svc-lb, which the subtests above
+	// still expect to be present and single-versioned.
+	t.Run("valid_to", func(t *testing.T) {
+		const svc = "name='svc-lb'"
+
+		// A live object has exactly one open version, carrying the FarFuture
+		// sentinel rather than a null.
+		if got := chQuery(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to > now()"); got != "1" {
+			t.Fatalf("expected 1 open version of svc-lb, got %q", got)
+		}
+		if got := chQuery(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to = toDateTime64('2200-01-01 00:00:00', 3)"); got != "1" {
+			t.Fatalf("open version should carry the FarFuture sentinel, got count %q", got)
+		}
+
+		// A real change supersedes v1: the writer re-inserts v1 with valid_to set
+		// and appends the new open version. Waiting on the closed row means the
+		// batch holding both has landed.
+		updateServicePortName(t, dyn, ns, "svc-lb", "http2")
+		waitForCHCount(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to <= now()", 1)
+
+		if got := chQuery(t, "SELECT count() FROM service_versions FINAL WHERE "+svc); got != "2" {
+			t.Fatalf("expected 2 versions of svc-lb after update, got %q", got)
+		}
+		if got := chQuery(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to > now()"); got != "1" {
+			t.Fatalf("expected exactly 1 open version after update, got %q", got)
+		}
+		// The closed version ends exactly where the open one begins: no gap, no overlap.
+		chain := "SELECT (SELECT valid_to FROM service_versions FINAL WHERE " + svc + " AND valid_to <= now()) = " +
+			"(SELECT valid_from FROM service_versions FINAL WHERE " + svc + " AND valid_to > now())"
+		if got := chQuery(t, chain); got != "1" {
+			t.Fatalf("v1.valid_to should equal v2.valid_from (got %q); rows:\n%s", got,
+				chQuery(t, "SELECT valid_from, valid_to, port_name FROM service_versions FINAL WHERE "+svc+" ORDER BY valid_from"))
+		}
+
+		// Deleting closes the last version. Deletion is expressed purely by
+		// valid_to — no deleted=1 tombstone row is ever written.
+		deleteObject(t, dyn, svcGVR, ns, "svc-lb")
+		waitForCHCount(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to <= now()", 2)
+
+		if got := chQuery(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to > now()"); got != "0" {
+			t.Fatalf("no version should remain open after delete, got %q", got)
+		}
+		if got := chQuery(t, "SELECT count() FROM service_versions WHERE "+svc+" AND deleted=1"); got != "0" {
+			t.Fatalf("delete must not write a tombstone row, got %q", got)
+		}
+	})
 }
 
 // --- helpers ---
@@ -264,6 +312,38 @@ func createObject(t *testing.T, dyn dynamic.Interface, gvr schema.GroupVersionRe
 		return false, err
 	}); err != nil {
 		t.Fatalf("create %s/%s: %v", gvr.Resource, obj["metadata"].(map[string]interface{})["name"], err)
+	}
+}
+
+// updateServicePortName renames the first port, changing both a declared column
+// (port_name) and the spec hash, so the ingester records a genuinely new version.
+func updateServicePortName(t *testing.T, dyn dynamic.Interface, ns, name, portName string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	got, err := dyn.Resource(svcGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get service %s: %v", name, err)
+	}
+	ports, found, err := unstructured.NestedSlice(got.Object, "spec", "ports")
+	if err != nil || !found || len(ports) == 0 {
+		t.Fatalf("service %s has no spec.ports (found=%v): %v", name, found, err)
+	}
+	ports[0].(map[string]interface{})["name"] = portName
+	if err := unstructured.SetNestedSlice(got.Object, ports, "spec", "ports"); err != nil {
+		t.Fatalf("set spec.ports: %v", err)
+	}
+	if _, err := dyn.Resource(svcGVR).Namespace(ns).Update(ctx, got, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update service %s: %v", name, err)
+	}
+}
+
+func deleteObject(t *testing.T, dyn dynamic.Interface, gvr schema.GroupVersionResource, ns, name string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := dyn.Resource(gvr).Namespace(ns).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete %s/%s: %v", gvr.Resource, name, err)
 	}
 }
 

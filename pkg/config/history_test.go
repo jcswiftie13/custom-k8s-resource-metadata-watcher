@@ -135,6 +135,7 @@ func TestHistory_ValidationErrors(t *testing.T) {
 		{"no columns", func(c *Config) { c.History.Resources[0].Columns = nil }, "at least one column"},
 		{"bad column type", func(c *Config) { c.History.Resources[0].Columns[0].Type = "Widget" }, "unsupported"},
 		{"reserved column name", func(c *Config) { c.History.Resources[0].Columns[0].Name = "valid_from" }, "reserved"},
+		{"reserved column valid_to", func(c *Config) { c.History.Resources[0].Columns[0].Name = "valid_to" }, "reserved"},
 		{"dup column name", func(c *Config) { c.History.Resources[0].Columns[1].Name = "cluster_ip" }, "duplicated"},
 		{"encode json wrong type", func(c *Config) {
 			c.History.Resources[0].Columns[0].Encode = "json"

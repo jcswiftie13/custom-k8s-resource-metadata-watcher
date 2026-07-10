@@ -768,11 +768,15 @@ history:
 
 ### 14.5 版本化語意（append-only）
 
-每個事件就是一筆 `INSERT`：`valid_from` 為觀測時間（Add 用 `creationTimestamp`），Delete 寫 `deleted=1` tombstone。
-**不儲存 `valid_to`**——查詢時以「下一版的 `valid_from`」推導（`AsOf(T)` = 最大的 `valid_from ≤ T`）。
+每個事件寫入一到兩筆 `INSERT`：`valid_from` 為觀測時間（Add 用 `creationTimestamp`），開放中的版本
+`valid_to` = 遠未來哨兵 `2200-01-01`。**`valid_to` 於寫入端物化**：新版本到達時，把前一版**整列**以相同排序鍵、
+更高 `ingest_seq` 重插一次並填上 `valid_to`（= 新版的 `valid_from`）；`ReplacingMergeTree(ingest_seq)` 於 merge
+時折疊，收尾列勝出。Delete 同樣只收尾最後一版（`valid_to` = 刪除觀測時刻），**不寫 `deleted=1` tombstone**——
+`valid_to` 已完整表達刪除語意。因此區間查詢可直接用吃索引的 `valid_from < t1 AND valid_to > t0`，免去 window function。
+
 去重分兩層：ingest 端 **spec-hash**（丟棄 resync no-op），CH 端 `ReplacingMergeTree(ingest_seq)` +
-`ORDER BY (namespace, name, valid_from, resource_version, deleted)`（重啟 re-LIST 同版本冪等，且 tombstone 不會
-與其 live 版本碰撞）。
+`ORDER BY (namespace, name, valid_from, resource_version, deleted)`（重啟 re-LIST 同版本冪等）。
+**`valid_to` 刻意排除於 ORDER BY 之外**：唯有排序鍵相同，收尾列才折疊得掉它所收尾的開放列。
 
 範例完整設定見 `examples/history-clickhouse.yaml`。
 

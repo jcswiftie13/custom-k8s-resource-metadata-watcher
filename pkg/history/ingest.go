@@ -51,11 +51,21 @@ type Ingester struct {
 
 	seq atomic.Uint64
 
-	mu       sync.Mutex
-	lastHash map[string]string // uid -> last spec hash
+	mu   sync.Mutex
+	last map[string]lastState // uid -> last written open version
 
 	queue   chan queued
 	ctxDone <-chan struct{}
+}
+
+// lastState is the last open version written for a live uid: its spec hash (for
+// dedup) and the whole row, kept so a later version or a delete can re-insert it
+// with valid_to filled in. One entry per live object, not per historical
+// version. row.Values is built fresh by buildRow and never mutated afterwards,
+// so holding the reference is safe.
+type lastState struct {
+	hash string
+	row  store.Row
 }
 
 // NewIngester builds an Ingester from compiled resources.
@@ -73,7 +83,7 @@ func NewIngester(st store.Store, informers InformerSource, resources []*Compiled
 		log:       log,
 		batchMax:  maxRows,
 		flushIvl:  time.Duration(batch.FlushIntervalMsOrDefault()) * time.Millisecond,
-		lastHash:  map[string]string{},
+		last:      map[string]lastState{},
 		queue:     make(chan queued, maxRows*2),
 	}
 }
@@ -159,16 +169,14 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 	uid := string(u.GetUID())
 
 	if kind == eventDelete {
-		// Only close out objects we actually wrote (passed filters before).
-		if !in.forgetIfSeen(uid) {
+		// Only close out objects we actually wrote (passed filters before). The
+		// close alone records the deletion — valid_to now bounds the last
+		// version, so no deleted=1 tombstone row is written.
+		prior, ok := in.forgetIfSeen(uid)
+		if !ok {
 			return
 		}
-		row, err := in.buildRow(cr, u, lookup, eventDelete)
-		if err != nil {
-			in.log.Error("history build tombstone failed", "kind", cr.Kind, "uid", uid, "err", err)
-			return
-		}
-		in.enqueue(cr.Table, row)
+		in.enqueue(cr.Table, in.closingRow(prior, time.Now().UTC()))
 		return
 	}
 
@@ -181,7 +189,8 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 		in.log.Error("history spec hash failed", "kind", cr.Kind, "uid", uid, "err", err)
 		return
 	}
-	if in.seenSame(uid, hash) {
+	prior, hadPrior, same := in.priorOpen(uid, hash)
+	if same {
 		return // resync / no-op: unchanged content
 	}
 
@@ -191,9 +200,18 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 		return
 	}
 	row.SpecHash = hash
+	in.remember(uid, hash, row)
+
+	// The superseded version ends where the new one begins. Both rows may land
+	// in any batch, in any order: ingest_seq alone decides the merge.
+	if hadPrior {
+		in.enqueue(cr.Table, in.closingRow(prior, row.ValidFrom))
+	}
 	in.enqueue(cr.Table, row)
 }
 
+// buildRow assembles the open version row for an Add/Update. Deleted stays
+// false: a deletion is recorded by closing valid_to, never by a tombstone row.
 func (in *Ingester) buildRow(cr *CompiledResource, u *unstructured.Unstructured, lookup srcLookup, kind eventKind) (store.Row, error) {
 	row := store.Row{
 		Namespace:       u.GetNamespace(),
@@ -201,7 +219,7 @@ func (in *Ingester) buildRow(cr *CompiledResource, u *unstructured.Unstructured,
 		UID:             string(u.GetUID()),
 		ResourceVersion: u.GetResourceVersion(),
 		ValidFrom:       validFrom(u, kind),
-		Deleted:         kind == eventDelete,
+		ValidTo:         store.FarFuture,
 		IngestSeq:       in.seq.Add(1),
 		Values:          make(map[string]any, len(cr.Columns)),
 	}
@@ -277,26 +295,50 @@ func (in *Ingester) enqueue(table string, row store.Row) {
 	}
 }
 
-// seenSame records uid->hash and reports whether the hash is unchanged.
-func (in *Ingester) seenSame(uid, hash string) bool {
+// priorOpen returns the last open row written for uid, and whether the incoming
+// hash matches it (a resync / no-op). The informer delivers events for one
+// object sequentially, so the caller may build the new row between this lookup
+// and the matching remember() without racing itself.
+func (in *Ingester) priorOpen(uid, hash string) (prior store.Row, hadPrior, same bool) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	if prev, ok := in.lastHash[uid]; ok && prev == hash {
-		return true
+	prev, ok := in.last[uid]
+	if !ok {
+		return store.Row{}, false, false
 	}
-	in.lastHash[uid] = hash
-	return false
+	return prev.row, true, prev.hash == hash
 }
 
-// forgetIfSeen drops uid from the seen set, returning true if it was present.
-func (in *Ingester) forgetIfSeen(uid string) bool {
+// remember records the row just written as uid's open version.
+func (in *Ingester) remember(uid, hash string, row store.Row) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	if _, ok := in.lastHash[uid]; !ok {
-		return false
+	in.last[uid] = lastState{hash: hash, row: row}
+}
+
+// forgetIfSeen drops uid from the live set, returning its open row if present.
+func (in *Ingester) forgetIfSeen(uid string) (store.Row, bool) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	prev, ok := in.last[uid]
+	if !ok {
+		return store.Row{}, false
 	}
-	delete(in.lastHash, uid)
-	return true
+	delete(in.last, uid)
+	return prev.row, true
+}
+
+// closingRow re-inserts prev with valid_to materialized. It keeps prev's sort
+// key and takes a fresh, higher ingest_seq, so ReplacingMergeTree(ingest_seq)
+// collapses it onto the open row it closes. closeAt is clamped to prev's start
+// so a version can never span a negative interval (see Add-after-Add below).
+func (in *Ingester) closingRow(prev store.Row, closeAt time.Time) store.Row {
+	if closeAt.Before(prev.ValidFrom) {
+		closeAt = prev.ValidFrom
+	}
+	prev.ValidTo = closeAt
+	prev.IngestSeq = in.seq.Add(1)
+	return prev
 }
 
 // validFrom is the observed start of this version: creationTimestamp for an

@@ -757,7 +757,7 @@ var historyFilterOps = map[string]struct{}{
 // history table; a resource may not redeclare them.
 var reservedHistoryColumns = map[string]struct{}{
 	"namespace": {}, "name": {}, "uid": {}, "resource_version": {},
-	"valid_from": {}, "deleted": {}, "spec_hash": {}, "ingest_seq": {},
+	"valid_from": {}, "valid_to": {}, "deleted": {}, "spec_hash": {}, "ingest_seq": {},
 }
 
 // Batch defaults for the history ingest writer.
@@ -767,8 +767,9 @@ const (
 )
 
 // History configures the optional event-driven ClickHouse version store.
-// Every informer event for a declared resource appends a version row; the
-// store is append-only and valid_to is derived at query time.
+// Every informer event for a declared resource appends a version row; the store
+// is append-only, and valid_to is materialized by re-inserting the superseded
+// row with its end time (ReplacingMergeTree collapses the pair).
 type History struct {
 	Enabled   bool              `json:"enabled,omitempty"`
 	Store     StoreConfig       `json:"store,omitempty"`

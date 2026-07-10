@@ -4,7 +4,12 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
+
+// FarFuture is the valid_to sentinel for an open (still-current) version, so
+// overlap predicates need no null handling.
+var FarFuture = time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // envelopeColumn is an implicit column present on every history table.
 type envelopeColumn struct {
@@ -13,13 +18,15 @@ type envelopeColumn struct {
 }
 
 // envelopeColumns are prepended to every table, in insert order. valid_to is
-// intentionally absent — it is derived at query time.
+// materialized at write time: the open version carries FarFuture, and a later
+// version (or a delete) re-inserts the prior row with valid_to filled in.
 var envelopeColumns = []envelopeColumn{
 	{"namespace", "LowCardinality(String)"},
 	{"name", "String"},
 	{"uid", "String"},
 	{"resource_version", "String"},
 	{"valid_from", "DateTime64(3)"},
+	{"valid_to", "DateTime64(3)"},
 	{"deleted", "UInt8"},
 	{"spec_hash", "String"},
 	{"ingest_seq", "UInt64"},
@@ -52,9 +59,14 @@ func createTableSQL(t TableSchema) string {
 	s := strings.TrimRight(b.String(), ",\n")
 	// ORDER BY doubles as the ReplacingMergeTree dedup key. resource_version
 	// keeps genuinely distinct versions apart (k8s bumps it on every change,
-	// and it is stable across a restart re-LIST so the same version dedups),
-	// and deleted keeps a tombstone from collapsing into its last live twin
-	// when they share a valid_from millisecond.
+	// and it is stable across a restart re-LIST so the same version dedups).
+	// deleted is retained for schema stability but is always 0: a deletion is
+	// recorded by closing valid_to, not by a tombstone row.
+	//
+	// Invariant: valid_to MUST stay out of ORDER BY. Closing a version re-inserts
+	// the same row with valid_to filled in and a higher ingest_seq; if valid_to
+	// were part of the key the open row and its closing row would sort apart and
+	// both survive the merge, so the close would never take effect.
 	s += "\n) ENGINE = ReplacingMergeTree(ingest_seq)\nORDER BY (namespace, name, valid_from, resource_version, deleted)"
 	return s
 }
@@ -63,12 +75,13 @@ func (s *chStore) createTable(ctx context.Context, t TableSchema) error {
 	if err := s.conn.Exec(ctx, createTableSQL(t)); err != nil {
 		return err
 	}
-	// Additive migration: add any declared column missing from an existing
-	// table. Never drop or retype.
-	for _, c := range t.Columns {
-		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s", t.Table, c.Name, c.Type)
+	// Additive migration: add any column — envelope or declared — missing from an
+	// existing table, so a table created before valid_to existed picks it up.
+	// Never drop or retype.
+	for _, c := range allColumns(t) {
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s", t.Table, c.name, c.typ)
 		if err := s.conn.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("add column %q: %w", c.Name, err)
+			return fmt.Errorf("add column %q: %w", c.name, err)
 		}
 	}
 	return nil

@@ -262,8 +262,9 @@ history:
 ```
 
 **Schema 由 config 定義**（json path 值無型別，型別只能由 config 指定）；`createSchema` 開關控制 dev 自動建表 vs
-prod 驗證-only。**版本化為 append-only**：每事件一筆 `INSERT`（`valid_from`、`deleted`、`ingest_seq`），
-`valid_to` 於查詢時由「下一版 `valid_from`」推導。落地於 `pkg/config`（設定）、`pkg/history`（filter + 事件
+prod 驗證-only。**版本化為 append-only**：每事件一到兩筆 `INSERT`（`valid_from`、`valid_to`、`ingest_seq`），
+`valid_to` 於寫入端物化——Update 收前版 `valid_to` + insert 新版，Delete 只收前版 `valid_to`（無 tombstone），
+由 `ReplacingMergeTree(ingest_seq)` 折疊收尾列。落地於 `pkg/config`（設定）、`pkg/history`（filter + 事件
 ingest）、`pkg/store`（ClickHouse writer + DDL）。
 
 

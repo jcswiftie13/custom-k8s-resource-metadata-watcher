@@ -1,6 +1,9 @@
 // Package store implements the append-only ClickHouse version store for the
-// history ingest path. Each informer event appends one Row; valid_to is not
-// stored (it is derived at query time as the next version's valid_from).
+// history ingest path. Each informer event appends one or two Rows: the new
+// open version (valid_to = FarFuture) and, when it supersedes an earlier
+// version, that earlier row re-inserted with valid_to materialized and a higher
+// ingest_seq. ReplacingMergeTree(ingest_seq) collapses the pair, so valid_to is
+// stored rather than derived at query time.
 //
 // Schema ownership: the exporter config is the source of truth for columns and
 // types. EnsureSchema either creates tables (createSchema=true, dev) or only
@@ -42,6 +45,7 @@ type Row struct {
 	UID             string
 	ResourceVersion string
 	ValidFrom       time.Time
+	ValidTo         time.Time
 	Deleted         bool
 	SpecHash        string
 	IngestSeq       uint64
