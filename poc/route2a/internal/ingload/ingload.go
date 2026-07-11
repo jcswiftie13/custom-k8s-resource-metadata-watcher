@@ -1,8 +1,8 @@
 // Package ingload generates the ingress-traffic corpus from scalegen and streams
-// it into a store.Store (ClickHouse / PostgreSQL / MariaDB) as multi-version
-// rows. It is the single loader shared by cmd/ipflow (-mode=load) and the
-// end-to-end test, so the "program-generated, never hand-written SQL" test data
-// is produced in exactly one place, backend-agnostic.
+// it into a store.Store (ClickHouse) as multi-version rows. It is the single
+// loader shared by cmd/ipflow (-mode=load) and the end-to-end test, so the
+// "program-generated, never hand-written SQL" test data is produced in exactly
+// one place, backend-agnostic.
 package ingload
 
 import (

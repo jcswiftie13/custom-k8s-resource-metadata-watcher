@@ -8,6 +8,8 @@ import (
 	"github.com/example/metadata-exporter/poc/route2a/internal/gwresolve"
 	"github.com/example/metadata-exporter/poc/route2a/internal/ingload"
 	"github.com/example/metadata-exporter/poc/route2a/internal/matchcheck"
+	"github.com/example/metadata-exporter/poc/route2a/internal/memwindow"
+	"github.com/example/metadata-exporter/poc/route2a/internal/rangequery"
 	"github.com/example/metadata-exporter/poc/route2a/internal/rccache"
 	"github.com/example/metadata-exporter/poc/route2a/internal/scalegen"
 	"github.com/example/metadata-exporter/poc/route2a/internal/simulate"
@@ -107,6 +109,52 @@ func TestIPFlowClickHouse(t *testing.T) {
 		}
 		if res[0].Cluster != c.Expected {
 			t.Errorf("host=%s path=%s: cluster=%s want %s", c.Host, c.Path, res[0].Cluster, c.Expected)
+		}
+	}
+
+	// (4) Range query: over a window spanning >=2 version boundaries, the traffic
+	// window slices into >=2 segments; every segment must resolve to the oracle
+	// gateway+cluster. The corpus writes an identical spec to every version, so the
+	// destination is constant and adjacent segments merge into one covering span.
+	t0 := store.VersionMidTime(0)
+	t1 := store.VersionMidTime(vers.VS - 1)
+	deps := rangequery.Deps{Translator: translate.NewTranslator(), Runner: runner}
+	for _, c := range cases[:min(5, len(cases))] {
+		ip, _ := gen.IPForHost(c.Host)
+
+		// The loaded window must slice into >=2 segments (crosses version boundaries).
+		w, err := st.LoadTrafficWindow(ctx, ip, t0, t1)
+		if err != nil {
+			t.Fatalf("LoadTrafficWindow %s: %v", ip, err)
+		}
+		if segs := memwindow.New(w, t0, t1).Segments(); len(segs) < 2 {
+			t.Fatalf("host=%s: want >=2 segments over [%s,%s), got %d",
+				c.Host, t0.Format(time.RFC3339), t1.Format(time.RFC3339), len(segs))
+		}
+
+		versions, err := deps.Resolve(ctx, st, c.Host, c.Path, ip, t0, t1)
+		if err != nil {
+			t.Fatalf("range resolve %s: %v", c.Host, err)
+		}
+		if len(versions) == 0 {
+			t.Fatalf("host=%s: empty range result", c.Host)
+		}
+		// Spans cover [t0,t1) contiguously.
+		if !versions[0].From.Equal(t0) || !versions[len(versions)-1].To.Equal(t1) {
+			t.Errorf("host=%s: range spans do not cover [%s,%s): first=%s last=%s",
+				c.Host, t0.Format(time.RFC3339), t1.Format(time.RFC3339),
+				versions[0].From.Format(time.RFC3339), versions[len(versions)-1].To.Format(time.RFC3339))
+		}
+		// Every span resolves to the oracle gateway+cluster (matches the point query).
+		for _, v := range versions {
+			if v.Gateway != c.Gateway {
+				t.Errorf("host=%s span=[%s,%s): gateway=%s want %s",
+					c.Host, v.From.Format(time.RFC3339), v.To.Format(time.RFC3339), v.Gateway, c.Gateway)
+			}
+			if v.Cluster != c.Expected {
+				t.Errorf("host=%s path=%s span=[%s,%s): cluster=%s want %s",
+					c.Host, c.Path, v.From.Format(time.RFC3339), v.To.Format(time.RFC3339), v.Cluster, c.Expected)
+			}
 		}
 	}
 }

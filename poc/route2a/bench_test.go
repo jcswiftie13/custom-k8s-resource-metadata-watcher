@@ -14,6 +14,7 @@ import (
 	"github.com/example/metadata-exporter/poc/route2a/internal/gwresolve"
 	"github.com/example/metadata-exporter/poc/route2a/internal/ingload"
 	"github.com/example/metadata-exporter/poc/route2a/internal/matchcheck"
+	"github.com/example/metadata-exporter/poc/route2a/internal/rangequery"
 	"github.com/example/metadata-exporter/poc/route2a/internal/rccache"
 	"github.com/example/metadata-exporter/poc/route2a/internal/report"
 	"github.com/example/metadata-exporter/poc/route2a/internal/scalegen"
@@ -97,33 +98,16 @@ func chScopedForBench(ctx context.Context, st store.Store, now time.Time) simula
 	}
 }
 
-// requireStore opens the store for the backend selected by POC_DB (default
-// clickhouse) or skips when it is unreachable (same "skip when a dependency is
-// absent" style as requireRouterCheck).
+// requireStore opens the ClickHouse store or skips when it is unreachable (same
+// "skip when a dependency is absent" style as requireRouterCheck).
 func requireStore(ctx context.Context, t *testing.T) store.Store {
 	t.Helper()
-	backend, err := storeopen.Backend()
+	addr := storeopen.Addr()
+	st, err := storeopen.Open(ctx, addr)
 	if err != nil {
-		t.Fatal(err)
-	}
-	addr := storeopen.Addr(backend)
-	st, err := storeopen.Open(ctx, backend, addr)
-	if err != nil {
-		t.Skipf("%s not reachable at %s (%v); start it with `make %s-up`", backend, addr, err, dbUpTarget(backend))
+		t.Skipf("clickhouse not reachable at %s (%v); start it with `make ch-up`", addr, err)
 	}
 	return st
-}
-
-// dbUpTarget maps a backend to its `make <x>-up` container target (for skip hints).
-func dbUpTarget(b store.Backend) string {
-	switch b {
-	case store.BackendPostgres:
-		return "pg"
-	case store.BackendMariaDB:
-		return "maria"
-	default:
-		return "ch"
-	}
 }
 
 // benchVersions is the bitemporal depth the benchmark loads into ClickHouse.
@@ -158,6 +142,46 @@ func ensureLoaded(ctx context.Context, t *testing.T, st store.Store, g *scalegen
 	t.Logf("corpus loaded in %s (not counted in report Wall)", time.Since(start).Round(time.Millisecond))
 }
 
+// benchRange is the [t0,t1) the interval benchmark resolves over: the whole
+// version timeline by default (store.BenchWindow), overridable via
+// POC_BENCH_FROM / POC_BENCH_TO (RFC3339).
+func benchRange(t *testing.T) (time.Time, time.Time) {
+	t.Helper()
+	t0, t1 := store.BenchWindow()
+	if v := os.Getenv("POC_BENCH_FROM"); v != "" {
+		p, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			t.Fatalf("POC_BENCH_FROM: %v", err)
+		}
+		t0 = p.UTC()
+	}
+	if v := os.Getenv("POC_BENCH_TO"); v != "" {
+		p, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			t.Fatalf("POC_BENCH_TO: %v", err)
+		}
+		t1 = p.UTC()
+	}
+	return t0, t1
+}
+
+// rangeMismatch checks a range result against the oracle. The corpus writes an
+// identical spec to every version, so the destination is constant across the
+// window: every returned span must resolve to the expected cluster. Returns "" on
+// agreement, else a sample description.
+func rangeMismatch(versions []rangequery.VersionResolution, c scalegen.Case) string {
+	if len(versions) == 0 {
+		return fmt.Sprintf("host=%s path=%s got=<empty range> want=%q", c.Host, c.Path, c.Expected)
+	}
+	for _, v := range versions {
+		if v.Cluster != c.Expected {
+			return fmt.Sprintf("host=%s path=%s span=[%s,%s) got=%q want=%q",
+				c.Host, c.Path, v.From.Format(time.RFC3339), v.To.Format(time.RFC3339), v.Cluster, c.Expected)
+		}
+	}
+	return ""
+}
+
 func toQueries(cases []scalegen.Case) []simulate.Query {
 	qs := make([]simulate.Query, len(cases))
 	for i, c := range cases {
@@ -189,14 +213,10 @@ func checkOracle(cases []scalegen.Case, res []simulate.Resolution) (int, []strin
 // worst-case online cost see TestResolveSingleWorst.
 const batchNote = "BULK/BATCH throughput: one router_check_tool invocation per gateway amortizes tool startup over that gateway's queries. This is the offline route-simulation number, NOT single-request latency — for worst-case online cost run TestResolveSingleWorst."
 
-// modeLabel prefixes a benchmark mode name with the active backend (POC_DB,
-// default clickhouse) so out/report.md rows from different DBs are comparable.
+// modeLabel prefixes a benchmark mode name with the store engine so out/report.md
+// rows stay self-describing.
 func modeLabel(mode string) string {
-	db := os.Getenv("POC_DB")
-	if db == "" {
-		db = string(store.BackendClickHouse)
-	}
-	return "[" + db + "] " + mode
+	return "[" + string(store.BackendClickHouse) + "] " + mode
 }
 
 // buildResult folds engine metrics into a report.Result.
@@ -279,6 +299,12 @@ func logResolutions(t *testing.T, res []simulate.Resolution) {
 // TestResolveWarm runs the full corpus in WARM mode (dependency-epoch cache, the
 // production steady state): the cache is pre-warmed, so the measured pass pays
 // only router_check_tool resolution cost. Asserts 0 mismatches vs the oracle.
+//
+// This is the bulk/steady-state throughput path and stays single-point (resolved
+// at `now`, the open version): its whole point is amortizing translation across a
+// warm per-gateway batch, which the cold per-segment interval path deliberately
+// does not do. The interval (range) path is benchmarked by TestResolveSingleWorst
+// and exercised end-to-end by TestIPFlowClickHouse.
 func TestResolveWarm(t *testing.T) {
 	runner := requireRouterCheck(t)
 	g := scalegen.New(benchScale())
@@ -303,21 +329,21 @@ func TestResolveWarm(t *testing.T) {
 		t.Fatalf("ResolveAll: %v", err)
 	}
 	logResolutions(t, res)
-	result := buildResult(modeLabel("WARM (cache, steady state)"), cases, res, m, time.Since(start))
+	result := buildResult(modeLabel("WARM (cache, steady state, single-point)"), cases, res, m, time.Since(start))
 	appendReport(t, result)
 	if result.Mismatches != 0 {
 		t.Fatalf("%d mismatches (want 0): %v", result.Mismatches, result.MismatchSamples)
 	}
 }
 
-// TestResolveSingleWorst is the WORST-CASE, single-request benchmark: each
-// host+path runs the FULL pipeline on its own (batch size 1, cold cache) —
-// resolve gateway + translate that gateway's RC + a dedicated router_check_tool
-// invocation for that one query. This is the honest online-serving latency a
-// caller sees when it hands the engine exactly one request; the batch tests
-// amortize the tool's per-invocation startup over ~100 queries/gateway and thus
-// UNDER-report single-request cost. Sampled (POC_WORST_SAMPLE) because each query
-// pays a full tool spawn (~0.2s on docker), so this is O(sample) spawns.
+// TestResolveSingleWorst is the WORST-CASE, single-request benchmark and the
+// default interval path: each host+path is resolved over a time RANGE [from,to)
+// via rangequery — one scoped Overlap load (LoadTrafficWindow), in-memory slicing
+// into per-version segments, then the full pipeline (translate + one
+// router_check_tool) per segment, all cold. This is the honest online-serving
+// latency for a range query; cost scales with the number of version segments in
+// the window. Sampled (POC_WORST_SAMPLE) because each segment pays a full tool
+// spawn. Override the window with POC_BENCH_FROM / POC_BENCH_TO.
 func TestResolveSingleWorst(t *testing.T) {
 	runner := requireRouterCheck(t)
 	g := scalegen.New(benchScale())
@@ -325,7 +351,6 @@ func TestResolveSingleWorst(t *testing.T) {
 	if sample := envInt("POC_WORST_SAMPLE", 200); sample < len(cases) {
 		cases = cases[:sample]
 	}
-	t.Logf("SINGLE-WORST: %d single-query full-pipeline runs", len(cases))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
@@ -333,45 +358,49 @@ func TestResolveSingleWorst(t *testing.T) {
 	st := requireStore(ctx, t)
 	defer st.Close()
 	ensureLoaded(ctx, t, st, g, benchVersions())
-	now := time.Now().UTC()
+	t0, t1 := benchRange(t)
+	t.Logf("SINGLE-WORST (range): %d single-request range queries over [%s, %s)",
+		len(cases), t0.Format(time.RFC3339), t1.Format(time.RFC3339))
 
-	// ColdAlways => every query re-fetches (ScopedFor) and re-translates its RC (true
-	// worst case). Get always misses, so a single shared engine is fine.
-	eng := buildEngine(ctx, g, rccache.ColdAlways, runner, st, now)
+	deps := rangequery.Deps{Translator: translate.NewTranslator(), Runner: runner}
 
-	agg := &report.Result{Mode: modeLabel("SINGLE-WORST (per-request, cold, batch=1)"), Queries: len(cases)}
-	agg.Notes = "Worst-case ONLINE latency: full pipeline per single host+path (resolve + translate + ONE router_check_tool invocation). The total-per-query p50/p99 below is the real single-request cost."
+	agg := &report.Result{Mode: modeLabel("SINGLE-WORST (per-request, cold, batch=1, range)"), Queries: len(cases)}
+	agg.Notes = "Worst-case ONLINE latency over an interval: one scoped Overlap load (LoadTrafficWindow) + in-memory slicing + translate + router_check_tool per DISTINCT config. Lookup stage = the single DB Overlap load. Cost scales with the number of distinct configs in [from,to); identical-spec version bumps are deduped, so translate/check are counted per distinct config, not per raw segment."
 
 	start := time.Now()
+	totalSegments, totalDistinct := 0, 0
 	for _, c := range cases {
-		q := simulate.Query{Host: c.Host, Path: c.Path}
-		t0 := time.Now()
-		res, m, err := eng.ResolveAll(ctx, []simulate.Query{q})
-		perQuery := time.Since(t0)
+		// Broad/unknown hosts (direct-*, nope-*) have no traffic IP by construction;
+		// like the single-point path, an empty IP yields no candidates -> a miss
+		// (Expected ""), not an error.
+		ip, _ := g.IPForHost(c.Host)
+		tq := time.Now()
+		versions, m, err := deps.ResolveTimed(ctx, st, c.Host, c.Path, ip, t0, t1)
+		perQuery := time.Since(tq)
 		if err != nil {
-			t.Fatalf("ResolveAll single: %v", err)
+			t.Fatalf("range resolve: %v", err)
 		}
-		logResolutions(t, res)
+		totalSegments += m.Segments
+		totalDistinct += m.DistinctCfgs
 		agg.Stages.Total.Add(perQuery)
-		agg.Stages.Lookup.Add(m.Stages.Lookup.Mean())
-		agg.Stages.Resolve.Add(m.Stages.Resolve.Mean())
-		if m.CacheMisses > 0 {
-			agg.Stages.ScopedFetch.Add(m.Stages.ScopedFetch.Mean())
-			agg.Stages.Translate.Add(m.Stages.Translate.Mean())
-		}
-		agg.Stages.Check.Add(m.Stages.Check.Mean())
+		agg.Stages.Lookup.Add(m.Load) // the single DB Overlap load for the whole window
+		agg.Stages.Resolve.Add(m.Resolve)
+		agg.Stages.ScopedFetch.Add(m.ScopedFor)
+		agg.Stages.Translate.Add(m.Translate)
+		agg.Stages.Check.Add(m.Check)
 		agg.CacheHits += m.CacheHits
 		agg.CacheMisses += m.CacheMisses
-		if res[0].Cluster != c.Expected {
+		if mism := rangeMismatch(versions, c); mism != "" {
 			agg.Mismatches++
 			if len(agg.MismatchSamples) < 10 {
-				agg.MismatchSamples = append(agg.MismatchSamples,
-					fmt.Sprintf("host=%s path=%s got=%q want=%q", c.Host, c.Path, res[0].Cluster, c.Expected))
+				agg.MismatchSamples = append(agg.MismatchSamples, mism)
 			}
 		}
 	}
 	agg.Wall = time.Since(start)
 	agg.PeakRSSKB = peakRSSKB()
+	t.Logf("range slicing: %d cases, %d total segments (avg %.1f/case), %d distinct configs translated+checked (identical-spec versions dedup)",
+		len(cases), totalSegments, float64(totalSegments)/float64(len(cases)), totalDistinct)
 	appendReport(t, agg)
 	if agg.Mismatches != 0 {
 		t.Fatalf("%d mismatches (want 0): %v", agg.Mismatches, agg.MismatchSamples)

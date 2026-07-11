@@ -27,6 +27,7 @@ import (
 	"github.com/example/metadata-exporter/poc/route2a/internal/gwresolve"
 	"github.com/example/metadata-exporter/poc/route2a/internal/ingload"
 	"github.com/example/metadata-exporter/poc/route2a/internal/matchcheck"
+	"github.com/example/metadata-exporter/poc/route2a/internal/rangequery"
 	"github.com/example/metadata-exporter/poc/route2a/internal/rccache"
 	"github.com/example/metadata-exporter/poc/route2a/internal/scalegen"
 	"github.com/example/metadata-exporter/poc/route2a/internal/simulate"
@@ -38,28 +39,20 @@ import (
 func main() {
 	log.SetFlags(0)
 	var (
-		db   = flag.String("db", envStr("POC_DB", ""), "backend: clickhouse | postgres | mariadb (default clickhouse)")
-		addr = flag.String("addr", "", "backend connection string; empty => POC_<DB>_ADDR or per-DB default")
+		addr = flag.String("addr", "", "ClickHouse connection string; empty => POC_CH_ADDR or default 127.0.0.1:9000")
 		mode = flag.String("mode", "query", "load | query | verify")
 		ip   = flag.String("ip", "", "destination IP (post-DNS); empty => derive from -host")
 		host = flag.String("host", "svc00.gw000.example.com", "request :authority host")
 		path = flag.String("path", "/healthz", "request :path")
+		from = flag.String("from", "", "range start (RFC3339); with -to, resolve the request over [from,to) per version")
+		to   = flag.String("to", "", "range end (RFC3339); with -from, resolve the request over [from,to) per version")
 	)
 	flag.Parse()
 
-	backend := store.BackendClickHouse
-	if *db != "" {
-		backend = store.Backend(*db)
-	}
-	connStr := *addr
-	if connStr == "" {
-		connStr = storeopen.Addr(backend)
-	}
-
 	ctx := context.Background()
-	st, err := storeopen.Open(ctx, backend, connStr)
+	st, err := storeopen.Open(ctx, *addr)
 	if err != nil {
-		log.Fatalf("open %s: %v", backend, err)
+		log.Fatalf("open clickhouse: %v", err)
 	}
 	defer st.Close()
 
@@ -71,7 +64,17 @@ func main() {
 			log.Fatalf("load: %v", err)
 		}
 	case "query":
-		if err := query(ctx, st, gen, *ip, *host, *path); err != nil {
+		// -from and -to (both set) switch to the interval path (per-version result);
+		// otherwise resolve at "now" (single point).
+		if *from != "" || *to != "" {
+			t0, t1, err := parseRange(*from, *to)
+			if err != nil {
+				log.Fatalf("range: %v", err)
+			}
+			if err := queryRange(ctx, st, gen, *ip, *host, *path, t0, t1); err != nil {
+				log.Fatalf("query range: %v", err)
+			}
+		} else if err := query(ctx, st, gen, *ip, *host, *path); err != nil {
 			log.Fatalf("query: %v", err)
 		}
 	case "verify":
@@ -81,6 +84,25 @@ func main() {
 	default:
 		log.Fatalf("unknown -mode %q (load|query|verify)", *mode)
 	}
+}
+
+// parseRange parses the -from/-to RFC3339 bounds; both must be set and ordered.
+func parseRange(from, to string) (time.Time, time.Time, error) {
+	if from == "" || to == "" {
+		return time.Time{}, time.Time{}, fmt.Errorf("both -from and -to are required for a range query")
+	}
+	t0, err := time.Parse(time.RFC3339, from)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("parse -from: %w", err)
+	}
+	t1, err := time.Parse(time.RFC3339, to)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("parse -to: %w", err)
+	}
+	if !t0.Before(t1) {
+		return time.Time{}, time.Time{}, fmt.Errorf("-from %s must be before -to %s", from, to)
+	}
+	return t0.UTC(), t1.UTC(), nil
 }
 
 // envVersions reads the per-resource-type version counts (bitemporal depth).
@@ -188,6 +210,51 @@ func query(ctx context.Context, st store.Store, gen *scalegen.Gen, ip, host, pat
 	return nil
 }
 
+// queryRange runs the interval pipeline for one request over [t0,t1): load the
+// traffic window once, slice it at version boundaries, and resolve each segment,
+// printing one line per version (time span + gateway + cluster).
+func queryRange(ctx context.Context, st store.Store, gen *scalegen.Gen, ip, host, path string, t0, t1 time.Time) error {
+	if ip == "" {
+		got, ok := gen.IPForHost(host)
+		if !ok {
+			return fmt.Errorf("cannot derive IP from host %q (pass -ip)", host)
+		}
+		ip = got
+		log.Printf("DNS lookup (simulated): %s -> %s", host, ip)
+	}
+	log.Printf("request: host=%s path=%s dst_ip=%s  over [%s, %s)",
+		host, path, ip, t0.Format(time.RFC3339), t1.Format(time.RFC3339))
+
+	runner, kind, ok := matchcheck.Detect()
+	if !ok {
+		return fmt.Errorf("router_check_tool unavailable (no native binary, no tools image) — cannot resolve clusters")
+	}
+	log.Printf("router_check_tool: %s", kind)
+
+	deps := rangequery.Deps{Translator: translate.NewTranslator(), Runner: runner}
+	versions, err := deps.Resolve(ctx, st, host, path, ip, t0, t1)
+	if err != nil {
+		return err
+	}
+	if len(versions) == 0 {
+		log.Printf("RESULT: no version in range (empty traffic window)")
+		return nil
+	}
+	for _, v := range versions {
+		cluster := v.Cluster
+		if cluster == "" {
+			cluster = "<no route / miss>"
+		}
+		gw := v.Gateway
+		if gw == "" {
+			gw = "<no gateway>"
+		}
+		log.Printf("  [%s, %s) gateway=%s cluster=%s",
+			v.From.Format(time.RFC3339), v.To.Format(time.RFC3339), gw, cluster)
+	}
+	return nil
+}
+
 // verify samples the 3-hop against the oracle and checks multi-version selection.
 func verify(ctx context.Context, st store.Store, gen *scalegen.Gen) error {
 	t := time.Now().UTC()
@@ -267,13 +334,6 @@ func pass(ok bool) string {
 		return "PASS"
 	}
 	return "FAIL"
-}
-
-func envStr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
 
 func envInt(key string, def int) int {

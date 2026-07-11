@@ -1,12 +1,11 @@
 // Package store is the backend-agnostic contract for the ingress-traffic config
 // store. It holds the value types and the Store/batch interfaces the pipeline
 // depends on, so the loader (internal/ingload), the benchmark harness, and the
-// ipflow CLI can run against ClickHouse, PostgreSQL, or MariaDB interchangeably.
+// ipflow CLI can run against the store without knowing the engine.
 //
-// Each backend (internal/chstore, internal/pgstore, internal/mariastore)
-// implements Store with the fastest single-node access path for its engine; the
-// factory in internal/storeopen dials one by Backend name. This package imports
-// no backend, so it stays a leaf (backends import it; the factory imports both).
+// The engine is ClickHouse (internal/chstore) — the same store production uses,
+// so the PoC stays portable. The factory in internal/storeopen dials it. This
+// package imports no backend, so it stays a leaf (the backend imports it).
 package store
 
 import (
@@ -16,19 +15,15 @@ import (
 	"github.com/example/metadata-exporter/poc/route2a/internal/translate"
 )
 
-// Backend names a config-store engine. The value is what POC_DB / -db select.
+// Backend names the config-store engine (ClickHouse). Kept as a named value so
+// report rows and log lines can label the store.
 type Backend string
 
-const (
-	BackendClickHouse Backend = "clickhouse"
-	BackendPostgres   Backend = "postgres"
-	BackendMariaDB    Backend = "mariadb"
-)
+const BackendClickHouse Backend = "clickhouse"
 
-// farFuture is the open-ended `valid_to` sentinel for the current version. It
-// stays within ClickHouse DateTime64 range (max year 2299) while being
-// comfortably after any query time; MariaDB DATETIME (max 9999) and PostgreSQL
-// timestamp both accommodate it too.
+// farFuture is the open-ended `valid_to` sentinel for the current (open) version.
+// It stays within ClickHouse DateTime64 range (max year 2299) while being
+// comfortably after any query time.
 var farFuture = time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // versionBase/versionStep lay the K versions on a fixed early timeline so the
@@ -68,6 +63,11 @@ func VersionMidTime(v int) time.Time {
 	return versionBase.Add(time.Duration(v)*versionStep + versionStep/2)
 }
 
+// BenchWindow is the default [t0,t1) for a range query over the whole corpus: the
+// first version's start through the far-future sentinel, so every version on the
+// timeline falls inside it (segments >= 1).
+func BenchWindow() (time.Time, time.Time) { return versionBase, farFuture }
+
 // ServiceRow is one service_versions row (ingress LB: ingress_ips/selector set,
 // hostname empty; backend: hostname/port set, ingress_ips empty).
 type ServiceRow struct {
@@ -87,6 +87,50 @@ type GatewayCand struct {
 	Namespace   string
 	Name        string
 	ServerHosts []string
+}
+
+// DeployRow / GatewayRow / VSRow are full version rows for the range path (the
+// point-in-time path takes only what each hop needs). They carry the materialized
+// ValidFrom/ValidTo so the in-memory window can do AsOf without re-hitting the DB;
+// GatewayRow/VSRow keep spec_json so ScopedFor can rebuild off the loaded rows.
+type DeployRow struct {
+	Namespace, Name    string
+	ValidFrom, ValidTo time.Time
+	Rev                uint32
+	PodLabels          []string
+	IngestSeq          uint64
+}
+
+type GatewayRow struct {
+	Namespace, Name    string
+	ValidFrom, ValidTo time.Time
+	Rev                uint32
+	SelectorKV         []string
+	ServerHosts        []string
+	SpecJSON           string
+	IngestSeq          uint64
+}
+
+type VSRow struct {
+	Namespace, Name    string
+	ValidFrom, ValidTo time.Time
+	Rev                uint32
+	BoundGateways      []string
+	SpecJSON           string
+	IngestSeq          uint64
+}
+
+// TrafficWindow is every resource version overlapping [t0,t1) that is reachable
+// from one destination IP — the ingress Service, its Deployment, the candidate
+// Gateways, their bound VirtualServices, and the backend Services those VS route
+// to. It is loaded once (LoadTrafficWindow), then sliced/resolved in memory
+// (internal/memwindow) with no further DB round-trips. Each row's ValidTo is the
+// materialized column value, so AsOf(t) is `ValidFrom <= t < ValidTo`.
+type TrafficWindow struct {
+	Services []ServiceRow // ingress LB + backend destination Service versions
+	Deploys  []DeployRow
+	Gateways []GatewayRow
+	VSes     []VSRow
 }
 
 // Store is the versioned config store one backend implements. Reads answer the
@@ -110,6 +154,12 @@ type Store interface {
 	// VirtualServices + destination Services) as-of time t. ok=false if the
 	// gateway has no version live at t.
 	ScopedFor(ctx context.Context, gwName string, t time.Time) (translate.ScopedInput, bool, error)
+
+	// LoadTrafficWindow fetches every resource version overlapping [t0,t1) that is
+	// reachable from destination IP (one scoped Overlap load per resource kind,
+	// using the materialized valid_to: valid_from < t1 AND t0 < valid_to). The
+	// range query slices and resolves the returned window in memory.
+	LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Time) (TrafficWindow, error)
 
 	// CountRows returns the row count of a table (all versions).
 	CountRows(ctx context.Context, table string) (uint64, error)
