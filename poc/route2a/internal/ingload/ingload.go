@@ -69,13 +69,13 @@ func Load(ctx context.Context, st store.Store, gen *scalegen.Gen, v Versions, pr
 				return err
 			}
 		}
-		// backend destination Services.
+		// backend destination Services (identity = (namespace, name); all ports in
+		// one row via Ports/spec_json).
 		for _, bs := range gen.BackendServices(i) {
 			for _, ver := range store.Versions(v.KSvc) {
 				if err := svcB.Append(store.ServiceRow{
 					Namespace: bs.Namespace, Name: bs.Name, ValidFrom: ver.From, ValidTo: ver.To, Rev: uint32(ver.Rev),
-					IngressIPs: empty, Selector: empty, Hostname: bs.Hostname, Port: uint32(bs.Port),
-					PortName: bs.PortName, Protocol: bs.Protocol, IngestSeq: next(),
+					IngressIPs: empty, Selector: empty, Ports: bs.Ports, IngestSeq: next(),
 				}); err != nil {
 					return err
 				}

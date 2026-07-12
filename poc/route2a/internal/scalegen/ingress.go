@@ -26,6 +26,8 @@ import (
 	"strings"
 
 	"istio.io/istio/pkg/config"
+
+	"github.com/example/metadata-exporter/poc/route2a/internal/store"
 )
 
 // ingressWorkloadApp is the extra pod-template label the ingress Deployment
@@ -50,13 +52,13 @@ type IngressDeploymentInfo struct {
 }
 
 // BackendSvc is one route-destination Service (what istiod turns into a cluster).
+// Ports holds every port the Service serves (one row / one spec_json); its VS
+// routes always target the primary svcPort.
 type BackendSvc struct {
 	Name      string
 	Namespace string
 	Hostname  string // FQDN (destination.host)
-	Port      int
-	PortName  string
-	Protocol  string
+	Ports     []store.SvcPort
 }
 
 // ingressName is the ingress Service/Deployment name for gateway i.
@@ -123,13 +125,28 @@ func (g *Gen) BackendServices(i int) []BackendSvc {
 				Name:      destShort(i, j, rule),
 				Namespace: vsNS(i),
 				Hostname:  destFQDN(i, j, rule),
-				Port:      svcPort,
-				PortName:  "http",
-				Protocol:  "TCP",
+				Ports:     backendPorts(i, j),
 			})
 		}
 	}
 	return out
+}
+
+// backendPorts is a Service's port set. Every Service serves the primary http
+// port (svcPort) that its VS routes target, so the resolved cluster is always
+// outbound|svcPort||fqdn; a deterministic subset also serves extra ports, so the
+// multi-port build path is exercised without changing any oracle expectation.
+func backendPorts(i, j int) []store.SvcPort {
+	ports := []store.SvcPort{{Name: "http", Port: svcPort, Protocol: "TCP"}}
+	switch (i + j) % 3 {
+	case 1:
+		ports = append(ports, store.SvcPort{Name: "https", Port: svcPortHTTPS, Protocol: "TCP"})
+	case 2:
+		ports = append(ports,
+			store.SvcPort{Name: "https", Port: svcPortHTTPS, Protocol: "TCP"},
+			store.SvcPort{Name: "grpc", Port: svcPortGRPC, Protocol: "TCP"})
+	}
+	return ports
 }
 
 // GatewayConfig / VSConfig expose the typed Istio configs (already built by the

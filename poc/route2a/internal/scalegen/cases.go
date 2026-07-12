@@ -126,7 +126,16 @@ spec:
         protocol: HTTP
       hosts:
         - "%s"
-`, gwName(i), gwNS, gwName(i), gwHostPat(i))
+    - port:
+        number: 443
+        name: https
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: cred-%s
+      hosts:
+        - "%s"
+`, gwName(i), gwNS, gwName(i), gwHostPat(i), pad3(i), gwHostPat(i))
 }
 
 func writeVSYAML(b *strings.Builder, i, j int) {
@@ -187,8 +196,8 @@ metadata:
   namespace: %s
 spec:
   ports:
-    - name: http
-      port: %d
-      protocol: TCP
-`, destShort(i, j, rule), vsNS(i), svcPort)
+`, destShort(i, j, rule), vsNS(i))
+	for _, p := range backendPorts(i, j) {
+		fmt.Fprintf(b, "    - name: %s\n      port: %d\n      protocol: %s\n", p.Name, p.Port, p.Protocol)
+	}
 }

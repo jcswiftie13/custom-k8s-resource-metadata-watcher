@@ -201,9 +201,16 @@ func (m *Window) ConfigSigAt(gwName string, t time.Time) (uint64, bool) {
 	var svcParts []string
 	for i := range m.w.Services {
 		r := &m.w.Services[i]
-		if r.Hostname != "" && asOf(r.ValidFrom, r.ValidTo, t) {
-			svcParts = append(svcParts, fmt.Sprintf("%s\x00%s\x00%d\x00%s", r.Hostname, r.Namespace, r.Port, r.PortName))
+		// Backend Services (Ports set) feed ScopedFor; fold identity + the whole
+		// port set so the signature stays a superset of the translate input.
+		if len(r.Ports) == 0 || !asOf(r.ValidFrom, r.ValidTo, t) {
+			continue
 		}
+		part := r.Namespace + "\x00" + r.Name
+		for _, p := range r.Ports {
+			part += fmt.Sprintf("\x00%s\x00%d", p.Name, p.Port)
+		}
+		svcParts = append(svcParts, part)
 	}
 	sort.Strings(svcParts)
 	for _, p := range svcParts {
@@ -262,27 +269,35 @@ func (m *Window) ScopedFor(gwName string, t time.Time) (translate.ScopedInput, b
 	}, true, nil
 }
 
-// backendServices rebuilds the destination Services matching hosts as-of t. Keyed
-// by hostname (the Service identity FQDN), not namespace — portable to production
-// where backend Service ns == VS ns != gateway ns.
+// backendServices rebuilds the destination Services matching hosts as-of t.
+// Identity is the (namespace, name) parsed from each destination.host FQDN — not
+// scoped by the gateway namespace, so it's portable to production where backend
+// Service ns == VS ns != gateway ns. Each matched row is one Service carrying all
+// its ports.
 func (m *Window) backendServices(hosts []string, t time.Time) []*model.Service {
 	if len(hosts) == 0 {
 		return nil
 	}
 	want := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
-		want[h] = true
+		if name, ns, ok := store.ParseBackendHost(h); ok {
+			want[ns+"/"+name] = true
+		}
 	}
 	var out []*model.Service
 	for i := range m.w.Services {
 		r := &m.w.Services[i]
-		if r.Hostname == "" || !want[r.Hostname] || !asOf(r.ValidFrom, r.ValidTo, t) {
+		if len(r.Ports) == 0 || !want[r.Namespace+"/"+r.Name] || !asOf(r.ValidFrom, r.ValidTo, t) {
 			continue
 		}
+		pl := make(model.PortList, 0, len(r.Ports))
+		for _, p := range r.Ports {
+			pl = append(pl, &model.Port{Name: p.Name, Port: int(p.Port), Protocol: protocol.Parse(p.Name)})
+		}
 		out = append(out, &model.Service{
-			Hostname:       host.Name(r.Hostname),
+			Hostname:       host.Name(store.BackendFQDN(r.Name, r.Namespace)),
 			DefaultAddress: "0.0.0.0",
-			Ports:          model.PortList{{Name: r.PortName, Port: int(r.Port), Protocol: protocol.Parse(r.PortName)}},
+			Ports:          pl,
 			Attributes:     model.ServiceAttributes{Namespace: r.Namespace},
 		})
 	}

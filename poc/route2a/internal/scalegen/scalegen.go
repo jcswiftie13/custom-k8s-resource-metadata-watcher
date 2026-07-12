@@ -5,7 +5,7 @@
 //
 // It is the single source of ground truth:
 //   - ScopedFor(gw) yields exactly one ingress's config (1 Gateway CR + its VS
-//     + the Services those VS route to) for on-demand scoped translation — the
+//   - the Services those VS route to) for on-demand scoped translation — the
 //     whole cluster is NEVER materialized at once.
 //   - ExpectedCluster(host,path) and Cases(...) give an oracle computed purely
 //     by construction, independent of istiod, so the translate+Envoy pipeline
@@ -34,13 +34,16 @@ import (
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
 
+	"github.com/example/metadata-exporter/poc/route2a/internal/store"
 	"github.com/example/metadata-exporter/poc/route2a/internal/translate"
 )
 
 const (
-	svcPort   = 8080
-	gwNS      = "istio-system"
-	regexRule = "^/products/[0-9]+$"
+	svcPort      = 8080 // primary http port every VS route targets (the resolved cluster)
+	svcPortHTTPS = 8443 // extra port on some Services (multi-port coverage)
+	svcPortGRPC  = 9090 // extra port on some Services (multi-port coverage)
+	gwNS         = "istio-system"
+	regexRule    = "^/products/[0-9]+$"
 )
 
 // Config parameterizes the corpus (ramp 10->100->600 to find the knee).
@@ -81,15 +84,19 @@ const broadName = "gw-broad-all"
 func pad3(i int) string { return fmt.Sprintf("%03d", i) }
 func pad2(j int) string { return fmt.Sprintf("%02d", j) }
 
-func gwName(i int) string      { return "gw-" + pad3(i) }
+func gwName(i int) string                { return "gw-" + pad3(i) }
 func gwSelector(i int) map[string]string { return map[string]string{"istio": gwName(i)} }
-func gwHostPat(i int) string   { return "*.gw" + pad3(i) + ".example.com" }
-func vsHost(i, j int) string   { return "svc" + pad2(j) + ".gw" + pad3(i) + ".example.com" }
-func vsNS(i int) string        { return gwName(i) }
+func gwHostPat(i int) string             { return "*.gw" + pad3(i) + ".example.com" }
+func vsHost(i, j int) string             { return "svc" + pad2(j) + ".gw" + pad3(i) + ".example.com" }
+func vsNS(i int) string                  { return gwName(i) }
 
 func destShort(i, j int, rule string) string { return "svc-" + pad3(i) + "-" + pad2(j) + "-" + rule }
-func destFQDN(i, j int, rule string) string  { return destShort(i, j, rule) + "." + vsNS(i) + ".svc.cluster.local" }
-func clusterOf(i, j int, rule string) string { return fmt.Sprintf("outbound|%d||%s", svcPort, destFQDN(i, j, rule)) }
+func destFQDN(i, j int, rule string) string {
+	return destShort(i, j, rule) + "." + vsNS(i) + ".svc.cluster.local"
+}
+func clusterOf(i, j int, rule string) string {
+	return fmt.Sprintf("outbound|%d||%s", svcPort, destFQDN(i, j, rule))
+}
 
 // Gateways returns every gateway (the 600 + broad ones) for gwresolve.
 func (g *Gen) Gateways() []GatewayInfo {
@@ -132,15 +139,25 @@ func httpRoute(uri *networking.StringMatch, destHost string) *networking.HTTPRou
 	return r
 }
 
-func exact(s string) *networking.StringMatch  { return &networking.StringMatch{MatchType: &networking.StringMatch_Exact{Exact: s}} }
-func prefix(s string) *networking.StringMatch { return &networking.StringMatch{MatchType: &networking.StringMatch_Prefix{Prefix: s}} }
-func regex(s string) *networking.StringMatch  { return &networking.StringMatch{MatchType: &networking.StringMatch_Regex{Regex: s}} }
+func exact(s string) *networking.StringMatch {
+	return &networking.StringMatch{MatchType: &networking.StringMatch_Exact{Exact: s}}
+}
+func prefix(s string) *networking.StringMatch {
+	return &networking.StringMatch{MatchType: &networking.StringMatch_Prefix{Prefix: s}}
+}
+func regex(s string) *networking.StringMatch {
+	return &networking.StringMatch{MatchType: &networking.StringMatch_Regex{Regex: s}}
+}
 
-func svcModel(fqdn, ns string) *model.Service {
+func svcModel(fqdn, ns string, ports []store.SvcPort) *model.Service {
+	pl := make(model.PortList, 0, len(ports))
+	for _, p := range ports {
+		pl = append(pl, &model.Port{Name: p.Name, Port: int(p.Port), Protocol: protocol.Parse(p.Name)})
+	}
 	return &model.Service{
 		Hostname:       host.Name(fqdn),
 		DefaultAddress: "0.0.0.0",
-		Ports:          model.PortList{&model.Port{Name: "http", Port: svcPort, Protocol: protocol.HTTP}},
+		Ports:          pl,
 		Attributes:     model.ServiceAttributes{Namespace: ns},
 	}
 }
@@ -163,15 +180,30 @@ func (g *Gen) vsConfig(i, j int) config.Config {
 	}
 }
 
+// gwServers builds a gateway's listeners: a plain HTTP :80 server and a
+// TLS-terminated HTTPS :443 server, both on the same host pattern. The 443
+// server exercises the https.<port>.<name>.<gw>.<ns> RC-name path; VS routing is
+// port-independent, so both listeners resolve host+path to the same clusters.
+func gwServers(hostPat, credName string) []*networking.Server {
+	return []*networking.Server{
+		{
+			Port:  &networking.Port{Number: 80, Name: "http", Protocol: "HTTP"},
+			Hosts: []string{hostPat},
+		},
+		{
+			Port:  &networking.Port{Number: 443, Name: "https", Protocol: "HTTPS"},
+			Hosts: []string{hostPat},
+			Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_SIMPLE, CredentialName: credName},
+		},
+	}
+}
+
 func (g *Gen) gwConfig(i int) config.Config {
 	return config.Config{
 		Meta: config.Meta{GroupVersionKind: gvk.Gateway, Name: gwName(i), Namespace: gwNS},
 		Spec: &networking.Gateway{
 			Selector: gwSelector(i),
-			Servers: []*networking.Server{{
-				Port:  &networking.Port{Number: 80, Name: "http", Protocol: "HTTP"},
-				Hosts: []string{gwHostPat(i)},
-			}},
+			Servers:  gwServers(gwHostPat(i), "cred-"+pad3(i)),
 		},
 	}
 }
@@ -189,7 +221,7 @@ func (g *Gen) ScopedFor(gwName string) (translate.ScopedInput, bool) {
 					Meta: config.Meta{GroupVersionKind: gvk.Gateway, Name: broadName, Namespace: gwNS},
 					Spec: &networking.Gateway{
 						Selector: map[string]string{"istio": broadName},
-						Servers:  []*networking.Server{{Port: &networking.Port{Number: 80, Name: "http", Protocol: "HTTP"}, Hosts: []string{"*.example.com"}}},
+						Servers:  gwServers("*.example.com", "cred-broad"),
 					},
 				}},
 				Proxy: translate.GatewayProxy{Name: broadName, Namespace: gwNS, Labels: map[string]string{"istio": broadName}},
@@ -204,7 +236,7 @@ func (g *Gen) ScopedFor(gwName string) (translate.ScopedInput, bool) {
 	for j := 0; j < g.cfg.VSPerGW; j++ {
 		cfgs = append(cfgs, g.vsConfig(i, j))
 		for _, rule := range []string{"exact", "prefix", "regex", "default"} {
-			svcs = append(svcs, svcModel(destFQDN(i, j, rule), vsNS(i)))
+			svcs = append(svcs, svcModel(destFQDN(i, j, rule), vsNS(i), backendPorts(i, j)))
 		}
 	}
 	return translate.ScopedInput{

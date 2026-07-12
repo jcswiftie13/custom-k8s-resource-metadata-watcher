@@ -375,7 +375,7 @@ func TestResolveSingleWorst(t *testing.T) {
 		// (Expected ""), not an error.
 		ip, _ := g.IPForHost(c.Host)
 		tq := time.Now()
-		versions, m, err := deps.ResolveTimed(ctx, st, c.Host, c.Path, ip, t0, t1)
+		versions, m, err := deps.ResolveTimed(ctx, st, c.Host, c.Path, ip, 80, t0, t1)
 		perQuery := time.Since(tq)
 		if err != nil {
 			t.Fatalf("range resolve: %v", err)

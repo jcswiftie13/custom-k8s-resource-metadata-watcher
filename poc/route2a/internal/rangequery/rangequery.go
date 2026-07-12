@@ -58,16 +58,16 @@ type outcome struct {
 	cluster string
 }
 
-// Resolve returns the gateway+cluster a request (host, path, dst ip) resolved to
-// across [t0,t1), one entry per distinct outcome.
-func (d Deps) Resolve(ctx context.Context, st store.Store, host, path, ip string, t0, t1 time.Time) ([]VersionResolution, error) {
-	out, _, err := d.ResolveTimed(ctx, st, host, path, ip, t0, t1)
+// Resolve returns the gateway+cluster a request (host, path, dst ip, listener
+// port) resolved to across [t0,t1), one entry per distinct outcome. port 0 => 80.
+func (d Deps) Resolve(ctx context.Context, st store.Store, host, path, ip string, port int, t0, t1 time.Time) ([]VersionResolution, error) {
+	out, _, err := d.ResolveTimed(ctx, st, host, path, ip, port, t0, t1)
 	return out, err
 }
 
 // ResolveTimed is Resolve with per-stage timing folded into Metrics (for the
 // benchmark). The window is loaded once; each distinct config resolves once.
-func (d Deps) ResolveTimed(ctx context.Context, st store.Store, host, path, ip string, t0, t1 time.Time) ([]VersionResolution, *Metrics, error) {
+func (d Deps) ResolveTimed(ctx context.Context, st store.Store, host, path, ip string, port int, t0, t1 time.Time) ([]VersionResolution, *Metrics, error) {
 	m := &Metrics{}
 
 	loadStart := time.Now()
@@ -105,7 +105,7 @@ func (d Deps) ResolveTimed(ctx context.Context, st store.Store, host, path, ip s
 				res = cached
 				m.CacheHits++
 			} else {
-				r, err := d.resolveConfig(ctx, mw, gw, host, path, t, m)
+				r, err := d.resolveConfig(ctx, mw, gw, host, path, port, t, m)
 				if err != nil {
 					return nil, m, err
 				}
@@ -129,7 +129,7 @@ func (d Deps) ResolveTimed(ctx context.Context, st store.Store, host, path, ip s
 
 // resolveConfig runs the expensive stages for one gateway as-of t: in-memory
 // ScopedFor -> istiod translate -> router_check_tool. Timings fold into m.
-func (d Deps) resolveConfig(ctx context.Context, mw *memwindow.Window, gw, host, path string, t time.Time, m *Metrics) (outcome, error) {
+func (d Deps) resolveConfig(ctx context.Context, mw *memwindow.Window, gw, host, path string, port int, t time.Time, m *Metrics) (outcome, error) {
 	sf := time.Now()
 	scoped, found, err := mw.ScopedFor(gw, t)
 	m.ScopedFor += time.Since(sf)
@@ -139,6 +139,7 @@ func (d Deps) resolveConfig(ctx context.Context, mw *memwindow.Window, gw, host,
 	if !found {
 		return outcome{gateway: gw}, nil // gateway present but no config -> miss cluster
 	}
+	scoped.Port = port
 
 	tt := time.Now()
 	rc, err := d.Translator.Translate(scoped)

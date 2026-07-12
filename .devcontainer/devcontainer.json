@@ -11,8 +11,6 @@
   },
   "remoteEnv": {
     "POC_CH_ADDR": "clickhouse:9000",
-    "POC_PG_ADDR": "postgres://postgres:postgres@postgres:5432/route2a?sslmode=disable",
-    "POC_MARIA_ADDR": "root:root@tcp(mariadb:3306)/route2a?parseTime=true&loc=UTC",
     "POC_ROUTERCHECK_IMAGE": "envoyproxy/envoy:tools-v1.34-latest",
     "PATH": "${containerEnv:HOME}/.local/bin:${containerEnv:PATH}"
   },
@@ -34,8 +32,6 @@
   },
   "forwardPorts": [
     8123,
-    9000,
-    5432,
-    3306
+    9000
   ]
 }

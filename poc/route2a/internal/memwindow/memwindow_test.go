@@ -64,7 +64,7 @@ func testWindow(t *testing.T) store.TrafficWindow {
 		}},
 		Services: []store.ServiceRow{{
 			Namespace: "ns-a", Name: "svc-1", ValidFrom: sigT0, ValidTo: sigT1,
-			Hostname: "svc-1.ns-a.svc.cluster.local", Port: 8080, PortName: "http",
+			Ports: []store.SvcPort{{Name: "http", Port: 8080, Protocol: "TCP"}},
 		}},
 	}
 }
@@ -146,9 +146,15 @@ func perturbConfig(t *testing.T, w *store.TrafficWindow, kind config.GroupVersio
 }
 
 func perturbService(t *testing.T, w *store.TrafficWindow, hostname string) {
+	name, ns, ok := store.ParseBackendHost(hostname)
+	if !ok {
+		t.Fatalf("service host %q is not an in-cluster FQDN", hostname)
+	}
 	for i := range w.Services {
-		if w.Services[i].Hostname == hostname {
-			w.Services[i].Port++ // any identity change the signature must notice
+		if w.Services[i].Namespace == ns && w.Services[i].Name == name {
+			// any change to the port set the signature must notice (append
+			// reallocates, so the cloned window's row isn't shared with base)
+			w.Services[i].Ports = append(w.Services[i].Ports, store.SvcPort{Name: "perturb", Port: 1})
 			return
 		}
 	}

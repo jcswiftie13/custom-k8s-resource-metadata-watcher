@@ -54,6 +54,10 @@ type Config struct {
 	// over all gateways (the original in-memory path).
 	Lookup func(host string) ([]string, error)
 	Runner matchcheck.Runner
+	// Port is the ingress listener port to resolve against; it selects which
+	// RouteConfiguration (http.<port> or https.<port>...) each gateway is
+	// translated to. 0 => 80.
+	Port int
 }
 
 // Engine resolves host+path to a destination service cluster.
@@ -133,6 +137,7 @@ func (e *Engine) ResolveAll(ctx context.Context, queries []Query) ([]Resolution,
 			if !found {
 				return nil, nil, fmt.Errorf("no scoped config for gateway %q", gw)
 			}
+			scoped.Port = e.cfg.Port
 			t0 = time.Now()
 			translated, err := e.cfg.Translator.Translate(scoped)
 			if err != nil {

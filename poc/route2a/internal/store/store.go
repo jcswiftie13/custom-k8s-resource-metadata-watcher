@@ -10,6 +10,8 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/example/metadata-exporter/poc/route2a/internal/translate"
@@ -69,16 +71,83 @@ func VersionMidTime(v int) time.Time {
 func BenchWindow() (time.Time, time.Time) { return versionBase, farFuture }
 
 // ServiceRow is one service_versions row (ingress LB: ingress_ips/selector set,
-// hostname empty; backend: hostname/port set, ingress_ips empty).
+// Ports empty; backend: Ports set, ingress_ips empty). One row per Service
+// version — a backend Service's ports all live in Ports (serialized to the
+// spec_json column), so a multi-port Service is a single row, not one row per
+// port. The backend Service's identity is (Namespace, Name); its FQDN (the
+// destination.host a VS routes to) is derived — see BackendFQDN / ParseBackendHost.
 type ServiceRow struct {
 	Namespace, Name      string
 	ValidFrom, ValidTo   time.Time
 	Rev                  uint32
 	IngressIPs, Selector []string
-	Hostname             string
-	Port                 uint32
-	PortName, Protocol   string
+	Ports                []SvcPort
 	IngestSeq            uint64
+}
+
+// SvcPort is one Service port. JSON tags match the corev1 ServiceSpec.ports
+// shape so the reader unmarshals the same struct from the PoC's synthetic
+// spec_json and from a real metadata-exporter `spec` blob (extra fields ignored).
+type SvcPort struct {
+	Name     string `json:"name"`
+	Port     uint32 `json:"port"`
+	Protocol string `json:"protocol"`
+}
+
+// serviceDomain is the standard Kubernetes Service FQDN suffix. The PoC assumes
+// the default cluster domain; the exporter stores only (namespace, name), so the
+// FQDN mapping is Istio-side derivation that lives here in the reader layer.
+const serviceDomain = ".svc.cluster.local"
+
+// BackendFQDN reconstructs a backend Service's FQDN (its destination.host
+// identity) from its (name, namespace) — the inverse of ParseBackendHost.
+func BackendFQDN(name, ns string) string { return name + "." + ns + serviceDomain }
+
+// ParseBackendHost derives (name, namespace) from a VirtualService route's
+// destination.host FQDN (name.namespace.svc.cluster.local). ok=false for a host
+// that isn't a resolvable in-cluster FQDN (e.g. a bare short name or external
+// host), which the caller skips. Short-name support (default to the VS namespace)
+// can be added later; the corpus emits FQDNs.
+func ParseBackendHost(host string) (name, ns string, ok bool) {
+	rest, found := strings.CutSuffix(host, serviceDomain)
+	if !found {
+		return "", "", false
+	}
+	labels := strings.SplitN(rest, ".", 3)
+	if len(labels) < 2 || labels[0] == "" || labels[1] == "" {
+		return "", "", false
+	}
+	return labels[0], labels[1], true
+}
+
+// serviceSpec is the minimal shape carried in the spec_json column: just the
+// ports subtree of a Service spec. It mirrors the field a real exporter `spec`
+// blob exposes, so one decoder works for both.
+type serviceSpec struct {
+	Ports []SvcPort `json:"ports"`
+}
+
+// MarshalPorts encodes a Service's ports as the spec_json column value
+// (`{"ports":[...]}`), or "" for a portless (ingress LB) row.
+func MarshalPorts(ports []SvcPort) (string, error) {
+	if len(ports) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(serviceSpec{Ports: ports})
+	return string(b), err
+}
+
+// ParsePorts decodes the ports out of a spec_json column value ("" => none).
+// Unknown fields are ignored, so it also reads a full exporter `spec` blob.
+func ParsePorts(specJSON string) ([]SvcPort, error) {
+	if specJSON == "" {
+		return nil, nil
+	}
+	var s serviceSpec
+	if err := json.Unmarshal([]byte(specJSON), &s); err != nil {
+		return nil, err
+	}
+	return s.Ports, nil
 }
 
 // GatewayCand is one candidate gateway from the 3-hop (name + server host
@@ -150,6 +219,10 @@ type Store interface {
 	// time t: IP -> ingress Service (selector) -> ingress Deployment pod labels
 	// L -> gateways whose selector ⊆ L. Empty result => traffic miss.
 	ResolveIPToGateways(ctx context.Context, ip string, t time.Time) ([]GatewayCand, error)
+	// AllGatewaysLiveAt returns every gateway version live at time t (name +
+	// server hosts), for the config-only path that disambiguates a host across
+	// all gateways without an IP 3-hop.
+	AllGatewaysLiveAt(ctx context.Context, t time.Time) ([]GatewayCand, error)
 	// ScopedFor rebuilds one gateway's translate input (its Gateway CR + bound
 	// VirtualServices + destination Services) as-of time t. ok=false if the
 	// gateway has no version live at t.

@@ -7,16 +7,9 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
-      postgres:
-        condition: service_healthy
-      mariadb:
-        condition: service_healthy
     environment:
-      # Backend selected at run time with POC_DB (clickhouse|postgres|mariadb);
-      # each backend reads its own POC_<DB>_ADDR (service hostnames below).
+      # The PoC runs against ClickHouse (the engine production uses).
       POC_CH_ADDR: clickhouse:9000
-      POC_PG_ADDR: postgres://postgres:postgres@postgres:5432/route2a?sslmode=disable
-      POC_MARIA_ADDR: root:root@tcp(mariadb:3306)/route2a?parseTime=true&loc=UTC
       POC_ROUTERCHECK_IMAGE: envoyproxy/envoy:tools-v1.34-latest
 
   clickhouse:
@@ -30,32 +23,6 @@ services:
       - ../poc/route2a/testdata/clickhouse-open-users.xml:/etc/clickhouse-server/users.d/zzz-open-networks.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
-      interval: 2s
-      timeout: 3s
-      retries: 45
-      start_period: 5s
-
-  postgres:
-    image: postgres:17
-    hostname: postgres
-    environment:
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: route2a
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d route2a"]
-      interval: 2s
-      timeout: 3s
-      retries: 45
-      start_period: 5s
-
-  mariadb:
-    image: mariadb:11
-    hostname: mariadb
-    environment:
-      MARIADB_ROOT_PASSWORD: root
-      MARIADB_DATABASE: route2a
-    healthcheck:
-      test: ["CMD-SHELL", "mariadb-admin ping -uroot -proot --silent"]
       interval: 2s
       timeout: 3s
       retries: 45

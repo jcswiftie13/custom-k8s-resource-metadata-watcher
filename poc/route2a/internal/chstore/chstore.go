@@ -87,10 +87,7 @@ var ddl = []string{
 		rev         UInt32,
 		ingress_ips Array(String),
 		selector_kv Array(String),
-		hostname    String,
-		port        UInt32,
-		port_name   String,
-		protocol    String,
+		spec_json   String,
 		ingest_seq  UInt64,
 		INDEX idx_ips ingress_ips TYPE bloom_filter GRANULARITY 1
 	) ENGINE = ReplacingMergeTree(ingest_seq) ORDER BY (namespace, name, valid_from)`,
@@ -199,8 +196,12 @@ func (s *Store) NewServiceBatch(ctx context.Context) (store.ServiceBatch, error)
 	return &ServiceBatch{b}, err
 }
 func (b *ServiceBatch) Append(r store.ServiceRow) error {
+	specJSON, err := store.MarshalPorts(r.Ports)
+	if err != nil {
+		return fmt.Errorf("marshal service ports %s/%s: %w", r.Namespace, r.Name, err)
+	}
 	return b.append(r.Namespace, r.Name, r.ValidFrom, r.ValidTo, r.Rev,
-		r.IngressIPs, r.Selector, r.Hostname, r.Port, r.PortName, r.Protocol, r.IngestSeq)
+		r.IngressIPs, r.Selector, specJSON, r.IngestSeq)
 }
 func (b *ServiceBatch) Close() error { return b.flush() }
 
@@ -288,6 +289,30 @@ func (s *Store) ResolveIPToGateways(ctx context.Context, ip string, t time.Time)
 	return cands, rows.Err()
 }
 
+// AllGatewaysLiveAt returns every gateway version live at time t (name + server
+// hosts), for the config-only path (no IP 3-hop) that disambiguates a host
+// across all gateways. Mirrors hop3's scan shape without the selector join.
+func (s *Store) AllGatewaysLiveAt(ctx context.Context, t time.Time) ([]store.GatewayCand, error) {
+	rows, err := s.conn.Query(ctx,
+		`SELECT namespace, name, server_hosts FROM gw_versions
+		 WHERE valid_from <= ? AND ? < valid_to`,
+		t, t)
+	if err != nil {
+		return nil, fmt.Errorf("all gateways live at t: %w", err)
+	}
+	defer rows.Close()
+
+	var cands []store.GatewayCand
+	for rows.Next() {
+		var c store.GatewayCand
+		if err := rows.Scan(&c.Namespace, &c.Name, &c.ServerHosts); err != nil {
+			return nil, err
+		}
+		cands = append(cands, c)
+	}
+	return cands, rows.Err()
+}
+
 // ScopedFor rebuilds one gateway's translate input from ClickHouse at time t: its
 // Gateway CR + bound VirtualServices + the destination Services those VS route
 // to (all as-of-t versions). This is the store-backed replacement for the
@@ -343,8 +368,8 @@ func (s *Store) ScopedFor(ctx context.Context, gwName string, t time.Time) (tran
 		return translate.ScopedInput{}, false, err
 	}
 
-	// Destination Services: the backend Services the bound VS route to, keyed by
-	// the destination host FQDN in each VS's routes (the Service's identity). This
+	// Destination Services: the backend Services the bound VS route to, identified
+	// by the (namespace, name) parsed from each route's destination.host FQDN. This
 	// is namespace-portable — in production backend Service ns == VS ns != gateway
 	// ns, so we must NOT scope by the gateway's namespace.
 	svcs, err := s.backendServices(ctx, destHosts, t)
@@ -359,43 +384,74 @@ func (s *Store) ScopedFor(ctx context.Context, gwName string, t time.Time) (tran
 	}, true, nil
 }
 
-// backendServices reads the destination Services whose hostname matches one of
-// the given VS route destination hosts (the Service's identity FQDN) as-of time t
-// and rebuilds them as istiod model.Services so the config generator can build
-// clusters for them. Keying by hostname (not namespace) is namespace-portable:
-// the FQDN encodes the Service's own namespace, which need not equal the gateway's.
+// backendServices reads the destination Services the bound VS route to (identity
+// = the (namespace, name) parsed from each route's destination.host FQDN) as-of
+// time t and rebuilds them as istiod model.Services so the config generator can
+// build clusters for them. Each row is one Service carrying all its ports in
+// spec_json, so a multi-port Service becomes one model.Service with a multi-port
+// PortList. Keying by (namespace, name) is namespace-portable — the FQDN encodes
+// the Service's own namespace, which need not equal the gateway's — and hits the
+// ORDER BY (namespace, name, ...) prefix. The FQDN<->identity mapping is Istio
+// derivation, so it lives here in the reader (see store.ParseBackendHost).
 func (s *Store) backendServices(ctx context.Context, hosts []string, t time.Time) ([]*model.Service, error) {
-	if len(hosts) == 0 {
+	keys := backendKeys(hosts)
+	if len(keys) == 0 {
 		return nil, nil
 	}
 	rows, err := s.conn.Query(ctx,
-		`SELECT hostname, namespace, port, port_name FROM service_versions
-		 WHERE has(?, hostname) AND valid_from <= ? AND ? < valid_to`,
-		hosts, t, t)
+		`SELECT namespace, name, spec_json FROM service_versions
+		 WHERE has(?, concat(namespace, '/', name)) AND valid_from <= ? AND ? < valid_to`,
+		keys, t, t)
 	if err != nil {
 		return nil, fmt.Errorf("scopedfor backend services: %w", err)
 	}
 	defer rows.Close()
 	var out []*model.Service
 	for rows.Next() {
-		var hostname, ns, portName string
-		var port uint32
-		if err := rows.Scan(&hostname, &ns, &port, &portName); err != nil {
+		var ns, name, specJSON string
+		if err := rows.Scan(&ns, &name, &specJSON); err != nil {
 			return nil, err
 		}
-		out = append(out, &model.Service{
-			Hostname:       host.Name(hostname),
-			DefaultAddress: "0.0.0.0",
-			Ports:          model.PortList{{Name: portName, Port: int(port), Protocol: protocol.Parse(portName)}},
-			Attributes:     model.ServiceAttributes{Namespace: ns},
-		})
+		ports, err := store.ParsePorts(specJSON)
+		if err != nil {
+			return nil, fmt.Errorf("parse ports %s/%s: %w", ns, name, err)
+		}
+		out = append(out, backendModel(ns, name, ports))
 	}
 	return out, rows.Err()
 }
 
+// backendKeys maps VS destination.host FQDNs to the "namespace/name" identity
+// keys used to look up backend Service rows (has(?, concat(namespace,'/',name))).
+// Hosts that aren't resolvable in-cluster FQDNs are skipped.
+func backendKeys(hosts []string) []string {
+	keys := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		if name, ns, ok := store.ParseBackendHost(h); ok {
+			keys = append(keys, ns+"/"+name)
+		}
+	}
+	return keys
+}
+
+// backendModel rebuilds one backend Service as an istiod model.Service: FQDN
+// hostname derived from (name, namespace), one cluster-eligible Port per port.
+func backendModel(ns, name string, ports []store.SvcPort) *model.Service {
+	pl := make(model.PortList, 0, len(ports))
+	for _, p := range ports {
+		pl = append(pl, &model.Port{Name: p.Name, Port: int(p.Port), Protocol: protocol.Parse(p.Name)})
+	}
+	return &model.Service{
+		Hostname:       host.Name(store.BackendFQDN(name, ns)),
+		DefaultAddress: "0.0.0.0",
+		Ports:          pl,
+		Attributes:     model.ServiceAttributes{Namespace: ns},
+	}
+}
+
 // vsDestHosts collects the destination host of every route in a VirtualService
 // (HTTP/TLS/TCP). Each host is the target Service's identity — an FQDN like
-// svc.ns.svc.cluster.local — matched against service_versions.hostname.
+// svc.ns.svc.cluster.local — from which the backend lookup derives (name, ns).
 func vsDestHosts(vs *networking.VirtualService) []string {
 	var hosts []string
 	add := func(d *networking.Destination) {
@@ -442,7 +498,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 
 	// 1. Ingress Service versions serving this IP.
 	svcRows, err := s.conn.Query(ctx,
-		`SELECT namespace, name, valid_from, valid_to, rev, ingress_ips, selector_kv, hostname, port, port_name, protocol, ingest_seq
+		`SELECT namespace, name, valid_from, valid_to, rev, ingress_ips, selector_kv, spec_json, ingest_seq
 		 FROM service_versions
 		 WHERE has(ingress_ips, ?) AND valid_from < ? AND ? < valid_to`,
 		ip, t1, t0)
@@ -454,9 +510,8 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 	selSeen := map[string]bool{}
 	var selectors [][]string // distinct ingress-service selectors across versions
 	for svcRows.Next() {
-		var r store.ServiceRow
-		if err := svcRows.Scan(&r.Namespace, &r.Name, &r.ValidFrom, &r.ValidTo, &r.Rev,
-			&r.IngressIPs, &r.Selector, &r.Hostname, &r.Port, &r.PortName, &r.Protocol, &r.IngestSeq); err != nil {
+		r, err := scanServiceRow(svcRows)
+		if err != nil {
 			svcRows.Close()
 			return w, err
 		}
@@ -595,22 +650,21 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 		vsRows.Close()
 	}
 
-	// 5. Backend Service versions those VS route to (keyed by destination host
-	// FQDN). Chunked so a gateway with very many routes can't inline a host list
-	// past ClickHouse's max_query_size.
-	for _, chunk := range chunkStrings(destHosts, hostChunk) {
+	// 5. Backend Service versions those VS route to (identity = (namespace, name)
+	// parsed from each route's destination.host FQDN). Chunked so a gateway with
+	// very many routes can't inline a key list past ClickHouse's max_query_size.
+	for _, chunk := range chunkStrings(backendKeys(destHosts), hostChunk) {
 		bsRows, err := s.conn.Query(ctx,
-			`SELECT namespace, name, valid_from, valid_to, rev, ingress_ips, selector_kv, hostname, port, port_name, protocol, ingest_seq
+			`SELECT namespace, name, valid_from, valid_to, rev, ingress_ips, selector_kv, spec_json, ingest_seq
 			 FROM service_versions
-			 WHERE has(?, hostname) AND valid_from < ? AND ? < valid_to`,
+			 WHERE has(?, concat(namespace, '/', name)) AND valid_from < ? AND ? < valid_to`,
 			chunk, t1, t0)
 		if err != nil {
 			return w, fmt.Errorf("window backend services: %w", err)
 		}
 		for bsRows.Next() {
-			var r store.ServiceRow
-			if err := bsRows.Scan(&r.Namespace, &r.Name, &r.ValidFrom, &r.ValidTo, &r.Rev,
-				&r.IngressIPs, &r.Selector, &r.Hostname, &r.Port, &r.PortName, &r.Protocol, &r.IngestSeq); err != nil {
+			r, err := scanServiceRow(bsRows)
+			if err != nil {
 				bsRows.Close()
 				return w, err
 			}
@@ -624,6 +678,23 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 	}
 
 	return w, nil
+}
+
+// scanServiceRow scans one full service_versions row, decoding spec_json into
+// Ports. Shared by the ingress (step 1) and backend (step 5) window loads.
+func scanServiceRow(rows driver.Rows) (store.ServiceRow, error) {
+	var r store.ServiceRow
+	var specJSON string
+	if err := rows.Scan(&r.Namespace, &r.Name, &r.ValidFrom, &r.ValidTo, &r.Rev,
+		&r.IngressIPs, &r.Selector, &specJSON, &r.IngestSeq); err != nil {
+		return r, err
+	}
+	ports, err := store.ParsePorts(specJSON)
+	if err != nil {
+		return r, fmt.Errorf("parse ports %s/%s: %w", r.Namespace, r.Name, err)
+	}
+	r.Ports = ports
+	return r, nil
 }
 
 // hostChunk bounds how many host FQDNs go into one IN-list, keeping the inlined

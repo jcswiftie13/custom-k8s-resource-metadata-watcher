@@ -132,7 +132,7 @@ func TestIPFlowClickHouse(t *testing.T) {
 				c.Host, t0.Format(time.RFC3339), t1.Format(time.RFC3339), len(segs))
 		}
 
-		versions, err := deps.Resolve(ctx, st, c.Host, c.Path, ip, t0, t1)
+		versions, err := deps.Resolve(ctx, st, c.Host, c.Path, ip, 80, t0, t1)
 		if err != nil {
 			t.Fatalf("range resolve %s: %v", c.Host, err)
 		}
