@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "clickhouse.serverConfigMapName" . }}
+  labels:
+    {{- include "clickhouse.labels" . | nindent 4 }}
+data:
+  10-metadata-exporter.xml: |
+    <clickhouse>
+      <!-- Standalone single-pod defaults. Future cluster mode will add
+           remote_servers / macros via architecture.mode=cluster. -->
+      <max_open_files>{{ .Values.server.maxOpenFiles }}</max_open_files>
+      <listen_host>0.0.0.0</listen_host>
+      <listen_try>1</listen_try>
+    </clickhouse>

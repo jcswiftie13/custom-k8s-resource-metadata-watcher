@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "clickhouse.fullname" . }}
+  labels:
+    {{- include "clickhouse.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if and (eq .Values.service.type "ClusterIP") (gt (int .Values.replicaCount) 1) }}
+  clusterIP: None
+  publishNotReadyAddresses: true
+  {{- end }}
+  selector:
+    {{- include "clickhouse.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: native
+      port: {{ .Values.service.nativePort }}
+      targetPort: native
+      protocol: TCP
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePorts.native }}
+      nodePort: {{ .Values.service.nodePorts.native }}
+      {{- end }}
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePorts.http }}
+      nodePort: {{ .Values.service.nodePorts.http }}
+      {{- end }}

@@ -1,0 +1,133 @@
+# Default: one ClickHouse pod (no Keeper / no sharded cluster).
+# metadata-exporter history DSN example:
+#   clickhouse://default@clickhouse:9000/default
+# (service name defaults to "clickhouse" via fullnameOverride below)
+
+nameOverride: ""
+fullnameOverride: clickhouse
+
+image:
+  repository: clickhouse/clickhouse-server
+  tag: "26.5.5.8-stable"
+  pullPolicy: IfNotPresent
+
+# standalone — single StatefulSet (implemented).
+# cluster — reserved hook for a future multi-shard / Keeper topology; not rendered yet.
+architecture:
+  mode: standalone
+
+# Reserved for a future Keeper + sharded deployment (templates not rendered yet).
+cluster:
+  enabled: false
+
+replicaCount: 1
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+service:
+  type: ClusterIP
+  # Native protocol (metadata-exporter / poc chstore).
+  nativePort: 9000
+  # HTTP (health, clickhouse-client over HTTP).
+  httpPort: 8123
+  annotations: {}
+  # Optional fixed NodePorts for host-side poc clients (ipflow, routesim).
+  # Leave empty to auto-assign when type is NodePort.
+  nodePorts:
+    native: ""
+    http: ""
+
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 20Gi
+  annotations: {}
+
+# Server-wide ClickHouse settings (mounted under config.d/).
+server:
+  # Raised ulimits match poc/route2a/Makefile and integration manifests.
+  maxOpenFiles: 262144
+
+# User profiles and the built-in `default` account (mounted under users.d/).
+auth:
+  defaultUser:
+    # Allow in-cluster clients (metadata-exporter) and optional host-side poc tools.
+    allowAllNetworks: true
+  # Scheme A: password from a K8s Secret -> Pod env -> ClickHouse <password from_env="..."/>.
+  # Password is never written into the rendered ConfigMap.
+  # Leave existingSecret empty for passwordless dev (integration / poc default).
+  secret:
+    existingSecret: ""
+    passwordKey: password
+    passwordEnvVar: CLICKHOUSE_DEFAULT_PASSWORD
+
+# Profile settings required by metadata-exporter closeMode=update and poc chstore.
+lightweightUpdate:
+  enabled: true
+  # User-level settings (users.d profile); server 26.5 enables lightweight UPDATE by
+  # default — kept explicit for upgrade safety and documentation.
+  enableLightweightUpdate: true
+  allowExperimentalLightweightUpdate: true
+  applyPatchesOnRead: true
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+
+podSecurityContext:
+  fsGroup: 101
+  runAsUser: 101
+  runAsGroup: 101
+  runAsNonRoot: true
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+livenessProbe:
+  httpGet:
+    path: /ping
+    port: http
+  initialDelaySeconds: 30
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 6
+
+readinessProbe:
+  httpGet:
+    path: /ping
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 6
+
+startupProbe:
+  httpGet:
+    path: /ping
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 30
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+
+extraEnv: []
+extraVolumeMounts: []
+extraVolumes: []

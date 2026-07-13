@@ -1,0 +1,5 @@
+# Patterns to ignore when packaging.
+.git/
+.gitignore
+*.md
+.helmignore
