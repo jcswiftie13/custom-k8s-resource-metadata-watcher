@@ -77,8 +77,11 @@ func BenchWindow() (time.Time, time.Time) { return versionBase, farFuture }
 // port. The backend Service's identity is (Namespace, Name); its FQDN (the
 // destination.host a VS routes to) is derived — see BackendFQDN / ParseBackendHost.
 type ServiceRow struct {
-	Namespace, Name      string
-	ValidFrom, ValidTo   time.Time
+	Namespace, Name    string
+	ValidFrom, ValidTo time.Time
+	// Rev is write-side only: the PoC loader materializes it into the `rev`
+	// oracle column (production tables have no such column, so readers never
+	// select it — LoadTrafficWindow leaves it zero).
 	Rev                  uint32
 	IngressIPs, Selector []string
 	Ports                []SvcPort
@@ -165,7 +168,6 @@ type GatewayCand struct {
 type DeployRow struct {
 	Namespace, Name    string
 	ValidFrom, ValidTo time.Time
-	Rev                uint32
 	PodLabels          []string
 	IngestSeq          uint64
 }
@@ -173,7 +175,6 @@ type DeployRow struct {
 type GatewayRow struct {
 	Namespace, Name    string
 	ValidFrom, ValidTo time.Time
-	Rev                uint32
 	SelectorKV         []string
 	ServerHosts        []string
 	SpecJSON           string
@@ -183,7 +184,6 @@ type GatewayRow struct {
 type VSRow struct {
 	Namespace, Name    string
 	ValidFrom, ValidTo time.Time
-	Rev                uint32
 	BoundGateways      []string
 	SpecJSON           string
 	IngestSeq          uint64

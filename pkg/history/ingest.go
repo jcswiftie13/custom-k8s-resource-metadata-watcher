@@ -32,9 +32,24 @@ const (
 	eventDelete
 )
 
+// queued is one ordered write operation: an INSERT of row (close == nil) or an
+// in-place close of a previously inserted open row (closeMode=update). A
+// single FIFO queue keeps each object's operations in event order.
 type queued struct {
 	table string
 	row   store.Row
+	close *closeOp
+}
+
+// closeOp pins the exact open row to patch: identity + valid_from + (implicit)
+// the FarFuture sentinel. Because the successor version has a different
+// valid_from, running the close AFTER the successor's INSERT is safe — which
+// is what allows the flush cycle to send INSERT batches first and the closes
+// second.
+type closeOp struct {
+	namespace, name, uid string
+	validFrom            time.Time
+	closeAt              time.Time
 }
 
 // Ingester registers informer event handlers and streams version rows to the
@@ -48,6 +63,11 @@ type Ingester struct {
 	log       *slog.Logger
 	batchMax  int
 	flushIvl  time.Duration
+	// updateClose selects how a superseded/deleted version's valid_to lands:
+	// false (rewrite) re-inserts the prior row with valid_to set (collapsed by
+	// ReplacingMergeTree); true (update) patches the open row in place with a
+	// lightweight UPDATE, so every version stays exactly one row.
+	updateClose bool
 
 	seq atomic.Uint64
 
@@ -68,24 +88,95 @@ type lastState struct {
 	row  store.Row
 }
 
-// NewIngester builds an Ingester from compiled resources.
-func NewIngester(st store.Store, informers InformerSource, resources []*CompiledResource, batch config.BatchConfig, log *slog.Logger) *Ingester {
+// NewIngester builds an Ingester from compiled resources. closeMode is
+// config.CloseModeRewrite or config.CloseModeUpdate (see StoreConfig.CloseMode).
+func NewIngester(st store.Store, informers InformerSource, resources []*CompiledResource, batch config.BatchConfig, closeMode string, log *slog.Logger) *Ingester {
 	byKind := make(map[string]*CompiledResource, len(resources))
 	for _, r := range resources {
 		byKind[r.Kind] = r
 	}
 	maxRows := batch.MaxRowsOrDefault()
 	return &Ingester{
-		store:     st,
-		informers: informers,
-		ev:        collector.NewEvaluator(),
-		byKind:    byKind,
-		log:       log,
-		batchMax:  maxRows,
-		flushIvl:  time.Duration(batch.FlushIntervalMsOrDefault()) * time.Millisecond,
-		last:      map[string]lastState{},
-		queue:     make(chan queued, maxRows*2),
+		store:       st,
+		informers:   informers,
+		ev:          collector.NewEvaluator(),
+		byKind:      byKind,
+		log:         log,
+		batchMax:    maxRows,
+		flushIvl:    time.Duration(batch.FlushIntervalMsOrDefault()) * time.Millisecond,
+		updateClose: closeMode == config.CloseModeUpdate,
+		last:        map[string]lastState{},
+		queue:       make(chan queued, maxRows*2),
 	}
+}
+
+// Recover rebuilds the ingester's last-state from the store's open rows —
+// restart idempotency for closeMode=update. Without it, the initial re-LIST
+// after a restart re-inserts a row for every live object (the in-memory
+// last-state is empty), breaking the "every version is exactly one row"
+// guarantee update mode exists for. Call after EnsureSchema and BEFORE the
+// informers start.
+//
+// Per uid it keeps the newest open row (max valid_from, then max ingest_seq —
+// raw rows may still contain rewrite-era duplicates) as the object's open
+// version: matching spec_hash on re-LIST is then a no-op, a differing hash
+// closes it and opens a new version at observation time. Any OLDER open row of
+// the same uid is a stale leftover from a crash between an INSERT flush and
+// its close — it is closed here at the next version's valid_from, the exact
+// boundary the lost close would have written.
+//
+// Rewrite mode keeps its memory-only last-state (re-LIST duplicates there are
+// same-key rows the readers' dedup already collapses), so Recover is a no-op.
+func (in *Ingester) Recover(ctx context.Context) error {
+	if !in.updateClose {
+		return nil
+	}
+	tables := map[string]struct{}{}
+	for _, cr := range in.byKind {
+		tables[cr.Table] = struct{}{}
+	}
+	recovered, sweeps := 0, 0
+	for table := range tables {
+		open, err := in.store.OpenVersions(ctx, table)
+		if err != nil {
+			return fmt.Errorf("history recover %s: %w", table, err)
+		}
+		// Group per uid, collapse duplicate slots (same valid_from) by max
+		// ingest_seq, order by valid_from. OpenVersions returns rows already
+		// ordered (uid, valid_from, ingest_seq), so a linear pass suffices.
+		byUID := map[string][]store.OpenVersion{}
+		for _, v := range open {
+			vs := byUID[v.UID]
+			if n := len(vs); n > 0 && vs[n-1].ValidFrom.Equal(v.ValidFrom) {
+				vs[n-1] = v // same slot, higher seq wins
+			} else {
+				vs = append(vs, v)
+			}
+			byUID[v.UID] = vs
+		}
+		for uid, vs := range byUID {
+			latest := vs[len(vs)-1]
+			in.remember(uid, latest.SpecHash, store.Row{
+				Namespace: latest.Namespace,
+				Name:      latest.Name,
+				UID:       uid,
+				ValidFrom: latest.ValidFrom,
+				ValidTo:   store.FarFuture,
+			})
+			recovered++
+			// Stale opens: every open row before the latest lost its close in a
+			// crash window; its true end is the next version's start.
+			for i := 0; i < len(vs)-1; i++ {
+				if err := in.store.CloseVersion(ctx, table,
+					vs[i].Namespace, vs[i].Name, uid, vs[i].ValidFrom, vs[i+1].ValidFrom); err != nil {
+					return fmt.Errorf("history recover %s: close stale open row: %w", table, err)
+				}
+				sweeps++
+			}
+		}
+	}
+	in.log.Info("history last-state recovered from store", "objects", recovered, "staleOpensClosed", sweeps)
+	return nil
 }
 
 // Register attaches event handlers on every informer for each configured Kind.
@@ -122,7 +213,13 @@ func (in *Ingester) loop(ctx context.Context) {
 	ticker := time.NewTicker(in.flushIvl)
 	defer ticker.Stop()
 	pending := map[string][]store.Row{}
+	var closes []queued
 	count := 0
+	// flush sends the buffered INSERT batches first and only then executes the
+	// buffered closes. Queue order guarantees a close was enqueued after the
+	// INSERT of the row it targets, so that row is at the latest in this
+	// cycle's batch; and a close can safely run after its successor's INSERT
+	// because the close predicate pins the exact valid_from (see closeOp).
 	flush := func() {
 		for table, rows := range pending {
 			if len(rows) == 0 {
@@ -132,7 +229,15 @@ func (in *Ingester) loop(ctx context.Context) {
 				in.log.Error("history write batch failed", "table", table, "rows", len(rows), "err", err)
 			}
 		}
+		for _, q := range closes {
+			c := q.close
+			if err := in.store.CloseVersion(ctx, q.table, c.namespace, c.name, c.uid, c.validFrom, c.closeAt); err != nil {
+				in.log.Error("history close version failed", "table", q.table,
+					"namespace", c.namespace, "name", c.name, "uid", c.uid, "err", err)
+			}
+		}
 		pending = map[string][]store.Row{}
+		closes = nil
 		count = 0
 	}
 	for {
@@ -141,7 +246,11 @@ func (in *Ingester) loop(ctx context.Context) {
 			flush()
 			return
 		case q := <-in.queue:
-			pending[q.table] = append(pending[q.table], q.row)
+			if q.close != nil {
+				closes = append(closes, q)
+			} else {
+				pending[q.table] = append(pending[q.table], q.row)
+			}
 			count++
 			if count >= in.batchMax {
 				flush()
@@ -176,7 +285,7 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 		if !ok {
 			return
 		}
-		in.enqueue(cr.Table, in.closingRow(prior, time.Now().UTC()))
+		in.enqueueClose(cr.Table, prior, time.Now().UTC())
 		return
 	}
 
@@ -194,7 +303,15 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 		return // resync / no-op: unchanged content
 	}
 
-	row, err := in.buildRow(cr, u, lookup, kind)
+	// An Add for a uid we already track is a change observed as a re-LIST
+	// (restart recovery, informer replay): the change happened while we were
+	// not watching, so its version starts at observation time — the object's
+	// creationTimestamp would overlap every prior version.
+	effKind := kind
+	if hadPrior && kind == eventAdd {
+		effKind = eventUpdate
+	}
+	row, err := in.buildRow(cr, u, lookup, effKind)
 	if err != nil {
 		in.log.Error("history build row failed", "kind", cr.Kind, "uid", uid, "err", err)
 		return
@@ -202,12 +319,30 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 	row.SpecHash = hash
 	in.remember(uid, hash, row)
 
-	// The superseded version ends where the new one begins. Both rows may land
-	// in any batch, in any order: ingest_seq alone decides the merge.
+	// The superseded version ends where the new one begins.
 	if hadPrior {
-		in.enqueue(cr.Table, in.closingRow(prior, row.ValidFrom))
+		in.enqueueClose(cr.Table, prior, row.ValidFrom)
 	}
-	in.enqueue(cr.Table, row)
+	in.enqueue(cr.Table, row, nil)
+}
+
+// enqueueClose records that prev ends at closeAt, in whichever way the close
+// mode dictates: rewrite re-inserts prev with valid_to materialized and a
+// higher ingest_seq (ReplacingMergeTree collapses the pair later); update
+// patches the open row in place. closeAt is clamped to prev's start so a
+// version can never span a negative interval (Add-after-Add).
+func (in *Ingester) enqueueClose(table string, prev store.Row, closeAt time.Time) {
+	if closeAt.Before(prev.ValidFrom) {
+		closeAt = prev.ValidFrom
+	}
+	if in.updateClose {
+		in.enqueue(table, store.Row{}, &closeOp{
+			namespace: prev.Namespace, name: prev.Name, uid: prev.UID,
+			validFrom: prev.ValidFrom, closeAt: closeAt,
+		})
+		return
+	}
+	in.enqueue(table, in.closingRow(prev, closeAt), nil)
 }
 
 // buildRow assembles the open version row for an Add/Update. Deleted stays
@@ -288,9 +423,9 @@ func (in *Ingester) columnValue(c *CompiledColumn, lookup srcLookup) (any, error
 	return nil, fmt.Errorf("unsupported column type %q", c.Type)
 }
 
-func (in *Ingester) enqueue(table string, row store.Row) {
+func (in *Ingester) enqueue(table string, row store.Row, close *closeOp) {
 	select {
-	case in.queue <- queued{table: table, row: row}:
+	case in.queue <- queued{table: table, row: row, close: close}:
 	case <-in.ctxDone:
 	}
 }
@@ -328,14 +463,11 @@ func (in *Ingester) forgetIfSeen(uid string) (store.Row, bool) {
 	return prev.row, true
 }
 
-// closingRow re-inserts prev with valid_to materialized. It keeps prev's sort
-// key and takes a fresh, higher ingest_seq, so ReplacingMergeTree(ingest_seq)
-// collapses it onto the open row it closes. closeAt is clamped to prev's start
-// so a version can never span a negative interval (see Add-after-Add below).
+// closingRow re-inserts prev with valid_to materialized (rewrite mode). It
+// keeps prev's sort key and takes a fresh, higher ingest_seq, so
+// ReplacingMergeTree(ingest_seq) collapses it onto the open row it closes.
+// closeAt is pre-clamped by enqueueClose.
 func (in *Ingester) closingRow(prev store.Row, closeAt time.Time) store.Row {
-	if closeAt.Before(prev.ValidFrom) {
-		closeAt = prev.ValidFrom
-	}
 	prev.ValidTo = closeAt
 	prev.IngestSeq = in.seq.Add(1)
 	return prev

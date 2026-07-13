@@ -66,6 +66,7 @@ history:
     type: clickhouse
     dsn: "clickhouse://default@clickhouse:9000/default"
     createSchema: true
+    closeMode: update
     batch:
       maxRows: 100
       flushIntervalMs: 200
@@ -75,6 +76,7 @@ history:
       columns:
         - { name: ingress_ips, type: "Array(String)", path: "status.loadBalancer.ingress[*].ip", index: bloom_filter }
         - { name: selector_kv, type: "Array(String)", path: "spec.selector", encode: kv }
+        - { name: spec_json, type: "String", path: "spec", encode: json }
         - { name: port, type: "Int64", path: "spec.ports[0].port" }
         - { name: port_name, type: "String", path: "spec.ports[0].name" }
         - { name: protocol, type: "String", path: "spec.ports[0].protocol" }

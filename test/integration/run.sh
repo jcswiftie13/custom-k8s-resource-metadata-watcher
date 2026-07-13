@@ -27,6 +27,15 @@
 #                       to be kept (SKIP_CLUSTER_DELETE=1 if this runner
 #                       created the cluster, or SKIP_KIND_CREATE with your own)
 #   INTEGRATION_METRICS_LOCAL_PORT  local port for port-forward (default 18080)
+#   ROUTESIM_IMAGE      Envoy tools image carrying the native router_check_tool
+#                       (default envoyproxy/envoy:tools-v1.34-latest). The
+#                       routing-resolution scenario runs the routesim test
+#                       binary inside this image on the `kind` docker network.
+#   SKIP_ROUTESIM_BUILD when set, skip pulling the tools image and
+#                       cross-compiling the routesim binary; the routing
+#                       scenario then FAILS unless ROUTESIM_TEST_BIN /
+#                       ROUTESIM_PLATFORM are provided (or excluded via
+#                       GOTEST_FLAGS='-skip TestHistory_RoutingResolution').
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -102,6 +111,34 @@ docker "${build_args[@]}"
 kind load docker-image "${IMAGE}" --name "${KIND_CLUSTER_NAME}"
 
 kubectl apply -k "${SCRIPT_DIR}/manifests"
+
+# --- routesim (routing-history resolution) prep ---
+# TestHistory_RoutingResolution runs a precompiled linux test binary
+# (test/integration/routesim, a separate Go module) inside the Envoy tools image
+# so router_check_tool executes NATIVELY even on macOS hosts. The binary's arch
+# is slaved to the platform the image is pulled for, so tool and binary always
+# match; if the host arch has no image variant we fall back to linux/amd64
+# under emulation.
+if [[ -z "${SKIP_ROUTESIM_BUILD:-}" ]]; then
+  ROUTESIM_IMAGE="${ROUTESIM_IMAGE:-envoyproxy/envoy:tools-v1.34-latest}"
+  host_arch="$(docker version --format '{{.Server.Arch}}')"
+  ROUTESIM_PLATFORM="linux/${host_arch}"
+  if ! docker image inspect "${ROUTESIM_IMAGE}" >/dev/null 2>&1 \
+     || [[ "$(docker image inspect "${ROUTESIM_IMAGE}" --format '{{.Architecture}}')" != "${host_arch}" ]]; then
+    if ! docker pull --platform "${ROUTESIM_PLATFORM}" "${ROUTESIM_IMAGE}"; then
+      log "routesim: ${ROUTESIM_IMAGE} has no ${ROUTESIM_PLATFORM} variant; falling back to linux/amd64 (emulated)"
+      ROUTESIM_PLATFORM="linux/amd64"
+      docker pull --platform "${ROUTESIM_PLATFORM}" "${ROUTESIM_IMAGE}"
+    fi
+  fi
+  ROUTESIM_GOARCH="${ROUTESIM_PLATFORM#linux/}"
+  log "routesim: building test binary (GOOS=linux GOARCH=${ROUTESIM_GOARCH}; first build compiles istio.io/istio — takes minutes)"
+  (cd "${SCRIPT_DIR}/routesim" && \
+    GOOS=linux GOARCH="${ROUTESIM_GOARCH}" CGO_ENABLED=0 go test -c -o bin/routesim.test .)
+  export ROUTESIM_TEST_BIN="${SCRIPT_DIR}/routesim/bin/routesim.test"
+  export ROUTESIM_IMAGE ROUTESIM_PLATFORM
+  export E2E_KIND_CONTROL_PLANE="${KIND_CLUSTER_NAME}-control-plane"
+fi
 
 kubectl rollout status deployment/metadata-exporter -n "${NS}" --timeout=120s
 kubectl wait --for=condition=ready pod \

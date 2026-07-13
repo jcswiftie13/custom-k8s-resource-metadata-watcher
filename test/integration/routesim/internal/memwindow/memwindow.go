@@ -22,8 +22,8 @@ import (
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
 
-	"github.com/example/metadata-exporter/poc/route2a/internal/store"
-	"github.com/example/metadata-exporter/poc/route2a/internal/translate"
+	"github.com/example/metadata-exporter/test/integration/routesim/internal/store"
+	"github.com/example/metadata-exporter/test/integration/routesim/internal/translate"
 )
 
 // Window is a loaded TrafficWindow scoped to [t0,t1), ready for in-memory queries.

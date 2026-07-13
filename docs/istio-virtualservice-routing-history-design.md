@@ -65,7 +65,7 @@ match 細節與 route→destination 樹。path/host 當 label 造成高基數；
 | 設定儲存       | **ClickHouse**，interval 模型（`valid_from` / `valid_to`）                |
 | 時間精度       | **事件級**（informer 事件寫入，不漏短命版本）                                        |
 | Join 原語    | ingest 期物化 `Array(String)`；查詢用 `has` / `hasAll`                      |
-| 去重         | `ReplacingMergeTree(ingest_seq)` + 查詢端 `FINAL` / `argMax`            |
+| 去重         | `ReplacingMergeTree(ingest_seq)` + **reader 端 dedup**（SQL 不過濾 `valid_to`、client 依 (ns,name,valid_from) 取 max ingest_seq、之後才套 liveness）；`FINAL` 因 ~10x lookup 成本棄用 |
 | 比對引擎       | **引擎 2A**：in-process istiod `ConfigGenerator` + `router_check_tool`  |
 | 查詢視角       | **Ingress Gateway**（南北向）；不做 Sidecar mesh 視角                          |
 | IP→Gateway | **query-time 三跳**（Service → Deployment → Gateway），per-resource store |
@@ -192,7 +192,11 @@ graph TD
 - **interval 模型**：`valid_from <= T AND T < valid_to`；open 版 `valid_to` = 遠未來 sentinel。
 - **ingest 期物化** join 欄為排序 `Array(String)`。
 - **子集** = `hasAll(set, subset)`。
-- **去重** = `ReplacingMergeTree(ingest_seq)` + `FINAL` / `argMax`。
+- **去重** = `ReplacingMergeTree(ingest_seq)` + **reader 端 dedup**：SQL WHERE 只留不可變條件
+  （join 欄、`valid_from`），**`valid_to` 不得進 WHERE**（closing row 會被先濾掉、stale open row
+  勝出）；client 依 `(namespace,name,valid_from)` 取 max `ingest_seq` 後才套 liveness/overlap。
+  `FINAL` 有 query-time merge 成本（bench 實測 lookup p50 822ms→634ms、p99 1.64s→815ms 改善）；
+  writer 若改 lightweight UPDATE 可回到 SQL 端過濾（見 lightweight-update-upgrade-plan.md）。
 
 **DDL（ingress 相關示意；VS/DR 同模式加** `spec` **欄）**：
 
@@ -301,22 +305,24 @@ ingest）、`pkg/store`（ClickHouse writer + DDL）。
 
 **IP 來源 union** → `ingress_ips` 陣列：`spec.externalIPs` ∪ `status.loadBalancer.ingress[]` ∪（選配）NodePort+NodeIP。
 
-**三跳 SQL**（每跳窄查詢 + `valid_from <= T AND T < valid_to`）：
+**三跳 SQL**（每跳窄查詢；SQL 只過濾不可變欄位，`{t} < valid_to` 與同 key 去重在 **client 端**
+於 dedup 之後執行——`valid_to` 進 WHERE 會把 closing row 先濾掉、讓 stale open row 勝出）：
 
 ```sql
--- Hop1: has(ingress_ips, ip) → svc selector
-SELECT namespace AS ns, selector_kv AS svc_sel
-FROM svc_versions FINAL
-WHERE has(ingress_ips, {ip}) AND valid_from <= {t} AND {t} < valid_to;
+-- Hop1: has(ingress_ips, ip) → svc selector（+ dedup 欄位）
+SELECT namespace, name, valid_from, valid_to, ingest_seq, selector_kv
+FROM svc_versions
+WHERE has(ingress_ips, {ip}) AND valid_from <= {t};
 
 -- Hop2: hasAll(pod_labels_kv, svc_sel) → L
-SELECT pod_labels_kv AS L FROM deploy_versions FINAL
-WHERE namespace = {ns} AND hasAll(pod_labels_kv, {svc_sel})
-  AND valid_from <= {t} AND {t} < valid_to;
+SELECT namespace, name, valid_from, valid_to, ingest_seq, pod_labels_kv
+FROM deploy_versions
+WHERE namespace = {ns} AND hasAll(pod_labels_kv, {svc_sel}) AND valid_from <= {t};
 
 -- Hop3: hasAll(L, selector_kv) → 候選 Gateway
-SELECT namespace, name, server_hosts FROM gw_versions FINAL
-WHERE hasAll({L}, selector_kv) AND valid_from <= {t} AND {t} < valid_to;
+SELECT namespace, name, valid_from, valid_to, ingest_seq, server_hosts
+FROM gw_versions
+WHERE hasAll({L}, selector_kv) AND valid_from <= {t};
 ```
 
 候選交 `gwresolve(host, candidates)` 做 most-specific host 消歧。可合併為單一 WITH join 查詢以攤平
@@ -326,7 +332,8 @@ per-query overhead。
 約 1–5ms，三次 round-trip 約 5–15ms），對取證/低 QPS 足夠。
 
 **調校**：ingest 期物化 join 欄；`valid_to` sentinel；`ORDER BY (identity, valid_from)`；
-`bloom_filter` on `ingress_ips`；單一查詢 + prepared statement；必要時 `argMax` 取代 `FINAL`。
+`bloom_filter` on `ingress_ips`；單一查詢 + prepared statement；去重走 reader 端 dedup（不用
+`FINAL`；`argMax` 為 SQL 端替代，`valid_to` 過濾須放 HAVING）。
 
 #### 引擎 2A
 
@@ -391,8 +398,12 @@ POC 落地差異（固定 `http.80`、無 `FakeDiscoveryServer`、sentinel 解�
 1. **引擎 2A**：POC `matchcheck` vs `scalegen` oracle（已在 `poc/route2a` 驗證）。
 2. **IP→Gateway 三跳**：POC `TestIPFlowClickHouse`；主專案需 mock 多候選案例。
 3. **時間回溯**：VS 變更後查橫跨區間 → 兩個版本各自 destination 正確。
+   **已由 e2e 驗證**（`TestHistory_RoutingResolution`）：exporter 寫入 → `test/integration/routesim`
+   （bench-worst 管線之複製、已適配 exporter schema：reader 端 dedup（無 FINAL）、無 `rev`、
+   protojson `DiscardUnknown`、bare gateway ref）跨版本解析，兩 span 各自命中正確 cluster。
 4. **解析對照**：`istioctl proxy-config routes` 比對。
-5. **store**：`AsOf(T)` 唯一版、`Overlap(t0,t1)` 全版本、`FINAL` 去重正確。
+5. **store**：`AsOf(T)` 唯一版、`Overlap(t0,t1)` 全版本、reader 端 dedup 去重正確
+   （closing-row 重寫與重啟重插兩種重複形狀都收斂）。
 
 ---
 
@@ -413,6 +424,8 @@ POC 落地差異（固定 `http.80`、無 `FakeDiscoveryServer`、sentinel 解�
 ## 10. 待實作清單
 
 - [x] ingest：event handler + ClickHouse writer（`pkg/history`）＋設定式欄位/型別/json path＋client 端 regex filter
+- [x] `closeMode: update`：lightweight UPDATE 原地關版（每版本恆一列）＋ `Recover()` 重啟冪等
+      （CH ≥ 25.8；預設仍 `rewrite`；見 lightweight-update-upgrade-plan.md、CONFIG.md §14.5）
 - [x] `pkg/store` ClickHouse：append-only writer + DDL 產生/驗證（`EnsureSchema` / `WriteBatch`）
   - 查詢面 `AsOf(T)` / `Overlap(t0,t1)`（含 `valid_to` 推導）待查詢引擎階段實作
 - [ ] watch 新增 GVR：VS/Gateway/DR/Service/EndpointSlice/ingress Deployment（設定已支援；預設清單待補）

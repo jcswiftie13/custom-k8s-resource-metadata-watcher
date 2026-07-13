@@ -29,9 +29,17 @@ func Addr() string {
 }
 
 // Open dials ClickHouse at addr (empty => Addr()) and returns a store.Store.
+// POC_CH_UNIQUE_ROWS=1 opens the store in pruned read mode (valid_to predicate
+// back in SQL) — only valid when the writer guarantees one row per version
+// (exporter closeMode=update; the PoC loader also qualifies, it writes each
+// version exactly once). See chstore.WithUniqueRows.
 func Open(ctx context.Context, addr string) (store.Store, error) {
 	if addr == "" {
 		addr = Addr()
 	}
-	return chstore.Open(ctx, addr)
+	var opts []chstore.Option
+	if os.Getenv("POC_CH_UNIQUE_ROWS") == "1" {
+		opts = append(opts, chstore.WithUniqueRows())
+	}
+	return chstore.Open(ctx, addr, opts...)
 }

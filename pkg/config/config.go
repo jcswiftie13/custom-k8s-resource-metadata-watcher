@@ -787,6 +787,17 @@ type StoreConfig struct {
 	// drift, mutating nothing. true (dev) means CREATE TABLE IF NOT EXISTS plus
 	// additive ADD COLUMN IF NOT EXISTS. It never drops or retypes columns.
 	CreateSchema *bool `json:"createSchema,omitempty"`
+	// CloseMode selects how a superseded/deleted version's valid_to is
+	// materialized. "rewrite" (default) re-inserts the prior row with valid_to
+	// filled in and a higher ingest_seq, collapsed later by
+	// ReplacingMergeTree — works on any ClickHouse version but leaves
+	// transient duplicate rows until background merges run. "update" closes
+	// the open row in place with a lightweight UPDATE (patch parts) so every
+	// version is always exactly one row — requires ClickHouse >= 25.8 and the
+	// enable_block_number_column / enable_block_offset_column table settings
+	// (added automatically when createSchema is on). See
+	// docs/lightweight-update-upgrade-plan.md.
+	CloseMode string `json:"closeMode,omitempty"`
 	// Batch tunes the ingest writer.
 	Batch BatchConfig `json:"batch,omitempty"`
 
@@ -820,6 +831,21 @@ type StoreConfig struct {
 // CreateSchemaEnabled reports whether auto-DDL is turned on.
 func (s StoreConfig) CreateSchemaEnabled() bool {
 	return s.CreateSchema != nil && *s.CreateSchema
+}
+
+// Close-mode values for StoreConfig.CloseMode.
+const (
+	CloseModeRewrite = "rewrite"
+	CloseModeUpdate  = "update"
+)
+
+// CloseModeOrDefault returns the configured close mode, defaulting to rewrite
+// (the mode with no ClickHouse version requirement).
+func (s StoreConfig) CloseModeOrDefault() string {
+	if s.CloseMode == "" {
+		return CloseModeRewrite
+	}
+	return s.CloseMode
 }
 
 // SecureEnabled reports whether TLS is turned on.
@@ -932,6 +958,11 @@ func (h History) validate(reg *Registry) error {
 	}
 	if strings.TrimSpace(h.Store.DSN) == "" {
 		return fmt.Errorf("store.dsn: required")
+	}
+	switch h.Store.CloseMode {
+	case "", CloseModeRewrite, CloseModeUpdate:
+	default:
+		return fmt.Errorf("store.closeMode: must be %q or %q (got %q)", CloseModeRewrite, CloseModeUpdate, h.Store.CloseMode)
 	}
 	// token/JWT replaces basic auth in clickhouse-go, so the two are mutually
 	// exclusive.

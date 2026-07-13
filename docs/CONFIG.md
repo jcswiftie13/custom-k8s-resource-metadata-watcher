@@ -713,6 +713,7 @@ history:
     type: clickhouse
     dsn: "clickhouse://host:9000/db"
     createSchema: true          # dev；prod 預設 false（見 14.4）
+    closeMode: rewrite          # rewrite（預設）| update（需 CH >= 25.8，見 14.5）
     batch: { maxRows: 5000, flushIntervalMs: 1000 }
     # --- 身分驗證（皆選填，見 14.6）---
     username: default
@@ -766,17 +767,31 @@ history:
 - `true`（dev）→ `CREATE TABLE IF NOT EXISTS` + 加法式 `ADD COLUMN IF NOT EXISTS`（**永不** drop／改型別）。
 - `false`（**prod 預設**）→ 只查 `system.columns` **驗證**線上 schema 與 config 是否一致，**有偏差就 fail fast、不變更任何東西**。
 
-### 14.5 版本化語意（append-only）
+### 14.5 版本化語意與 `closeMode`
 
-每個事件寫入一到兩筆 `INSERT`：`valid_from` 為觀測時間（Add 用 `creationTimestamp`），開放中的版本
-`valid_to` = 遠未來哨兵 `2200-01-01`。**`valid_to` 於寫入端物化**：新版本到達時，把前一版**整列**以相同排序鍵、
-更高 `ingest_seq` 重插一次並填上 `valid_to`（= 新版的 `valid_from`）；`ReplacingMergeTree(ingest_seq)` 於 merge
-時折疊，收尾列勝出。Delete 同樣只收尾最後一版（`valid_to` = 刪除觀測時刻），**不寫 `deleted=1` tombstone**——
-`valid_to` 已完整表達刪除語意。因此區間查詢可直接用吃索引的 `valid_from < t1 AND valid_to > t0`，免去 window function。
+每個事件產生一個新開放版本（`valid_from` 為觀測時間，Add 用 `creationTimestamp`；開放版本
+`valid_to` = 遠未來哨兵 `2200-01-01`），前一版的 `valid_to` **於寫入端物化**、由 `store.closeMode` 決定收尾方式：
+
+- **`rewrite`（預設，任何 CH 版本可用）**：把前一版**整列**以相同排序鍵、更高 `ingest_seq` 重插一次並填上
+  `valid_to`（= 新版的 `valid_from`）；`ReplacingMergeTree(ingest_seq)` 於 merge 時折疊，收尾列勝出。
+  merge 收斂前同 key 會短暫存在兩列（stale 開放列 + 收尾列），**讀取端必須套 no-FINAL dedup 模式**
+  （SQL 不過濾 `valid_to`、client 依 `(namespace,name,valid_from)` 取 max `ingest_seq` 後才套 liveness）。
+- **`update`（需 ClickHouse ≥ 25.8）**：以 lightweight `UPDATE`（patch parts）**原地**把開放列的 `valid_to`
+  收攏——每個版本恆為唯一一列、寫入當下即最終、不依賴 merge 時機。需要表級設定
+  `enable_block_number_column = 1, enable_block_offset_column = 1`（`createSchema: true` 時自動建立／
+  以 `ALTER TABLE ... MODIFY SETTING` 加法遷移既有表；`createSchema: false` 時啟動會驗證並 fail fast）。
+  UPDATE 條件鎖定 `(namespace, name, uid, valid_from, valid_to=哨兵)`，天然冪等；ingest 迴圈保證
+  同批次內 INSERT 先送、close 後執行。**重啟冪等**：啟動時（informer 起動前）自動從 CH 恢復
+  last-state（每 uid 最新開放列的 spec_hash），re-LIST 不會重插已寫入的版本，並掃除 crash 遺留的
+  stale 開放列。升級與回滾流程見 `docs/lightweight-update-upgrade-plan.md`。
+
+兩種模式下 Delete 都只收尾最後一版（`valid_to` = 刪除觀測時刻），**不寫 `deleted=1` tombstone**——
+`valid_to` 已完整表達刪除語意。
 
 去重分兩層：ingest 端 **spec-hash**（丟棄 resync no-op），CH 端 `ReplacingMergeTree(ingest_seq)` +
-`ORDER BY (namespace, name, valid_from, resource_version, deleted)`（重啟 re-LIST 同版本冪等）。
-**`valid_to` 刻意排除於 ORDER BY 之外**：唯有排序鍵相同，收尾列才折疊得掉它所收尾的開放列。
+`ORDER BY (namespace, name, valid_from, resource_version, deleted)`（rewrite 模式重啟 re-LIST 同版本冪等）。
+**`valid_to` 刻意排除於 ORDER BY 之外**：唯有排序鍵相同，收尾列才折疊得掉它所收尾的開放列（rewrite），
+且 lightweight UPDATE 不能改排序鍵欄位（update）。
 
 範例完整設定見 `examples/history-clickhouse.yaml`。
 

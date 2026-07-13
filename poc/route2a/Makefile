@@ -95,7 +95,7 @@ clean:
 # Scale/version knobs: POC_GATEWAYS POC_VS
 #   POC_VER_DEPLOY POC_VER_SVC POC_VER_GW POC_VER_VS POC_VER_KSVC (default 1 each)
 
-CH_IMAGE ?= clickhouse/clickhouse-server:25.5
+CH_IMAGE ?= clickhouse/clickhouse-server:25.8
 CH_NAME  ?= route2a-ch
 CH_ADDR  ?= 127.0.0.1:9000
 

@@ -12,8 +12,16 @@ import (
 	"github.com/example/metadata-exporter/pkg/store"
 )
 
+type fakeClose struct {
+	table, namespace, name, uid string
+	validFrom, closeAt          time.Time
+}
+
 type fakeStore struct {
 	tables map[string][]store.Row
+	closes []fakeClose
+	open   map[string][]store.OpenVersion // OpenVersions fixture for Recover tests
+	ops    []string                       // "batch:<table>" / "close:<table>" in execution order
 }
 
 func (f *fakeStore) EnsureSchema(_ context.Context, _ []store.TableSchema) error { return nil }
@@ -22,7 +30,16 @@ func (f *fakeStore) WriteBatch(_ context.Context, table string, rows []store.Row
 		f.tables = map[string][]store.Row{}
 	}
 	f.tables[table] = append(f.tables[table], rows...)
+	f.ops = append(f.ops, "batch:"+table)
 	return nil
+}
+func (f *fakeStore) CloseVersion(_ context.Context, table, namespace, name, uid string, validFrom, closeAt time.Time) error {
+	f.closes = append(f.closes, fakeClose{table, namespace, name, uid, validFrom, closeAt})
+	f.ops = append(f.ops, "close:"+table)
+	return nil
+}
+func (f *fakeStore) OpenVersions(_ context.Context, table string) ([]store.OpenVersion, error) {
+	return f.open[table], nil
 }
 func (f *fakeStore) Close() error { return nil }
 
@@ -43,6 +60,11 @@ func svcObj(uid, ns, clusterIP, resourceVersion string) *unstructured.Unstructur
 
 func newTestIngester(t *testing.T) (*Ingester, *CompiledResource) {
 	t.Helper()
+	return newTestIngesterMode(t, config.CloseModeRewrite, &fakeStore{})
+}
+
+func newTestIngesterMode(t *testing.T, closeMode string, fs *fakeStore) (*Ingester, *CompiledResource) {
+	t.Helper()
 	cr := mustCompile(t, config.HistoryResource{
 		Kind:  "Service",
 		Table: "svc_versions",
@@ -53,7 +75,7 @@ func newTestIngester(t *testing.T) (*Ingester, *CompiledResource) {
 			{Extract: config.Extract{Path: "metadata.namespace"}, Op: "prefix", Value: "prod-"},
 		},
 	})
-	in := NewIngester(&fakeStore{}, nil, []*CompiledResource{cr}, config.BatchConfig{}, slog.Default())
+	in := NewIngester(fs, nil, []*CompiledResource{cr}, config.BatchConfig{}, closeMode, slog.Default())
 	return in, cr
 }
 
@@ -182,16 +204,30 @@ func TestIngest_ValidToChain(t *testing.T) {
 	}
 }
 
-// A version observed by a later Add (e.g. a relist after the object changed)
-// carries creationTimestamp as valid_from, which predates the row it closes.
-// Clamping degenerates the interval to zero width rather than inverting it.
+// A close whose closeAt predates the row it closes (clock skew, replayed
+// events) is clamped: the interval degenerates to zero width rather than
+// inverting. The clamp lives in enqueueClose so both close modes share it.
 func TestIngest_ClosingRowClampsInvertedInterval(t *testing.T) {
 	in, _ := newTestIngester(t)
 	prev := store.Row{ValidFrom: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), ValidTo: store.FarFuture}
 
-	got := in.closingRow(prev, prev.ValidFrom.Add(-time.Hour))
-	if !got.ValidTo.Equal(prev.ValidFrom) {
-		t.Fatalf("valid_to %v should be clamped to valid_from %v", got.ValidTo, prev.ValidFrom)
+	in.enqueueClose("svc_versions", prev, prev.ValidFrom.Add(-time.Hour))
+	q := drain(in)
+	if len(q) != 1 || q[0].close != nil {
+		t.Fatalf("rewrite mode should enqueue 1 closing row, got %+v", q)
+	}
+	if !q[0].row.ValidTo.Equal(prev.ValidFrom) {
+		t.Fatalf("valid_to %v should be clamped to valid_from %v", q[0].row.ValidTo, prev.ValidFrom)
+	}
+
+	inU, _ := newTestIngesterMode(t, config.CloseModeUpdate, &fakeStore{})
+	inU.enqueueClose("svc_versions", prev, prev.ValidFrom.Add(-time.Hour))
+	q = drain(inU)
+	if len(q) != 1 || q[0].close == nil {
+		t.Fatalf("update mode should enqueue 1 close op, got %+v", q)
+	}
+	if !q[0].close.closeAt.Equal(prev.ValidFrom) {
+		t.Fatalf("closeAt %v should be clamped to valid_from %v", q[0].close.closeAt, prev.ValidFrom)
 	}
 }
 
@@ -208,6 +244,151 @@ func TestIngest_FilteredOutNotWritten(t *testing.T) {
 	in.onEvent(cr, obj, eventDelete)
 	if q := drain(in); len(q) != 0 {
 		t.Fatalf("filtered delete should write nothing, got %d", len(q))
+	}
+}
+
+// closeMode=update: a superseded version yields a close OP (not a closing row)
+// pinning the prior version's exact valid_from, then the new open row; a
+// delete yields only the close op. No row is ever written twice.
+func TestIngest_UpdateCloseOps(t *testing.T) {
+	in, cr := newTestIngesterMode(t, config.CloseModeUpdate, &fakeStore{})
+
+	in.onEvent(cr, svcObj("uid-1", "prod-web", "10.0.0.1", "1"), eventAdd)
+	q := drain(in)
+	if len(q) != 1 || q[0].close != nil || q[0].row.ValidTo != store.FarFuture {
+		t.Fatalf("Add: expected 1 open insert, got %+v", q)
+	}
+	v1 := q[0].row
+
+	in.onEvent(cr, svcObj("uid-1", "prod-web", "10.0.0.2", "2"), eventUpdate)
+	q = drain(in)
+	if len(q) != 2 {
+		t.Fatalf("update: expected close op + insert, got %d", len(q))
+	}
+	if q[0].close == nil {
+		t.Fatalf("update: first item should be a close op, got row %+v", q[0].row)
+	}
+	v2 := q[1].row
+	c := q[0].close
+	if c.uid != "uid-1" || !c.validFrom.Equal(v1.ValidFrom) {
+		t.Fatalf("close op must pin v1's slot: %+v (v1.ValidFrom=%v)", c, v1.ValidFrom)
+	}
+	if !c.closeAt.Equal(v2.ValidFrom) {
+		t.Fatalf("v1 must close where v2 begins: closeAt=%v v2.ValidFrom=%v", c.closeAt, v2.ValidFrom)
+	}
+	if q[1].close != nil || v2.ValidTo != store.FarFuture {
+		t.Fatalf("update: second item should be the open v2 insert, got %+v", q[1])
+	}
+
+	in.onEvent(cr, svcObj("uid-1", "prod-web", "10.0.0.2", "2"), eventDelete)
+	q = drain(in)
+	if len(q) != 1 || q[0].close == nil {
+		t.Fatalf("delete: expected only a close op, got %+v", q)
+	}
+	if !q[0].close.validFrom.Equal(v2.ValidFrom) {
+		t.Fatalf("delete must close v2's slot, got %+v", q[0].close)
+	}
+}
+
+// The flush cycle must send INSERT batches before executing closes: a close
+// enqueued after its target row's INSERT would otherwise race it and match
+// zero rows, leaving the version open forever.
+func TestIngest_UpdateClose_FlushOrder(t *testing.T) {
+	fs := &fakeStore{}
+	in, cr := newTestIngesterMode(t, config.CloseModeUpdate, fs)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	in.ctxDone = ctx.Done()
+	done := make(chan struct{})
+	go func() { in.loop(ctx); close(done) }()
+
+	in.onEvent(cr, svcObj("uid-1", "prod-web", "10.0.0.1", "1"), eventAdd)
+	in.onEvent(cr, svcObj("uid-1", "prod-web", "10.0.0.2", "2"), eventUpdate)
+	for len(in.queue) > 0 {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if got := len(fs.tables["svc_versions"]); got != 2 {
+		t.Fatalf("expected v1+v2 inserts, got %d rows", got)
+	}
+	if len(fs.closes) != 1 {
+		t.Fatalf("expected 1 close, got %d", len(fs.closes))
+	}
+	lastBatch, lastClose := -1, -1
+	for i, op := range fs.ops {
+		switch op {
+		case "batch:svc_versions":
+			lastBatch = i
+		case "close:svc_versions":
+			lastClose = i
+		}
+	}
+	if lastBatch == -1 || lastClose == -1 || lastClose < lastBatch {
+		t.Fatalf("closes must run after the insert batch, ops=%v", fs.ops)
+	}
+}
+
+// Recover rebuilds last-state from the store's open rows so a restart's
+// re-LIST dedups instead of re-inserting, and sweeps stale open rows left by
+// a crash between an insert flush and its close.
+func TestIngest_RecoverPopulatesAndSweeps(t *testing.T) {
+	current := svcObj("uid-1", "prod-web", "10.0.0.2", "2")
+	hash, err := SpecHash(current.Object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vf1 := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	vf2 := time.Date(2026, 3, 2, 0, 0, 0, 0, time.UTC)
+	fs := &fakeStore{open: map[string][]store.OpenVersion{
+		"svc_versions": {
+			{Namespace: "prod-web", Name: "api", UID: "uid-1", SpecHash: "h-old", ValidFrom: vf1, IngestSeq: 1},
+			{Namespace: "prod-web", Name: "api", UID: "uid-1", SpecHash: hash, ValidFrom: vf2, IngestSeq: 3},
+		},
+	}}
+	in, cr := newTestIngesterMode(t, config.CloseModeUpdate, fs)
+	if err := in.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stale open row (vf1) is swept: closed at the next version's start.
+	if len(fs.closes) != 1 || !fs.closes[0].validFrom.Equal(vf1) || !fs.closes[0].closeAt.Equal(vf2) {
+		t.Fatalf("expected stale open row swept [vf1 -> vf2], got %+v", fs.closes)
+	}
+
+	// Re-LIST of the unchanged object dedups against the recovered hash.
+	in.onEvent(cr, current, eventAdd)
+	if q := drain(in); len(q) != 0 {
+		t.Fatalf("unchanged re-LIST must be a no-op, got %d items", len(q))
+	}
+
+	// A change observed as a re-LIST Add closes the recovered version and opens
+	// a new one at OBSERVATION time — creationTimestamp (2026-01-01) would
+	// overlap every prior version.
+	in.onEvent(cr, svcObj("uid-1", "prod-web", "10.0.0.3", "3"), eventAdd)
+	q := drain(in)
+	if len(q) != 2 || q[0].close == nil || q[1].close != nil {
+		t.Fatalf("changed re-LIST: expected close op + insert, got %+v", q)
+	}
+	if !q[0].close.validFrom.Equal(vf2) {
+		t.Fatalf("close must target the recovered open version (vf2), got %+v", q[0].close)
+	}
+	if !q[1].row.ValidFrom.After(vf2) {
+		t.Fatalf("new version must start at observation time, not creationTimestamp: %v", q[1].row.ValidFrom)
+	}
+
+	// Rewrite mode: Recover is a no-op (memory-only last-state).
+	fsR := &fakeStore{open: fs.open}
+	inR, _ := newTestIngesterMode(t, config.CloseModeRewrite, fsR)
+	if err := inR.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fsR.closes) != 0 {
+		t.Fatalf("rewrite-mode Recover must not touch the store, got %+v", fsR.closes)
+	}
+	if _, hadPrior, _ := inR.priorOpen("uid-1", hash); hadPrior {
+		t.Fatal("rewrite-mode Recover must not populate last-state")
 	}
 }
 

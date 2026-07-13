@@ -133,6 +133,7 @@ func main() {
 			Secure:        sc.SecureEnabled(),
 			TLSSkipVerify: sc.TLSSkipVerify,
 			CreateSchema:  sc.CreateSchemaEnabled(),
+			UpdateClose:   sc.CloseModeOrDefault() == config.CloseModeUpdate,
 		})
 		if err != nil {
 			log.Error("history store open failed", "err", err)
@@ -143,14 +144,23 @@ func main() {
 			log.Error("history schema ensure failed", "err", err)
 			os.Exit(1)
 		}
-		ing := history.NewIngester(histStore, col.Informers(), compiled, cfg.History.Store.Batch, log)
+		ing := history.NewIngester(histStore, col.Informers(), compiled, cfg.History.Store.Batch,
+			cfg.History.Store.CloseModeOrDefault(), log)
+		// Restart idempotency (closeMode=update): rebuild last-state from the
+		// store's open rows BEFORE the informers start, so the initial re-LIST
+		// dedups against what was already written instead of re-inserting it.
+		if err := ing.Recover(ctx); err != nil {
+			log.Error("history last-state recovery failed", "err", err)
+			os.Exit(1)
+		}
 		if err := ing.Register(); err != nil {
 			log.Error("history handler register failed", "err", err)
 			os.Exit(1)
 		}
 		ing.Start(ctx)
 		log.Info("history ingest enabled", "resources", len(compiled),
-			"createSchema", cfg.History.Store.CreateSchemaEnabled())
+			"createSchema", cfg.History.Store.CreateSchemaEnabled(),
+			"closeMode", cfg.History.Store.CloseModeOrDefault())
 	}
 
 	mux := http.NewServeMux()

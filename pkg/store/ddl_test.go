@@ -14,7 +14,7 @@ func TestCreateTableSQL(t *testing.T) {
 			{Name: "port", Type: "Int64"},
 		},
 	}
-	got := createTableSQL(ts)
+	got := createTableSQL(ts, false)
 
 	want := `CREATE TABLE IF NOT EXISTS svc_versions (
   namespace LowCardinality(String),
@@ -40,7 +40,7 @@ ORDER BY (namespace, name, valid_from, resource_version, deleted)`
 
 func TestCreateTableSQL_NoIndex(t *testing.T) {
 	ts := TableSchema{Table: "t", Columns: []ColumnSchema{{Name: "c", Type: "String"}}}
-	got := createTableSQL(ts)
+	got := createTableSQL(ts, false)
 	if strings.Contains(got, "INDEX") {
 		t.Fatalf("did not expect an INDEX clause:\n%s", got)
 	}
@@ -49,11 +49,24 @@ func TestCreateTableSQL_NoIndex(t *testing.T) {
 	}
 }
 
+// closeMode=update tables carry the patch-part settings lightweight UPDATE
+// needs; rewrite-mode tables must not (no ClickHouse version requirement).
+func TestCreateTableSQL_UpdateClosePatchSettings(t *testing.T) {
+	ts := TableSchema{Table: "t", Columns: []ColumnSchema{{Name: "c", Type: "String"}}}
+	got := createTableSQL(ts, true)
+	if !strings.HasSuffix(got, "SETTINGS "+patchPartSettings) {
+		t.Fatalf("update-close DDL must end with patch-part SETTINGS:\n%s", got)
+	}
+	if strings.Contains(createTableSQL(ts, false), "enable_block_number_column") {
+		t.Fatalf("rewrite-mode DDL must not carry patch-part settings")
+	}
+}
+
 // valid_to must never join the sort key: the closing row re-inserts the open
 // row with valid_to set, and only an identical sort key lets ReplacingMergeTree
 // collapse the two.
 func TestCreateTableSQL_ValidToNotInOrderBy(t *testing.T) {
-	got := createTableSQL(TableSchema{Table: "t", Columns: []ColumnSchema{{Name: "c", Type: "String"}}})
+	got := createTableSQL(TableSchema{Table: "t", Columns: []ColumnSchema{{Name: "c", Type: "String"}}}, false)
 	if !strings.Contains(got, "valid_to DateTime64(3)") {
 		t.Fatalf("valid_to column missing:\n%s", got)
 	}

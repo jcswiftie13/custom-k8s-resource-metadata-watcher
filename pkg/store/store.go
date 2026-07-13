@@ -52,10 +52,35 @@ type Row struct {
 	Values          map[string]any
 }
 
+// OpenVersion is one open (valid_to = FarFuture) row as seen by recovery: just
+// the identity + dedup hash the ingester needs to rebuild its last-state after
+// a restart, never the declared column values.
+type OpenVersion struct {
+	Namespace string
+	Name      string
+	UID       string
+	SpecHash  string
+	ValidFrom time.Time
+	IngestSeq uint64
+}
+
 // Store is the write surface used by the ingest path.
 type Store interface {
 	EnsureSchema(ctx context.Context, tables []TableSchema) error
 	WriteBatch(ctx context.Context, table string, rows []Row) error
+	// CloseVersion closes one open version in place with a lightweight UPDATE
+	// (closeMode=update only): it sets valid_to = closeAt on the row matching
+	// (namespace, name, uid, validFrom) that still carries the FarFuture
+	// sentinel. Matching zero rows is not an error — the close is idempotent
+	// by construction (a replay finds no sentinel row left to patch).
+	// Requires ClickHouse >= 25.8 with the block-number table settings (see
+	// EnsureSchema / docs/lightweight-update-upgrade-plan.md).
+	CloseVersion(ctx context.Context, table, namespace, name, uid string, validFrom, closeAt time.Time) error
+	// OpenVersions lists every row still carrying the FarFuture sentinel, for
+	// the ingester's restart recovery. Raw rows: pre-migration duplicates
+	// (same uid+valid_from, different ingest_seq) are NOT collapsed here — the
+	// caller dedups.
+	OpenVersions(ctx context.Context, table string) ([]OpenVersion, error)
 	Close() error
 }
 
@@ -63,6 +88,7 @@ type Store interface {
 type chStore struct {
 	conn         driver.Conn
 	createSchema bool
+	updateClose  bool                   // closeMode=update: DDL adds patch-part table settings
 	schemas      map[string]TableSchema // table name -> schema, set by EnsureSchema
 }
 
@@ -79,6 +105,10 @@ type Options struct {
 	Secure        bool
 	TLSSkipVerify bool
 	CreateSchema  bool
+	// UpdateClose (closeMode=update) makes EnsureSchema add/require the
+	// enable_block_number_column / enable_block_offset_column table settings
+	// that ClickHouse lightweight UPDATEs need.
+	UpdateClose bool
 }
 
 // buildClickHouseOptions resolves the DSN and applies auth/TLS overrides. It
@@ -125,7 +155,7 @@ func Open(ctx context.Context, o Options) (Store, error) {
 	if err := conn.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("ping clickhouse: %w", err)
 	}
-	return &chStore{conn: conn, createSchema: o.CreateSchema}, nil
+	return &chStore{conn: conn, createSchema: o.CreateSchema, updateClose: o.UpdateClose}, nil
 }
 
 func (s *chStore) Close() error { return s.conn.Close() }
