@@ -5,20 +5,33 @@ package history
 
 import (
 	"fmt"
+	"os"
 	"regexp"
+	"strconv"
+	"time"
 
 	"github.com/example/metadata-exporter/pkg/collector"
 	"github.com/example/metadata-exporter/pkg/config"
 	"github.com/example/metadata-exporter/pkg/store"
 )
 
-// CompiledColumn is a declared column plus its compiled extraction path.
+// CompiledColumn is a declared column plus either a typed constant or a
+// compiled extraction path (primary → fallbacks → onMissing).
 type CompiledColumn struct {
-	Name    string
-	Type    string // ClickHouse type
-	Encode  string // "", "json", "kv"
-	Index   string // "", "bloom_filter"
-	Extract collector.CompiledExtract
+	Name   string
+	Type   string // ClickHouse type
+	Encode string // "", "json", "kv"
+	Index  string // "", "bloom_filter"
+
+	// Constant mode (IsConstant): fixed value resolved at compile time.
+	IsConstant bool
+	Constant   any
+
+	// Path mode: EvaluateLabel-equivalent extraction.
+	Primary      collector.CompiledExtract
+	Fallbacks    []collector.CompiledExtract
+	HasOnMissing bool
+	OnMissing    string
 }
 
 // CompiledFilter is one compiled predicate. Regex is pre-compiled once so the
@@ -43,23 +56,17 @@ type CompiledResource struct {
 	Filters []CompiledFilter
 }
 
-// Compile builds a CompiledResource from config. The config is assumed already
-// validated (see config.HistoryResource.validate).
+// Compile builds a CompiledResource from one resource config (without injecting
+// top-level history.constants). The config is assumed already validated.
 func Compile(r config.HistoryResource) (*CompiledResource, error) {
 	cr := &CompiledResource{Kind: r.Kind, Table: r.TableName()}
 
 	for _, c := range r.Columns {
-		ce, err := collector.CompileExtract(c.Extract)
+		cc, err := compileColumn(c)
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", c.Name, err)
 		}
-		cr.Columns = append(cr.Columns, CompiledColumn{
-			Name:    c.Name,
-			Type:    c.Type,
-			Encode:  c.Encode,
-			Index:   c.Index,
-			Extract: ce,
-		})
+		cr.Columns = append(cr.Columns, cc)
 	}
 
 	var regexFilters []CompiledFilter
@@ -94,17 +101,138 @@ func Compile(r config.HistoryResource) (*CompiledResource, error) {
 	return cr, nil
 }
 
-// CompileAll compiles every resource in the history config.
+// CompileAll compiles every resource in the history config, prepending any
+// top-level constants onto each resource's column list.
 func CompileAll(h config.History) ([]*CompiledResource, error) {
+	constants := make([]CompiledColumn, 0, len(h.Constants))
+	for i, c := range h.Constants {
+		cc, err := compileConstant(c)
+		if err != nil {
+			return nil, fmt.Errorf("constants[%d] (name=%q): %w", i, c.Name, err)
+		}
+		constants = append(constants, cc)
+	}
+
 	out := make([]*CompiledResource, 0, len(h.Resources))
 	for i := range h.Resources {
 		cr, err := Compile(h.Resources[i])
 		if err != nil {
 			return nil, fmt.Errorf("resource %q: %w", h.Resources[i].Kind, err)
 		}
+		if len(constants) > 0 {
+			merged := make([]CompiledColumn, 0, len(constants)+len(cr.Columns))
+			merged = append(merged, constants...)
+			merged = append(merged, cr.Columns...)
+			cr.Columns = merged
+		}
 		out = append(out, cr)
 	}
 	return out, nil
+}
+
+func compileColumn(c config.HistoryColumn) (CompiledColumn, error) {
+	cc := CompiledColumn{Name: c.Name, Type: c.Type, Encode: c.Encode, Index: c.Index}
+	if c.IsConstant() {
+		v, err := resolveConstant(c.Type, c.Value, c.ValueEnv)
+		if err != nil {
+			return CompiledColumn{}, err
+		}
+		cc.IsConstant = true
+		cc.Constant = v
+		return cc, nil
+	}
+
+	primary, err := collector.CompileExtract(c.Extract)
+	if err != nil {
+		return CompiledColumn{}, err
+	}
+	cc.Primary = primary
+	for i, f := range c.Fallbacks {
+		fe, err := collector.CompileExtract(f)
+		if err != nil {
+			return CompiledColumn{}, fmt.Errorf("fallback[%d]: %w", i, err)
+		}
+		cc.Fallbacks = append(cc.Fallbacks, fe)
+	}
+	if c.OnMissing != nil {
+		cc.HasOnMissing = true
+		cc.OnMissing = *c.OnMissing
+	}
+	return cc, nil
+}
+
+func compileConstant(c config.HistoryConstant) (CompiledColumn, error) {
+	v, err := resolveConstant(c.Type, c.Value, c.ValueEnv)
+	if err != nil {
+		return CompiledColumn{}, err
+	}
+	return CompiledColumn{
+		Name:       c.Name,
+		Type:       c.Type,
+		Index:      c.Index,
+		IsConstant: true,
+		Constant:   v,
+	}, nil
+}
+
+func resolveConstant(typ, value, valueEnv string) (any, error) {
+	raw, err := resolveValueSource(value, valueEnv)
+	if err != nil {
+		return nil, err
+	}
+	return parseScalar(typ, raw)
+}
+
+func resolveValueSource(value, valueEnv string) (string, error) {
+	if valueEnv != "" {
+		v := os.Getenv(valueEnv)
+		if v == "" {
+			return "", fmt.Errorf("valueEnv references empty environment variable %q", valueEnv)
+		}
+		return v, nil
+	}
+	return value, nil
+}
+
+// parseScalar converts a string into the Go value matching a ClickHouse scalar
+// column type. Array(String) is rejected by validation before this is called.
+func parseScalar(typ, s string) (any, error) {
+	switch typ {
+	case "String":
+		return s, nil
+	case "Int64":
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse Int64 %q: %w", s, err)
+		}
+		return n, nil
+	case "UInt64":
+		n, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse UInt64 %q: %w", s, err)
+		}
+		return n, nil
+	case "Float64":
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse Float64 %q: %w", s, err)
+		}
+		return f, nil
+	case "Bool":
+		b, err := strconv.ParseBool(s)
+		if err != nil {
+			return nil, fmt.Errorf("parse Bool %q: %w", s, err)
+		}
+		return b, nil
+	case "DateTime64(3)":
+		t, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			return nil, fmt.Errorf("parse DateTime64(3) %q: %w", s, err)
+		}
+		return t.UTC(), nil
+	default:
+		return nil, fmt.Errorf("unsupported constant type %q", typ)
+	}
 }
 
 // TableSchema converts the compiled resource to the store's schema type.

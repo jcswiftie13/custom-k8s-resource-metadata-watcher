@@ -370,12 +370,17 @@ func (in *Ingester) buildRow(cr *CompiledResource, u *unstructured.Unstructured,
 }
 
 // columnValue produces a Go value matching the column's ClickHouse type and
-// encoding. Missing values yield typed zero values so the batch always has a
-// complete, correctly-typed tuple.
+// encoding. Constant columns return their compile-time value. Path columns try
+// primary then fallbacks then onMissing; when onMissing is unset, missing
+// values yield typed zeros so the batch always has a complete tuple.
 func (in *Ingester) columnValue(c *CompiledColumn, lookup srcLookup) (any, error) {
+	if c.IsConstant {
+		return c.Constant, nil
+	}
+
 	switch c.Encode {
 	case "json":
-		raw := in.ev.EvaluateExtractRaw(c.Extract, lookup)
+		raw := in.evaluateRaw(c, lookup)
 		if len(raw) == 0 || raw[0] == nil {
 			return "", nil
 		}
@@ -385,32 +390,32 @@ func (in *Ingester) columnValue(c *CompiledColumn, lookup srcLookup) (any, error
 		}
 		return string(b), nil
 	case "kv":
-		return kvTokens(in.ev.EvaluateExtractRaw(c.Extract, lookup)), nil
+		return kvTokens(in.evaluateRaw(c, lookup)), nil
 	}
 
+	vals, _ := in.evaluateStrings(c, lookup)
 	switch c.Type {
 	case "Array(String)":
-		vals := in.ev.EvaluateExtractAll(c.Extract, lookup)
 		if vals == nil {
 			vals = []string{}
 		}
 		return vals, nil
 	case "String":
-		return firstOr(in.ev.EvaluateExtractAll(c.Extract, lookup), ""), nil
+		return firstOr(vals, ""), nil
 	case "Int64":
-		n, _ := strconv.ParseInt(firstOr(in.ev.EvaluateExtractAll(c.Extract, lookup), ""), 10, 64)
+		n, _ := strconv.ParseInt(firstOr(vals, ""), 10, 64)
 		return n, nil
 	case "UInt64":
-		n, _ := strconv.ParseUint(firstOr(in.ev.EvaluateExtractAll(c.Extract, lookup), ""), 10, 64)
+		n, _ := strconv.ParseUint(firstOr(vals, ""), 10, 64)
 		return n, nil
 	case "Float64":
-		f, _ := strconv.ParseFloat(firstOr(in.ev.EvaluateExtractAll(c.Extract, lookup), ""), 64)
+		f, _ := strconv.ParseFloat(firstOr(vals, ""), 64)
 		return f, nil
 	case "Bool":
-		b, _ := strconv.ParseBool(firstOr(in.ev.EvaluateExtractAll(c.Extract, lookup), "false"))
+		b, _ := strconv.ParseBool(firstOr(vals, "false"))
 		return b, nil
 	case "DateTime64(3)":
-		s := firstOr(in.ev.EvaluateExtractAll(c.Extract, lookup), "")
+		s := firstOr(vals, "")
 		if s == "" {
 			return time.Unix(0, 0).UTC(), nil
 		}
@@ -421,6 +426,41 @@ func (in *Ingester) columnValue(c *CompiledColumn, lookup srcLookup) (any, error
 		return t.UTC(), nil
 	}
 	return nil, fmt.Errorf("unsupported column type %q", c.Type)
+}
+
+// evaluateStrings tries primary then fallbacks; on total miss returns
+// onMissing (as a single-element slice) when set, else nil.
+func (in *Ingester) evaluateStrings(c *CompiledColumn, lookup srcLookup) (vals []string, fromOnMissing bool) {
+	vals = in.ev.EvaluateExtractAll(c.Primary, lookup)
+	if len(vals) > 0 {
+		return vals, false
+	}
+	for _, f := range c.Fallbacks {
+		vals = in.ev.EvaluateExtractAll(f, lookup)
+		if len(vals) > 0 {
+			return vals, false
+		}
+	}
+	if c.HasOnMissing {
+		return []string{c.OnMissing}, true
+	}
+	return nil, false
+}
+
+// evaluateRaw tries primary then fallbacks for encode=json/kv. onMissing does
+// not apply (rejected at validate time when encode is set).
+func (in *Ingester) evaluateRaw(c *CompiledColumn, lookup srcLookup) []interface{} {
+	raw := in.ev.EvaluateExtractRaw(c.Primary, lookup)
+	if len(raw) > 0 {
+		return raw
+	}
+	for _, f := range c.Fallbacks {
+		raw = in.ev.EvaluateExtractRaw(f, lookup)
+		if len(raw) > 0 {
+			return raw
+		}
+	}
+	return nil
 }
 
 func (in *Ingester) enqueue(table string, row store.Row, close *closeOp) {

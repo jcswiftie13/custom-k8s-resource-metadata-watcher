@@ -64,6 +64,11 @@ history:
     # token / tokenEnv: JWT / access token (ClickHouse Cloud). Mutually
     # exclusive with username/password.
     # tokenEnv: CH_TOKEN
+  # Fixed columns injected into every history table (ideal for cluster name).
+  # Prefer valueEnv so the name comes from the Deployment env / downward API.
+  constants:
+    - { name: cluster_name, type: String, value: "dev" }
+    # - { name: cluster_name, type: String, valueEnv: CLUSTER_NAME }
   resources:
     - kind: VirtualService
       table: vs_versions

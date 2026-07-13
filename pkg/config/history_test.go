@@ -153,6 +153,43 @@ func TestHistory_ValidationErrors(t *testing.T) {
 			c.History.Resources[0].Filters[0].Op = "in"
 			c.History.Resources[0].Filters[0].Value = ""
 		}, "op=in requires values"},
+		{"value with path", func(c *Config) {
+			c.History.Resources[0].Columns[0].Value = "fixed"
+		}, "mutually exclusive"},
+		{"value and valueEnv", func(c *Config) {
+			c.History.Resources[0].Columns[0] = HistoryColumn{
+				Name: "src", Type: "String", Value: "a", ValueEnv: "B",
+			}
+		}, "mutually exclusive"},
+		{"value with encode", func(c *Config) {
+			c.History.Resources[0].Columns[0] = HistoryColumn{
+				Name: "src", Type: "String", Value: "a", Encode: "json",
+			}
+		}, "encode is incompatible"},
+		{"value Array(String)", func(c *Config) {
+			c.History.Resources[0].Columns[0] = HistoryColumn{
+				Name: "src", Type: "Array(String)", Value: "a",
+			}
+		}, "do not support type Array(String)"},
+		{"encode with onMissing", func(c *Config) {
+			om := "x"
+			c.History.Resources[0].Columns[1].OnMissing = &om
+		}, "encode is incompatible with onMissing"},
+		{"constants reserved", func(c *Config) {
+			c.History.Constants = []HistoryConstant{{Name: "uid", Type: "String", Value: "x"}}
+		}, "reserved"},
+		{"constants duplicated", func(c *Config) {
+			c.History.Constants = []HistoryConstant{
+				{Name: "cluster_name", Type: "String", Value: "a"},
+				{Name: "cluster_name", Type: "String", Value: "b"},
+			}
+		}, "duplicated"},
+		{"constants conflict column", func(c *Config) {
+			c.History.Constants = []HistoryConstant{{Name: "cluster_ip", Type: "String", Value: "prod"}}
+		}, "conflicts with history.constants"},
+		{"constants missing value", func(c *Config) {
+			c.History.Constants = []HistoryConstant{{Name: "cluster_name", Type: "String"}}
+		}, "value or valueEnv is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -166,5 +203,32 @@ func TestHistory_ValidationErrors(t *testing.T) {
 				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantSub)
 			}
 		})
+	}
+}
+
+func TestHistory_ConstantColumnAndTopLevel(t *testing.T) {
+	c := baseHistoryConfig()
+	c.History.Constants = []HistoryConstant{
+		{Name: "cluster_name", Type: "String", Value: "prod-a"},
+	}
+	c.History.Resources[0].Columns = append(c.History.Resources[0].Columns, HistoryColumn{
+		Name: "source", Type: "String", Value: "metadata-exporter",
+	})
+	om := "unknown"
+	c.History.Resources[0].Columns = append(c.History.Resources[0].Columns, HistoryColumn{
+		Name: "team", Type: "String", Extract: Extract{Path: "metadata.labels.team", OnMissing: &om},
+	})
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+}
+
+func TestHistory_ValueEnvColumn(t *testing.T) {
+	c := baseHistoryConfig()
+	c.History.Resources[0].Columns = append(c.History.Resources[0].Columns, HistoryColumn{
+		Name: "cluster_name", Type: "String", ValueEnv: "CLUSTER_NAME",
+	})
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected err: %v", err)
 	}
 }

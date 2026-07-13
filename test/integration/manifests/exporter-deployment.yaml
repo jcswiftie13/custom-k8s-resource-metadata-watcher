@@ -31,6 +31,10 @@ spec:
           args:
             - --config=/etc/metadata-exporter/config.yaml
             - --metrics-addr=:8080
+          env:
+            # Used by history e2e valueEnv (history.constants cluster_name).
+            - name: CLUSTER_NAME
+              value: e2e-cluster
           ports:
             - name: metrics
               containerPort: 8080

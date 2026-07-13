@@ -32,11 +32,13 @@ func istioHistoryConfigYAML(namespace string) string {
 // columns and bloom indexes as poc/route2a/internal/chstore — reproduced
 // purely through history config, with no import of poc code.
 //
-// It exercises all four required aspects in one scenario:
+// It exercises the following aspects in one scenario:
 //   - create table: createSchema:true builds the four tables + bloom indexes.
 //   - type: String / Int64 / Array(String) / encode:kv / encode:json columns.
 //   - filter: the Service history resource keeps only type in (LoadBalancer,NodePort).
 //   - labelSelector: the Gateway watch is narrowed server-side to istio=ingressgateway.
+//   - constants: history.constants injects cluster_name (valueEnv: CLUSTER_NAME) into every table.
+//   - value / onMissing: Service source is a fixed value; team uses path + onMissing.
 func istioHistoryConfigYAMLWithDSN(namespace, dsn string) string {
 	return fmt.Sprintf(`metricPrefix: "it_"
 
@@ -88,6 +90,8 @@ history:
     batch:
       maxRows: 100
       flushIntervalMs: 200
+  constants:
+    - { name: cluster_name, type: String, valueEnv: CLUSTER_NAME }
   resources:
     - kind: Service
       table: service_versions
@@ -99,12 +103,15 @@ history:
         - { name: port_name, type: "String", path: "spec.ports[0].name" }
         - { name: protocol, type: "String", path: "spec.ports[0].protocol" }
         - { name: hostname, type: "String", path: "metadata.name" }
+        - { name: source, type: "String", value: "metadata-exporter" }
+        - { name: team, type: "String", path: 'metadata.labels["team"]', onMissing: "unknown" }
       filters:
         - { path: "spec.type", op: in, values: ["LoadBalancer", "NodePort"] }
     - kind: Deployment
       table: deploy_versions
       columns:
         - { name: pod_labels_kv, type: "Array(String)", path: "spec.template.metadata.labels", encode: kv }
+        - { name: team, type: "String", path: 'metadata.labels["team"]', onMissing: "unknown" }
     - kind: Gateway
       table: gw_versions
       columns:

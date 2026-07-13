@@ -91,11 +91,15 @@ func runHistoryClickHouseIstioSchema(t *testing.T, ns, dsn string) {
 	// --- Create the real resources BEFORE enabling history so the exporter's
 	// initial LIST observes them all in one batch. ---
 
-	// Deployment (replicas 0 keeps it light; only its pod-template labels matter).
+	// Deployment (replicas 0 keeps it light; pod-template labels feed encode:kv,
+	// object metadata.labels.team exercises path onMissing hit).
 	createObject(t, dyn, deployGVR, ns, map[string]interface{}{
 		"apiVersion": "apps/v1",
 		"kind":       "Deployment",
-		"metadata":   map[string]interface{}{"namespace": ns, "name": "dep-1"},
+		"metadata": map[string]interface{}{
+			"namespace": ns, "name": "dep-1",
+			"labels": map[string]interface{}{"team": "platform"},
+		},
 		"spec": map[string]interface{}{
 			"replicas": int64(0),
 			"selector": map[string]interface{}{"matchLabels": map[string]interface{}{"app": "api"}},
@@ -261,6 +265,38 @@ func runHistoryClickHouseIstioSchema(t *testing.T, ns, dsn string) {
 		}
 		if got := chQuery(t, "SELECT count() FROM gw_versions WHERE name='gw-drop'"); got != "0" {
 			t.Fatalf("gw-drop should be excluded by labelSelector, got count %q", got)
+		}
+	})
+
+	t.Run("constants_value_onmissing", func(t *testing.T) {
+		// history.constants injects cluster_name into every table.
+		for _, tbl := range []string{"service_versions", "deploy_versions", "gw_versions", "vs_versions"} {
+			assertColumnType(t, tbl, "cluster_name", "String")
+		}
+		// valueEnv: CLUSTER_NAME from the exporter Deployment env.
+		cases := []struct{ table, name string }{
+			{"service_versions", "svc-lb"},
+			{"deploy_versions", "dep-1"},
+			{"gw_versions", "gw-keep"},
+			{"vs_versions", "vs-1"},
+		}
+		for _, c := range cases {
+			q := fmt.Sprintf("SELECT cluster_name FROM %s WHERE name='%s' ORDER BY valid_from DESC LIMIT 1", c.table, c.name)
+			if got := chQuery(t, q); got != "e2e-cluster" {
+				t.Fatalf("%s.%s cluster_name = %q, want e2e-cluster", c.table, c.name, got)
+			}
+		}
+		// Per-column value (constant mode).
+		if got := chQuery(t, "SELECT source FROM service_versions WHERE name='svc-lb' ORDER BY valid_from DESC LIMIT 1"); got != "metadata-exporter" {
+			t.Fatalf("service source = %q, want metadata-exporter", got)
+		}
+		// onMissing miss: svc-lb has no metadata.labels.team.
+		if got := chQuery(t, "SELECT team FROM service_versions WHERE name='svc-lb' ORDER BY valid_from DESC LIMIT 1"); got != "unknown" {
+			t.Fatalf("service team onMissing = %q, want unknown", got)
+		}
+		// onMissing hit: dep-1 carries metadata.labels.team=platform.
+		if got := chQuery(t, "SELECT team FROM deploy_versions WHERE name='dep-1' ORDER BY valid_from DESC LIMIT 1"); got != "platform" {
+			t.Fatalf("deploy team = %q, want platform", got)
 		}
 	})
 

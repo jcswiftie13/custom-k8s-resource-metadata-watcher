@@ -688,7 +688,7 @@ make bench-collect
 | Owner 鏈解析（`Resolve`） | `pkg/collector/resolver.go` |
 | Scoped informer 群（每 (resource, namespace) 一份 factory） | `pkg/collector/listers.go` |
 | 整合測設定形狀 | `test/integration/e2e/config_yaml.go` |
-| `history`（`StoreConfig`/`HistoryResource`/`HistoryColumn`/`HistoryFilter`）| `pkg/config/config.go` |
+| `history`（`StoreConfig`/`HistoryConstant`/`HistoryResource`/`HistoryColumn`/`HistoryFilter`）| `pkg/config/config.go` |
 | 欄位/filter 編譯、client 端 filter、事件 handler、spec-hash 去重 | `pkg/history/`（`compiled.go`/`filter.go`/`ingest.go`/`hash.go`）|
 | ClickHouse writer、DDL 產生／驗證、批次寫入 | `pkg/store/`（`store.go`/`ddl.go`/`batch.go`）|
 | 共用抽取介面（`CompileExtract`/`EvaluateExtractAll`/`EvaluateExtractRaw`）| `pkg/collector/extract.go` |
@@ -719,6 +719,9 @@ history:
     username: default
     passwordEnv: CH_PASSWORD    # 由 k8s Secret 注入的 env 變數（優先於 password）
     secure: true                # 開啟 TLS（https:// DSN 亦需）
+  # 固定值欄位，自動注入每一張 history 表（適合 cluster name）
+  constants:
+    - { name: cluster_name, type: String, valueEnv: CLUSTER_NAME }
   resources:
     - kind: VirtualService      # 必須同時出現在 watch.resources
       table: vs_versions        # 選填，預設 <kind 小寫>_versions
@@ -728,18 +731,24 @@ history:
 
 ### 14.2 `columns`：宣告 ClickHouse 欄位
 
-每個 column = 一個 ClickHouse 欄位 + 其來源 json path（像 tsdb rule）。
+每個 column 有兩種互斥模式：
+
+1. **Path 模式**：從 K8s 物件用 json path 取值（可搭配 `fallbacks`／`onMissing`）。
+2. **Constant 模式**：`value` 或 `valueEnv` 寫入固定 scalar（與 path 互斥）。
+
+另可用頂層 [`history.constants`](#141-頂層結構) 把同一組常數注入**所有**表（不必在每個 resource 重複宣告）。
 
 | 欄位 | 說明 |
 |------|------|
-| `name` | ClickHouse 欄位名（合法識別字，不可與 envelope 欄位衝突）|
+| `name` | ClickHouse 欄位名（合法識別字，不可與 envelope 或 `history.constants` 衝突）|
 | `type` | `String` / `Array(String)` / `Int64` / `UInt64` / `Float64` / `Bool` / `DateTime64(3)` |
-| `path` / `source` / `fallbacks` / `onMissing` | 同 `rules` 的 `Extract`；wildcard `[*]` path 產生 `Array(String)` 多值 |
-| `encode` | `""`（scalar）、`json`（把抽出的子樹 marshal 成 JSON 字串，需 `type: String`）、`kv`（把 map 攤平成排序 `k=v`，需 `type: Array(String)`）|
+| `path` / `source` / `fallbacks` / `onMissing` | Path 模式；同 `rules` 的 `Extract`。wildcard `[*]` 產生 `Array(String)`。miss 時：有 `onMissing` 則用它，否則寫該型別零值（`""`／`[]`／`0`／…）|
+| `value` / `valueEnv` | Constant 模式（互斥）；僅 scalar 型別，不可與 path／encode／onMissing 並用。`valueEnv` 於啟動時 resolve，空則 fail fast |
+| `encode` | `""`（scalar）、`json`（需 `type: String`）、`kv`（需 `type: Array(String)`）；不可與 `onMissing` 或 constant 並用 |
 | `index` | `""` 或 `bloom_filter`（產生 skip index，加速 `has`/`hasAll` 查詢）|
 
 **Envelope 欄位為隱含、每張表都有**（不可重複宣告）：`namespace`、`name`、`uid`、`resource_version`、
-`valid_from`、`deleted`、`spec_hash`、`ingest_seq`。
+`valid_from`、`valid_to`、`deleted`、`spec_hash`、`ingest_seq`。
 
 ### 14.3 `filters`：client 端欄位過濾（支援 regex）
 

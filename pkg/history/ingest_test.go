@@ -404,3 +404,55 @@ func TestIngest_IngestSeqMonotonic(t *testing.T) {
 		t.Fatalf("ingest_seq not monotonic: %d then %d", q[0].row.IngestSeq, q[1].row.IngestSeq)
 	}
 }
+
+func TestIngest_ConstantsAndOnMissing(t *testing.T) {
+	om := "unknown"
+	rs, err := CompileAll(config.History{
+		Constants: []config.HistoryConstant{
+			{Name: "cluster_name", Type: "String", Value: "prod"},
+		},
+		Resources: []config.HistoryResource{{
+			Kind:  "Service",
+			Table: "svc_versions",
+			Columns: []config.HistoryColumn{
+				{Extract: config.Extract{Path: "spec.clusterIP"}, Name: "cluster_ip", Type: "String"},
+				{Name: "team", Type: "String", Extract: config.Extract{Path: `metadata.labels["team"]`, OnMissing: &om}},
+			},
+			Filters: []config.HistoryFilter{
+				{Extract: config.Extract{Path: "metadata.namespace"}, Op: "prefix", Value: "prod-"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CompileAll: %v", err)
+	}
+	cr := rs[0]
+	in := NewIngester(&fakeStore{}, nil, rs, config.BatchConfig{}, config.CloseModeRewrite, slog.Default())
+
+	in.onEvent(cr, svcObj("uid-c", "prod-web", "10.0.0.1", "1"), eventAdd)
+	q := drain(in)
+	if len(q) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(q))
+	}
+	row := q[0].row
+	if row.Values["cluster_name"] != "prod" {
+		t.Fatalf("cluster_name = %v", row.Values["cluster_name"])
+	}
+	if row.Values["cluster_ip"] != "10.0.0.1" {
+		t.Fatalf("cluster_ip = %v", row.Values["cluster_ip"])
+	}
+	if row.Values["team"] != "unknown" {
+		t.Fatalf("team onMissing = %v", row.Values["team"])
+	}
+
+	// Spec change opens a new version; constants stay the same.
+	in.onEvent(cr, svcObj("uid-c", "prod-web", "10.0.0.2", "2"), eventUpdate)
+	q = drain(in)
+	if len(q) != 2 { // close prior + new open
+		t.Fatalf("expected close+open, got %d", len(q))
+	}
+	newOpen := q[1].row
+	if newOpen.Values["cluster_name"] != "prod" || newOpen.Values["cluster_ip"] != "10.0.0.2" {
+		t.Fatalf("updated row = %+v", newOpen.Values)
+	}
+}

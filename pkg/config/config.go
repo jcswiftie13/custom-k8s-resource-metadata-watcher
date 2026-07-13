@@ -771,9 +771,24 @@ const (
 // is append-only, and valid_to is materialized by re-inserting the superseded
 // row with its end time (ReplacingMergeTree collapses the pair).
 type History struct {
-	Enabled   bool              `json:"enabled,omitempty"`
-	Store     StoreConfig       `json:"store,omitempty"`
+	Enabled bool        `json:"enabled,omitempty"`
+	Store   StoreConfig `json:"store,omitempty"`
+	// Constants are fixed-value columns injected into every history table
+	// (e.g. cluster_name). Names must not collide with envelope columns or
+	// any per-resource column.
+	Constants []HistoryConstant `json:"constants,omitempty"`
 	Resources []HistoryResource `json:"resources,omitempty"`
+}
+
+// HistoryConstant declares a scalar column with a fixed value written on every
+// row of every history table. value and valueEnv are mutually exclusive; one
+// is required. Array(String) is not supported.
+type HistoryConstant struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Value    string `json:"value,omitempty"`
+	ValueEnv string `json:"valueEnv,omitempty"`
+	Index    string `json:"index,omitempty"`
 }
 
 // StoreConfig describes the ClickHouse backend for the history store.
@@ -926,9 +941,12 @@ func (r HistoryResource) TableName() string {
 	return strings.ToLower(r.Kind) + "_versions"
 }
 
-// HistoryColumn declares one ClickHouse column and how to populate it. The
-// embedded Extract supplies Source/Path/Fallbacks/OnMissing (json path
-// extraction), reusing the same engine as metric labels.
+// HistoryColumn declares one ClickHouse column and how to populate it.
+//
+// Two mutually exclusive modes:
+//   - Path mode: embedded Extract (source/path/fallbacks/onMissing) pulls a
+//     value from the watched object, same engine as metric labels.
+//   - Constant mode: Value or ValueEnv supplies a fixed scalar (no path).
 type HistoryColumn struct {
 	Extract
 	// Name is the ClickHouse column name.
@@ -938,9 +956,22 @@ type HistoryColumn struct {
 	// Encode transforms the extracted value: "" (scalar), "json" (marshal the
 	// extracted subtree to a JSON string; requires type String), "kv" (flatten
 	// a map into sorted "k=v" tokens; requires type Array(String)).
+	// Incompatible with constant mode and with onMissing.
 	Encode string `json:"encode,omitempty"`
 	// Index optionally attaches a skip index: "" or "bloom_filter".
 	Index string `json:"index,omitempty"`
+	// Value is a fixed scalar for constant-mode columns (mutually exclusive
+	// with path extraction and with ValueEnv).
+	Value string `json:"value,omitempty"`
+	// ValueEnv names an env var holding the constant; mutually exclusive with
+	// Value and with path extraction. Resolved at startup (fail fast if empty).
+	ValueEnv string `json:"valueEnv,omitempty"`
+}
+
+// IsConstant reports whether this column is populated from Value/ValueEnv
+// rather than json-path extraction.
+func (c HistoryColumn) IsConstant() bool {
+	return c.Value != "" || c.ValueEnv != ""
 }
 
 // HistoryFilter declares one client-side predicate on an extracted field. All
@@ -980,10 +1011,26 @@ func (h History) validate(reg *Registry) error {
 	if len(h.Resources) == 0 {
 		return fmt.Errorf("resources: at least one resource is required when history.enabled")
 	}
+
+	constNames := map[string]struct{}{}
+	for i := range h.Constants {
+		c := &h.Constants[i]
+		if err := c.validate(); err != nil {
+			return fmt.Errorf("constants[%d] (name=%q): %w", i, c.Name, err)
+		}
+		if _, reserved := reservedHistoryColumns[c.Name]; reserved {
+			return fmt.Errorf("constants[%d]: name %q is a reserved envelope column", i, c.Name)
+		}
+		if _, dup := constNames[c.Name]; dup {
+			return fmt.Errorf("constants[%d]: column %q is duplicated", i, c.Name)
+		}
+		constNames[c.Name] = struct{}{}
+	}
+
 	seenTable := map[string]struct{}{}
 	for i := range h.Resources {
 		r := &h.Resources[i]
-		if err := r.validate(reg); err != nil {
+		if err := r.validate(reg, constNames); err != nil {
 			return fmt.Errorf("resources[%d] (kind=%q): %w", i, r.Kind, err)
 		}
 		table := r.TableName()
@@ -998,7 +1045,7 @@ func (h History) validate(reg *Registry) error {
 	return nil
 }
 
-func (r *HistoryResource) validate(reg *Registry) error {
+func (r *HistoryResource) validate(reg *Registry, constNames map[string]struct{}) error {
 	if strings.TrimSpace(r.Kind) == "" {
 		return fmt.Errorf("kind: required")
 	}
@@ -1017,6 +1064,9 @@ func (r *HistoryResource) validate(reg *Registry) error {
 		if _, reserved := reservedHistoryColumns[c.Name]; reserved {
 			return fmt.Errorf("columns[%d]: name %q is a reserved envelope column", i, c.Name)
 		}
+		if _, hit := constNames[c.Name]; hit {
+			return fmt.Errorf("columns[%d]: column %q conflicts with history.constants", i, c.Name)
+		}
 		if _, dup := seen[c.Name]; dup {
 			return fmt.Errorf("columns[%d]: column %q is duplicated", i, c.Name)
 		}
@@ -1030,6 +1080,21 @@ func (r *HistoryResource) validate(reg *Registry) error {
 	return nil
 }
 
+func (c *HistoryConstant) validate() error {
+	if !chIdentRe.MatchString(c.Name) {
+		return fmt.Errorf("name %q: invalid ClickHouse identifier", c.Name)
+	}
+	if _, ok := historyColumnTypes[c.Type]; !ok {
+		return fmt.Errorf("type %q: unsupported (allowed: String, Array(String), Int64, UInt64, Float64, Bool, DateTime64(3))", c.Type)
+	}
+	switch c.Index {
+	case "", "bloom_filter":
+	default:
+		return fmt.Errorf("index %q: unsupported (allowed: bloom_filter)", c.Index)
+	}
+	return validateConstantValue(c.Type, c.Value, c.ValueEnv)
+}
+
 func (c *HistoryColumn) validate(reg *Registry) error {
 	if !chIdentRe.MatchString(c.Name) {
 		return fmt.Errorf("name %q: invalid ClickHouse identifier", c.Name)
@@ -1037,6 +1102,22 @@ func (c *HistoryColumn) validate(reg *Registry) error {
 	if _, ok := historyColumnTypes[c.Type]; !ok {
 		return fmt.Errorf("type %q: unsupported (allowed: String, Array(String), Int64, UInt64, Float64, Bool, DateTime64(3))", c.Type)
 	}
+	switch c.Index {
+	case "", "bloom_filter":
+	default:
+		return fmt.Errorf("index %q: unsupported (allowed: bloom_filter)", c.Index)
+	}
+
+	if c.IsConstant() {
+		if c.Encode != "" {
+			return fmt.Errorf("encode is incompatible with value/valueEnv")
+		}
+		if strings.TrimSpace(c.Path) != "" || c.Source != "" || len(c.Fallbacks) > 0 || c.OnMissing != nil {
+			return fmt.Errorf("value/valueEnv is mutually exclusive with path/source/fallbacks/onMissing")
+		}
+		return validateConstantValue(c.Type, c.Value, c.ValueEnv)
+	}
+
 	switch c.Encode {
 	case "":
 	case "json":
@@ -1050,13 +1131,26 @@ func (c *HistoryColumn) validate(reg *Registry) error {
 	default:
 		return fmt.Errorf("encode %q: unsupported (allowed: json, kv)", c.Encode)
 	}
-	switch c.Index {
-	case "", "bloom_filter":
-	default:
-		return fmt.Errorf("index %q: unsupported (allowed: bloom_filter)", c.Index)
+	if c.Encode != "" && c.OnMissing != nil {
+		return fmt.Errorf("encode is incompatible with onMissing")
 	}
 	// Reuse Extract validation (history has no forEach context).
 	return c.Extract.validate(reg, false)
+}
+
+// validateConstantValue checks scalar constant source fields shared by
+// HistoryColumn (constant mode) and HistoryConstant.
+func validateConstantValue(typ, value, valueEnv string) error {
+	if value != "" && valueEnv != "" {
+		return fmt.Errorf("value and valueEnv are mutually exclusive")
+	}
+	if value == "" && valueEnv == "" {
+		return fmt.Errorf("value or valueEnv is required")
+	}
+	if typ == "Array(String)" {
+		return fmt.Errorf("constant columns do not support type Array(String)")
+	}
+	return nil
 }
 
 func (f *HistoryFilter) validate(reg *Registry) error {

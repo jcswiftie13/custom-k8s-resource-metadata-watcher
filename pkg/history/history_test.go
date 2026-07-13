@@ -106,6 +106,80 @@ func TestColumnValue_Types(t *testing.T) {
 	}
 }
 
+func TestColumnValue_OnMissingAndConstant(t *testing.T) {
+	om := "unknown"
+	cr := mustCompile(t, config.HistoryResource{
+		Kind: "Service",
+		Columns: []config.HistoryColumn{
+			{Name: "team", Type: "String", Extract: config.Extract{Path: `metadata.labels["team"]`, OnMissing: &om}},
+			{Name: "app", Type: "String", Extract: config.Extract{Path: `metadata.labels["app"]`, OnMissing: &om}},
+			{Name: "source", Type: "String", Value: "metadata-exporter"},
+			{Name: "missing_no_default", Type: "String", Extract: config.Extract{Path: "missing.field"}},
+		},
+	})
+	in := &Ingester{ev: collector.NewEvaluator()}
+	lookup := anchorLookup(sampleService())
+
+	get := func(name string) any {
+		for i := range cr.Columns {
+			if cr.Columns[i].Name == name {
+				v, err := in.columnValue(&cr.Columns[i], lookup)
+				if err != nil {
+					t.Fatalf("columnValue(%s): %v", name, err)
+				}
+				return v
+			}
+		}
+		t.Fatalf("column %s not found", name)
+		return nil
+	}
+
+	if v := get("team"); v != "unknown" {
+		t.Errorf("team onMissing = %v, want unknown", v)
+	}
+	if v := get("app"); v != "api" {
+		t.Errorf("app present = %v, want api", v)
+	}
+	if v := get("source"); v != "metadata-exporter" {
+		t.Errorf("constant = %v", v)
+	}
+	if v := get("missing_no_default"); v != "" {
+		t.Errorf("no onMissing zero = %v", v)
+	}
+}
+
+func TestCompileAll_InjectsConstants(t *testing.T) {
+	t.Setenv("CLUSTER_NAME", "prod-a")
+	rs, err := CompileAll(config.History{
+		Constants: []config.HistoryConstant{
+			{Name: "cluster_name", Type: "String", ValueEnv: "CLUSTER_NAME"},
+		},
+		Resources: []config.HistoryResource{{
+			Kind:  "Service",
+			Table: "svc_versions",
+			Columns: []config.HistoryColumn{
+				{Extract: config.Extract{Path: "spec.clusterIP"}, Name: "cluster_ip", Type: "String"},
+				{Name: "source", Type: "String", Value: "exporter"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CompileAll: %v", err)
+	}
+	if len(rs) != 1 || len(rs[0].Columns) != 3 {
+		t.Fatalf("columns = %+v", rs[0].Columns)
+	}
+	if rs[0].Columns[0].Name != "cluster_name" || !rs[0].Columns[0].IsConstant || rs[0].Columns[0].Constant != "prod-a" {
+		t.Fatalf("injected constant = %+v", rs[0].Columns[0])
+	}
+	if rs[0].Columns[1].Name != "cluster_ip" || rs[0].Columns[1].IsConstant {
+		t.Fatalf("path column = %+v", rs[0].Columns[1])
+	}
+	if rs[0].Columns[2].Constant != "exporter" {
+		t.Fatalf("per-resource constant = %+v", rs[0].Columns[2])
+	}
+}
+
 func TestFilters_Ops(t *testing.T) {
 	obj := sampleService()
 	ev := collector.NewEvaluator()
