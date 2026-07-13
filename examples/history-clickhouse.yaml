@@ -41,6 +41,11 @@ history:
   store:
     type: clickhouse
     dsn: "clickhouse://clickhouse:9000/default"
+    # HTTP alternative (e.g. via Istio VirtualService / ingress on 80/443 →
+    # ClickHouse 8123). Scheme selects the protocol — clickhouse://host:8123
+    # is still native and will fail against an HTTP listener:
+    #   dsn: "http://clickhouse:8123/default"
+    #   dsn: "https://clickhouse.example.com/default"  # pair with secure: true
     # createSchema: dev -> auto CREATE TABLE + additive ADD COLUMN.
     # prod (default false) -> validate live schema against config, fail fast on
     # drift, mutate nothing.

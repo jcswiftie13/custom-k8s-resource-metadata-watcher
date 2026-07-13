@@ -711,14 +711,14 @@ history:
   enabled: true
   store:
     type: clickhouse
-    dsn: "clickhouse://host:9000/db"
+    dsn: "clickhouse://host:9000/db"   # 或 http://host:8123/db（HTTP）；見 14.6
     createSchema: true          # dev；prod 預設 false（見 14.4）
     closeMode: rewrite          # rewrite（預設）| update（需 CH >= 25.8，見 14.5）
     batch: { maxRows: 5000, flushIntervalMs: 1000 }
     # --- 身分驗證（皆選填，見 14.6）---
     username: default
     passwordEnv: CH_PASSWORD    # 由 k8s Secret 注入的 env 變數（優先於 password）
-    secure: true                # 開啟 TLS
+    secure: true                # 開啟 TLS（https:// DSN 亦需）
   resources:
     - kind: VirtualService      # 必須同時出現在 watch.resources
       table: vs_versions        # 選填，預設 <kind 小寫>_versions
@@ -806,13 +806,16 @@ history:
 | `password` / `passwordEnv` | 密碼；`passwordEnv` 指定 env 變數名並**優先** |
 | `database` | 覆寫目標 database |
 | `token` / `tokenEnv` | JWT／access token（ClickHouse Cloud）；設定時**取代** basic auth |
-| `secure` | 開啟 TLS（ClickHouse Cloud 必需） |
+| `secure` | 開啟 TLS（ClickHouse Cloud 必需；`https://` DSN 也需此欄或 DSN `?secure=true`） |
 | `tlsSkipVerify` | 略過 server 憑證驗證（測試／自簽用） |
 
 - **密鑰別放 ConfigMap**：production 用 `passwordEnv`/`tokenEnv`／`usernameEnv` 指向由 **k8s Secret 注入的環境變數**，
   避免明文落在 ConfigMap；`*Env` 設了但該 env 為空會在啟動時 fail fast。
 - **`token` 與 `username`/`password` 互斥**（JWT 在 `clickhouse-go` 會取代 basic auth）；同時設定會驗證失敗。
 - `secure` 未開時走明文；authenticated ClickHouse（尤其 Cloud）通常需 `secure: true`。
+- **協定由 DSN scheme 決定**（非 port）：`clickhouse://` = native TCP；`http://` / `https://` = HTTP 介面（8123）。
+  `clickhouse://host:8123` 仍是 native，連到 HTTP listener 會失敗。HTTP 寫入路徑會預設啟用 LZ4 block compression；
+  DSN 若已設 `compress=` 則不覆寫。e2e：`TestHistory_ClickHouseHTTP`。
 - 未涵蓋：mTLS client 憑證、LDAP/Kerberos（未來如需再擴充）。
 
 ---

@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"testing"
+
+	"github.com/ClickHouse/clickhouse-go/v2"
 )
 
 func TestBuildClickHouseOptions_BasicOverridesDSN(t *testing.T) {
@@ -82,6 +84,86 @@ func TestBuildClickHouseOptions_NoTLSByDefault(t *testing.T) {
 	}
 	if got.TLS != nil {
 		t.Fatal("TLS should be nil when Secure is false")
+	}
+}
+
+func TestBuildClickHouseOptions_HTTPDSN(t *testing.T) {
+	got, err := buildClickHouseOptions(Options{
+		DSN: "http://clickhouse:8123/default",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Protocol != clickhouse.HTTP {
+		t.Fatalf("Protocol = %v, want HTTP", got.Protocol)
+	}
+	if len(got.Addr) != 1 || got.Addr[0] != "clickhouse:8123" {
+		t.Fatalf("Addr = %v, want [clickhouse:8123]", got.Addr)
+	}
+	if got.Auth.Database != "default" {
+		t.Fatalf("Database = %q, want default", got.Auth.Database)
+	}
+	if got.TLS != nil {
+		t.Fatal("plain http:// DSN must not enable TLS")
+	}
+	// HTTP writer path enables LZ4 block compression by default.
+	if got.Compression == nil || got.Compression.Method != clickhouse.CompressionLZ4 {
+		t.Fatalf("HTTP Compression = %+v, want LZ4", got.Compression)
+	}
+}
+
+func TestBuildClickHouseOptions_HTTPDoesNotOverrideExplicitCompress(t *testing.T) {
+	got, err := buildClickHouseOptions(Options{
+		DSN: "http://clickhouse:8123/default?compress=gzip",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Compression == nil || got.Compression.Method != clickhouse.CompressionGZIP {
+		t.Fatalf("Compression = %+v, want gzip from DSN", got.Compression)
+	}
+}
+
+func TestBuildClickHouseOptions_HTTPSWithSecureConfig(t *testing.T) {
+	// https:// without ?secure=true fails ParseDSN unless we inject it from
+	// config Secure — this is the ingress / TLS termination config shape.
+	got, err := buildClickHouseOptions(Options{
+		DSN:           "https://clickhouse.example.com/default",
+		Secure:        true,
+		TLSSkipVerify: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Protocol != clickhouse.HTTP {
+		t.Fatalf("Protocol = %v, want HTTP", got.Protocol)
+	}
+	if got.TLS == nil {
+		t.Fatal("TLS should be set for https + secure")
+	}
+	if !got.TLS.InsecureSkipVerify {
+		t.Fatal("InsecureSkipVerify should propagate from TLSSkipVerify")
+	}
+}
+
+func TestBuildClickHouseOptions_HTTPSWithoutSecureFails(t *testing.T) {
+	if _, err := buildClickHouseOptions(Options{
+		DSN: "https://clickhouse.example.com/default",
+	}); err == nil {
+		t.Fatal("expected error for https:// DSN without secure")
+	}
+}
+
+func TestBuildClickHouseOptions_NativeNoDefaultCompression(t *testing.T) {
+	got, err := buildClickHouseOptions(Options{DSN: "clickhouse://host:9000/db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Protocol != clickhouse.Native {
+		t.Fatalf("Protocol = %v, want Native", got.Protocol)
+	}
+	if got.Compression != nil {
+		t.Fatalf("native path must not auto-enable compression (got %+v)", got.Compression)
 	}
 }
 

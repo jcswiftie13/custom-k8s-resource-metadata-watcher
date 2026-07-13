@@ -780,7 +780,12 @@ type History struct {
 type StoreConfig struct {
 	// Type currently must be "clickhouse".
 	Type string `json:"type,omitempty"`
-	// DSN is a clickhouse:// connection string.
+	// DSN is a ClickHouse connection string. Supported schemes:
+	//   clickhouse://host:9000/db  — native TCP protocol (default / recommended)
+	//   http://host:8123/db        — HTTP interface (e.g. via ingress / proxy)
+	//   https://host/db            — HTTP over TLS; pair with secure: true
+	// clickhouse://host:8123 still speaks native and will fail against an HTTP
+	// listener — the scheme, not the port, selects the protocol.
 	DSN string `json:"dsn,omitempty"`
 	// CreateSchema toggles auto-DDL. nil/false (prod-safe default) means the
 	// exporter only validates the live schema against config and fails fast on

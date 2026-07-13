@@ -15,6 +15,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -93,7 +95,8 @@ type chStore struct {
 }
 
 // Options configures the ClickHouse connection, including authentication. DSN
-// is the base clickhouse:// connection string; the remaining fields, when set,
+// is the base connection string — native (`clickhouse://host:9000/db`) or HTTP
+// (`http://host:8123/db`, `https://host/db`). The remaining fields, when set,
 // override any credentials embedded in it. Token (JWT / access token) replaces
 // basic auth when non-empty.
 type Options struct {
@@ -114,7 +117,11 @@ type Options struct {
 // buildClickHouseOptions resolves the DSN and applies auth/TLS overrides. It
 // performs no I/O so it can be unit-tested without a live ClickHouse.
 func buildClickHouseOptions(o Options) (*clickhouse.Options, error) {
-	opts, err := clickhouse.ParseDSN(o.DSN)
+	dsn, err := prepareDSN(o.DSN, o.Secure)
+	if err != nil {
+		return nil, err
+	}
+	opts, err := clickhouse.ParseDSN(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)
 	}
@@ -139,7 +146,38 @@ func buildClickHouseOptions(o Options) (*clickhouse.Options, error) {
 		}
 		opts.TLS.InsecureSkipVerify = o.TLSSkipVerify
 	}
+	// HTTP batch inserts benefit from ClickHouse native block compression
+	// (lz4 over the HTTP body). Leave an explicit DSN compress= setting alone.
+	if opts.Protocol == clickhouse.HTTP && opts.Compression == nil {
+		opts.Compression = &clickhouse.Compression{Method: clickhouse.CompressionLZ4}
+	}
 	return opts, nil
+}
+
+// prepareDSN makes config Secure compose with clickhouse-go's ParseDSN rules:
+// an https:// DSN is rejected unless ?secure=true is present at parse time, so
+// we inject it when Secure is set. http:// + Secure keeps the scheme (TLS is
+// applied after parse via Options.TLS) — clickhouse-go forbids http+secure in
+// the query string.
+func prepareDSN(dsn string, secure bool) (string, error) {
+	if !secure {
+		return dsn, nil
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", fmt.Errorf("parse dsn: %w", err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https", "clickhouse":
+		q := u.Query()
+		if q.Get("secure") == "" {
+			q.Set("secure", "true")
+			u.RawQuery = q.Encode()
+		}
+		return u.String(), nil
+	default:
+		return dsn, nil
+	}
 }
 
 // Open connects to ClickHouse using the given Options.

@@ -122,9 +122,13 @@ flowchart LR
 ### History 類（ClickHouse 路由回溯，見 `docs/istio-virtualservice-routing-history-design.md`）
 
 - `TestHistory_ClickHouseIstioSchema`
-  - 寫入面：exporter `history:` 依 `istioHistoryConfigYAML` 建四張 POC-shape 版本表並 ingest 真實 Service/Deployment/Istio Gateway/VirtualService。
+  - 寫入面：exporter `history:` 依 `istioHistoryConfigYAML`（native `clickhouse://…:9000`）建四張 POC-shape 版本表並 ingest 真實 Service/Deployment/Istio Gateway/VirtualService。
   - 覆蓋 create table（含 bloom index、`closeMode: update` 的 patch-part 表設定）、欄位型別（`encode: kv`/`json`、`Array(String)`）、client 端 filter、server 端 labelSelector、`valid_to` 版本鏈（open sentinel、update 收版、delete 無 tombstone）。
   - e2e config 以 **`closeMode: update`**（lightweight UPDATE 關版，ClickHouse 25.8）執行；`valid_to` 子測試因此同時驗證 update-close 的版本鏈語意與 rewrite 模式等價。
+- `TestHistory_ClickHouseHTTP`
+  - 與上者共用同一 fixture／斷言（`runHistoryClickHouseIstioSchema`），DSN 改為 **`http://clickhouse:8123/default`**，驗證 HTTP 協定寫入路徑（DDL、`PrepareBatch`、lightweight UPDATE）無需改程式即可運作。
+  - 讀取斷言仍經 pod 內 `clickhouse-client`（native），與 writer protocol 解耦；覆蓋「經 HTTP proxy / ingress 連 ClickHouse」的部署形狀。
+  - 常見誤用：`clickhouse://host:8123` 仍走 native，不是 HTTP。
 - `TestHistory_RoutingResolution`
   - 解析面閉環：exporter ingest → VS 改 destination 產生第二版本 → **routesim** 範圍查詢（host+path+[t0,t1]）必須回傳每版本的 gateway 與 destination cluster，且 `Segments>=2`、`DistinctCfgs>=2`。
   - routesim（`test/integration/routesim/`）是 `poc/route2a` bench-worst 管線（`LoadTrafficWindow` → memwindow 切段 → in-memory 3-hop → gwresolve → in-process istiod translate → `router_check_tool`）的**複製**（非 import；poc 之後會移除），並改編為 exporter schema：reader 端 dedup（SQL 不過濾 `valid_to`、client 取 max `ingest_seq`，取代 `FINAL`）、無 `rev` 欄、protojson `DiscardUnknown`、bare/qualified gateway ref 皆可比對。獨立 Go module，`istio.io/istio` 不進主 go.mod。

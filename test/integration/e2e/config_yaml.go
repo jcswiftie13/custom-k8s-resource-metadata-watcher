@@ -7,19 +7,37 @@ import (
 	"strings"
 )
 
+// clickhouseNativeDSN / clickhouseHTTPDSN are the in-cluster ClickHouse
+// endpoints used by history e2e. Native is the default production path;
+// HTTP covers deployments that reach ClickHouse via an HTTP proxy / ingress
+// (VirtualService on 80/443 → ClickHouse 8123). Scheme must be http(s):// —
+// clickhouse://host:8123 still speaks the native protocol and will fail.
+const (
+	clickhouseNativeDSN = "clickhouse://default@clickhouse:9000/default"
+	clickhouseHTTPDSN   = "http://clickhouse:8123/default"
+)
+
 // istioHistoryConfigYAML renders an exporter config that mirrors the POC's
-// ClickHouse routing-history shape: it watches the POC resource set (Service,
-// Deployment, Istio Gateway, VirtualService) and materialises four version
-// tables (service_versions / deploy_versions / gw_versions / vs_versions) with
-// the same domain/join columns and bloom indexes as poc/route2a/internal/chstore
-// — reproduced purely through history config, with no import of poc code.
+// ClickHouse routing-history shape over the native protocol (9000).
+func istioHistoryConfigYAML(namespace string) string {
+	return istioHistoryConfigYAMLWithDSN(namespace, clickhouseNativeDSN)
+}
+
+// istioHistoryConfigYAMLWithDSN is istioHistoryConfigYAML with a caller-chosen
+// ClickHouse DSN (native clickhouse:// or HTTP http:// / https://).
+//
+// It watches the POC resource set (Service, Deployment, Istio Gateway,
+// VirtualService) and materialises four version tables (service_versions /
+// deploy_versions / gw_versions / vs_versions) with the same domain/join
+// columns and bloom indexes as poc/route2a/internal/chstore — reproduced
+// purely through history config, with no import of poc code.
 //
 // It exercises all four required aspects in one scenario:
 //   - create table: createSchema:true builds the four tables + bloom indexes.
 //   - type: String / Int64 / Array(String) / encode:kv / encode:json columns.
 //   - filter: the Service history resource keeps only type in (LoadBalancer,NodePort).
 //   - labelSelector: the Gateway watch is narrowed server-side to istio=ingressgateway.
-func istioHistoryConfigYAML(namespace string) string {
+func istioHistoryConfigYAMLWithDSN(namespace, dsn string) string {
 	return fmt.Sprintf(`metricPrefix: "it_"
 
 watch:
@@ -64,7 +82,7 @@ history:
   enabled: true
   store:
     type: clickhouse
-    dsn: "clickhouse://default@clickhouse:9000/default"
+    dsn: %q
     createSchema: true
     closeMode: update
     batch:
@@ -98,7 +116,7 @@ history:
       columns:
         - { name: bound_gateways, type: "Array(String)", path: "spec.gateways[*]" }
         - { name: spec_json, type: "String", path: "spec", encode: json }
-`, namespace)
+`, namespace, dsn)
 }
 
 // sharedRulesYAML is the integration test rule set for cluster-wide and

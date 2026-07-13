@@ -41,6 +41,25 @@ var (
 )
 
 func TestHistory_ClickHouseIstioSchema(t *testing.T) {
+	runHistoryClickHouseIstioSchema(t, "e2e-history-0", clickhouseNativeDSN)
+}
+
+// TestHistory_ClickHouseHTTP is the HTTP-protocol twin of
+// TestHistory_ClickHouseIstioSchema. It points the exporter at ClickHouse's
+// HTTP interface (8123) via an http:// DSN — the path needed when traffic
+// reaches ClickHouse through an HTTP proxy / Istio VirtualService on 80/443.
+// Assertions are identical: DDL, typed columns, filters, labelSelector, and
+// closeMode=update version chaining must work over HTTP without code changes.
+func TestHistory_ClickHouseHTTP(t *testing.T) {
+	runHistoryClickHouseIstioSchema(t, "e2e-history-http-0", clickhouseHTTPDSN)
+}
+
+// runHistoryClickHouseIstioSchema drives the shared history write-path scenario
+// against the given ClickHouse DSN (native or HTTP). Assertions read back via
+// clickhouse-client inside the pod (always native) so the reader path is
+// independent of the writer protocol under test.
+func runHistoryClickHouseIstioSchema(t *testing.T, ns, dsn string) {
+	t.Helper()
 	t.Cleanup(func() {
 		if t.Failed() {
 			dumpLogs(t)
@@ -60,7 +79,6 @@ func TestHistory_ClickHouseIstioSchema(t *testing.T) {
 		}
 	}
 
-	ns := "e2e-history-0"
 	createNamespaces(t, ns)
 	t.Cleanup(func() { deleteNamespaces(t, ns) })
 
@@ -171,7 +189,7 @@ func TestHistory_ClickHouseIstioSchema(t *testing.T) {
 
 	// Enable history -> exporter restarts, connects to ClickHouse, builds the
 	// four tables, and ingests the objects above.
-	setExporterConfig(t, istioHistoryConfigYAML(ns))
+	setExporterConfig(t, istioHistoryConfigYAMLWithDSN(ns, dsn))
 
 	// Wait until every positive row has landed. Once these are present the
 	// initial LIST has been fully processed, so the negative assertions
