@@ -70,16 +70,8 @@ watch:
       namespaces:
         - %[1]s
 
-rules:
-  - name: "service_info"
-    help: "Trivial rule so the config validates; history is the real subject."
-    anchor: Service
-    labels:
-      namespace:
-        path: "metadata.namespace"
-      service:
-        path: "metadata.name"
-
+# history-only: no rules block, so this also exercises the exporter running
+# with the scrape path entirely absent.
 history:
   enabled: true
   store:

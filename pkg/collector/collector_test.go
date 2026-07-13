@@ -636,6 +636,29 @@ func TestSelfMetrics_Names(t *testing.T) {
 	}
 }
 
+// TestCollect_ZeroRules covers history-only mode, where the collector exists
+// solely to own the informers the history ingest borrows. It must construct,
+// register, start its informers, and scrape cleanly with no rules at all.
+func TestCollect_ZeroRules(t *testing.T) {
+	cfg := &config.Config{
+		MetricPrefix: "test_",
+		Watch:        legacyTestWatch(),
+	}
+	client := dynamicClientForObjects(t, runtimeObjs(podWithOwner("p1", "ns", "", nil, nil))...)
+	col, reg, cancel := startCollector(t, cfg, client)
+	defer cancel()
+
+	// The informers still cover watch.resources — that is what history needs.
+	if got := col.Informers().Informers("Pod"); len(got) == 0 {
+		t.Fatal("Pod informer should be running even with zero rules")
+	}
+
+	out := gatherText(t, reg)
+	if strings.Contains(out, "test_") {
+		t.Errorf("zero rules should emit no rule metrics, got:\n%s", out)
+	}
+}
+
 // expectContain is a small helper that fails the test with the full output
 // for easier debugging when an expected substring is missing.
 func expectContain(t *testing.T, got, want string) {

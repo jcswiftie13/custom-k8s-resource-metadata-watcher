@@ -28,13 +28,10 @@ watch:
       # the client-side history.filters below.
       labelSelector: "istio=ingressgateway"
 
-# Minimal scrape rule so the exporter still exposes _info metrics.
-rules:
-  - name: service_info
-    anchor: Service
-    labels:
-      namespace: { path: "metadata.namespace" }
-      name: { path: "metadata.name" }
+# No rules: this is a history-only config. Declaring the history block below is
+# what turns ingest on; rules and history are independent output paths and
+# either one alone is a complete configuration. Add a rules: block here to also
+# expose _info metrics on /metrics.
 
 history:
   enabled: true

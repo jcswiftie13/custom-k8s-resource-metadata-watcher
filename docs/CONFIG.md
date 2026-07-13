@@ -128,7 +128,16 @@ rules:
 | `metricPrefix` | 選填前綴；與各 `rules[].name` 組成註冊用 Prometheus metric 名稱，並受 metric 命名 regex 檢查。 |
 | `discovery` | 選填；`enabled: true` 時允許用 Kubernetes discovery 補齊缺少的 `resource` / `scope`。預設 `false`。 |
 | `watch` | 選填 `WatchScope`：以 `watch.resources[]` 宣告每個 resource 的 GVR/GVK、scope、namespace 與 selector。 |
-| `rules` | **必填**、非空之 `Rule` 陣列。 |
+| `rules` | 選填之 `Rule` 陣列；宣告要匯出的 Prometheus metric。 |
+| `history` | 選填；事件驅動的 ClickHouse 版本化儲存（見 §14）。**寫了這個區塊即代表啟用。** |
+
+`rules` 與 `history` 是兩條**互相獨立**的輸出路徑，各自都可以單獨使用：
+
+- **rules-only**（只有 `rules`）：純 Prometheus exporter，不連 ClickHouse。
+- **history-only**（只有 `history`）：只寫版本化歷史；`/metrics` 仍然服務，但不含任何 rule 產生的 `_info` series。
+- **兩者並存**：同一份 informer cache 同時餵給 scrape 與 history ingest。
+
+兩者**至少須設定其一**——都沒有的設定不會做任何事，會在啟動時直接被拒絕。
 
 ---
 
@@ -698,17 +707,35 @@ make bench-collect
 ## 14. `history`：事件驅動 ClickHouse 版本化儲存
 
 `history` 是**選配、且與 Prometheus scrape 路徑完全解耦**的區塊。啟用後，每個 informer 事件會對宣告的資源
-**append 一筆版本記錄**到 ClickHouse，供「回放到任意過去時間點」的歷史／取證查詢。`history.enabled: false`（或不設）
-時，exporter 行為與原本完全相同。
+**append 一筆版本記錄**到 ClickHouse，供「回放到任意過去時間點」的歷史／取證查詢。
 
 它重用 `rules` 相同的 path 抽取引擎（`source` + `path` + `fallbacks` + `onMissing`），因此欄位宣告方式與
 label 一致。
+
+### 14.0 啟用語意
+
+**寫了 `history:` 區塊就是啟用**，不需要額外記得寫 `enabled: true`：
+
+| 設定 | 結果 |
+|------|------|
+| 沒有 `history:` 區塊 | 停用；exporter 行為與純 rules 模式完全相同，不會連 ClickHouse。 |
+| 有 `history:` 區塊、未寫 `enabled` | **啟用**。 |
+| 有 `history:` 區塊、`enabled: true` | 啟用（明確寫出意圖，仍然合法且建議）。 |
+| 有 `history:` 區塊、`enabled: false` | 停用（明確 opt-out：想暫時關掉又不想刪掉整個區塊時用）。 |
+
+解耦是**雙向**的：`rules` 也是選配的，只寫 `history` 而完全不寫 `rules` 是合法的 history-only 設定
+（見 `examples/history-clickhouse.yaml`）。但 `rules` 與 `history` 至少要有一個——兩者皆無的設定不做任何事，
+會被拒絕。
+
+> **升級注意**：舊版的 `enabled` 預設為 `false`，寫了 history 區塊卻漏掉 `enabled: true` 會**靜默停用**
+> （連 history 設定都不驗證）。新版改為「有區塊即啟用」，這類設定升級後會開始寫入 ClickHouse；半成品的
+> history 區塊也會在啟動時直接報錯，而不再被默默忽略。若要維持停用，請明確寫 `enabled: false`。
 
 ### 14.1 頂層結構
 
 ```yaml
 history:
-  enabled: true
+  enabled: true               # 選填；省略即啟用。設 false 為明確停用（見 14.0）
   store:
     type: clickhouse
     dsn: "clickhouse://host:9000/db"   # 或 http://host:8123/db（HTTP）；見 14.6

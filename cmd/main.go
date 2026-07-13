@@ -49,7 +49,8 @@ func main() {
 		log.Error("load config failed", "err", err)
 		os.Exit(1)
 	}
-	log.Info("config parsed", "rules", len(cfg.Rules), "discoveryEnabled", cfg.Discovery.Enabled)
+	log.Info("config parsed", "rules", len(cfg.Rules), "historyEnabled", cfg.HistoryEnabled(),
+		"discoveryEnabled", cfg.Discovery.Enabled)
 
 	restCfg, err := buildRestConfig(*kubeconfig)
 	if err != nil {
@@ -80,7 +81,8 @@ func main() {
 		log.Error("resource registry build failed", "err", err)
 		os.Exit(1)
 	}
-	log.Info("config loaded", "rules", len(cfg.Rules), "watchResources", registry.Resources())
+	log.Info("config loaded", "rules", len(cfg.Rules), "historyEnabled", cfg.HistoryEnabled(),
+		"watchResources", registry.Resources())
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector())
@@ -102,8 +104,8 @@ func main() {
 	// History ingest is fully opt-in and decoupled from the scrape path. It
 	// registers event handlers on the SAME informer cache the collector owns,
 	// so it must be wired before col.Start (which starts the informers).
-	if cfg.History.Enabled {
-		compiled, err := history.CompileAll(cfg.History)
+	if cfg.HistoryEnabled() {
+		compiled, err := history.CompileAll(*cfg.History)
 		if err != nil {
 			log.Error("history compile failed", "err", err)
 			os.Exit(1)

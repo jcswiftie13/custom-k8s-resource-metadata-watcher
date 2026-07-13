@@ -7,19 +7,14 @@ import (
 
 func boolPtr(b bool) *bool { return &b }
 
-// baseHistoryConfig returns a valid config with one history resource so tests
-// can mutate a single field to assert a specific validation failure.
+// baseHistoryConfig returns a valid history-only config (no rules) with one
+// history resource so tests can mutate a single field to assert a specific
+// validation failure.
 func baseHistoryConfig() *Config {
 	return &Config{
 		Watch: watchResources("Service"),
-		Rules: []Rule{{
-			Name:   "svc_info",
-			Anchor: "Service",
-			Labels: map[string]Extract{"namespace": {Path: "metadata.namespace"}},
-		}},
-		History: History{
-			Enabled: true,
-			Store:   StoreConfig{Type: "clickhouse", DSN: "clickhouse://localhost:9000/routing"},
+		History: &History{
+			Store: StoreConfig{Type: "clickhouse", DSN: "clickhouse://localhost:9000/routing"},
 			Resources: []HistoryResource{{
 				Kind: "Service",
 				Columns: []HistoryColumn{
@@ -34,16 +29,71 @@ func baseHistoryConfig() *Config {
 	}
 }
 
-func TestHistory_ValidConfig(t *testing.T) {
-	if err := baseHistoryConfig().Validate(); err != nil {
+// svcRule is a minimal metric rule for tests that need the rules path present.
+func svcRule() Rule {
+	return Rule{
+		Name:   "svc_info",
+		Anchor: "Service",
+		Labels: map[string]Extract{"namespace": {Path: "metadata.namespace"}},
+	}
+}
+
+// TestHistory_OnlyConfigValidates pins the history-only mode: a config with a
+// history block and no rules at all is valid.
+func TestHistory_OnlyConfigValidates(t *testing.T) {
+	c := baseHistoryConfig()
+	if len(c.Rules) != 0 {
+		t.Fatalf("baseHistoryConfig should be history-only, got %d rules", len(c.Rules))
+	}
+	if err := c.Validate(); err != nil {
 		t.Fatalf("unexpected err: %v", err)
+	}
+}
+
+// TestHistory_WithRulesValidates covers both output paths enabled at once.
+func TestHistory_WithRulesValidates(t *testing.T) {
+	c := baseHistoryConfig()
+	c.History.Enabled = boolPtr(true)
+	c.Rules = []Rule{svcRule()}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+}
+
+// TestHistory_BlockWithoutEnabledIsEnabled pins presence-implies-enabled:
+// declaring a history block turns it on, and its contents are validated rather
+// than silently ignored.
+func TestHistory_BlockWithoutEnabledIsEnabled(t *testing.T) {
+	c := baseHistoryConfig()
+	if c.History.Enabled != nil {
+		t.Fatalf("baseHistoryConfig should omit enabled, got %v", *c.History.Enabled)
+	}
+	if !c.HistoryEnabled() {
+		t.Fatal("a history block without enabled should be enabled")
+	}
+	c.History.Store.Type = "" // invalid; must be caught, not skipped
+	if err := c.Validate(); err == nil {
+		t.Fatal("a history block without enabled must still be validated")
+	}
+}
+
+func TestHistory_NoBlockIsDisabled(t *testing.T) {
+	c := &Config{Watch: watchResources("Service"), Rules: []Rule{svcRule()}}
+	if c.HistoryEnabled() {
+		t.Fatal("a config with no history block should be disabled")
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("rules-only config should validate: %v", err)
 	}
 }
 
 func TestHistory_DisabledSkipsValidation(t *testing.T) {
 	c := baseHistoryConfig()
-	c.History.Enabled = false
+	c.History.Enabled = boolPtr(false)
 	c.History.Store.Type = "" // would be invalid if validated
+	// enabled: false is the explicit opt-out, so rules become the only output
+	// path and must be present for the config to do anything at all.
+	c.Rules = []Rule{svcRule()}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("disabled history should not be validated: %v", err)
 	}

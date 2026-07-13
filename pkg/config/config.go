@@ -7,6 +7,10 @@
 // declare expandLabels which flatten Kubernetes maps (typically
 // metadata.labels / metadata.annotations) into dynamic Prometheus label
 // names at scrape time.
+//
+// The optional history block is a second, independent output path (a ClickHouse
+// version store). Rules and history are each optional on their own, but a config
+// with neither does nothing and is rejected.
 package config
 
 import (
@@ -201,13 +205,23 @@ type Config struct {
 	// apiserver. It is disabled by default.
 	Discovery DiscoveryConfig `json:"discovery,omitempty"`
 
-	// Rules declares the set of metrics to export.
-	Rules []Rule `json:"rules"`
+	// Rules declares the set of metrics to export. It may be empty when a
+	// history block is declared (history-only mode).
+	Rules []Rule `json:"rules,omitempty"`
 
 	// History optionally enables the event-driven ClickHouse version store.
-	// It is fully decoupled from the scrape/export path; when disabled the
-	// exporter behaves exactly as before.
-	History History `json:"history,omitempty"`
+	// It is fully decoupled from the scrape/export path; a nil History means
+	// the exporter behaves exactly as before.
+	History *History `json:"history,omitempty"`
+}
+
+// HistoryEnabled reports whether the history store should run. Declaring a
+// history block turns it on; enabled: false is the explicit opt-out.
+func (c *Config) HistoryEnabled() bool {
+	if c.History == nil {
+		return false
+	}
+	return c.History.Enabled == nil || *c.History.Enabled
 }
 
 // WatchScope describes which kinds to watch, optional namespace limits, and
@@ -771,7 +785,10 @@ const (
 // is append-only, and valid_to is materialized by re-inserting the superseded
 // row with its end time (ReplacingMergeTree collapses the pair).
 type History struct {
-	Enabled bool        `json:"enabled,omitempty"`
+	// Enabled is an explicit opt-out: declaring a history block is what turns
+	// the store on, so nil (field omitted) means enabled. Set enabled: false to
+	// keep the block in place while turning ingest off.
+	Enabled *bool       `json:"enabled,omitempty"`
 	Store   StoreConfig `json:"store,omitempty"`
 	// Constants are fixed-value columns injected into every history table
 	// (e.g. cluster_name). Names must not collide with envelope columns or
@@ -1009,7 +1026,7 @@ func (h History) validate(reg *Registry) error {
 		return fmt.Errorf("store: token/tokenEnv is mutually exclusive with username/password (JWT replaces basic auth)")
 	}
 	if len(h.Resources) == 0 {
-		return fmt.Errorf("resources: at least one resource is required when history.enabled")
+		return fmt.Errorf("resources: at least one resource is required when a history block is declared")
 	}
 
 	constNames := map[string]struct{}{}
@@ -1198,8 +1215,8 @@ func Load(path string) (*Config, error) {
 // Validate performs structural checks. The caller is expected to run a
 // separate pass that compiles every JSONPath (see pkg/collector/evaluator).
 func (c *Config) Validate() error {
-	if len(c.Rules) == 0 {
-		return fmt.Errorf("rules: at least one rule is required")
+	if len(c.Rules) == 0 && !c.HistoryEnabled() {
+		return fmt.Errorf("at least one of rules (non-empty) or a history block is required; the configuration would do nothing")
 	}
 	if c.MetricPrefix != "" && !metricNameRe.MatchString(c.MetricPrefix+"x") {
 		return fmt.Errorf("metricPrefix %q is not a valid Prometheus metric name prefix", c.MetricPrefix)
@@ -1226,7 +1243,7 @@ func (c *Config) Validate() error {
 		}
 		seenMetric[metricName] = struct{}{}
 	}
-	if c.History.Enabled {
+	if c.HistoryEnabled() {
 		if err := c.History.validate(reg); err != nil {
 			return fmt.Errorf("history: %w", err)
 		}
