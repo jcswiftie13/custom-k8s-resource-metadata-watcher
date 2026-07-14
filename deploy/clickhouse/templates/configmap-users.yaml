@@ -41,9 +41,6 @@ data:
           {{- if .Values.lightweightUpdate.allowExperimentalLightweightUpdate }}
           <allow_experimental_lightweight_update>1</allow_experimental_lightweight_update>
           {{- end }}
-          {{- if .Values.lightweightUpdate.applyPatchesOnRead }}
-          <apply_patches_on_read>1</apply_patches_on_read>
-          {{- end }}
           {{- end }}
         </default>
       </profiles>

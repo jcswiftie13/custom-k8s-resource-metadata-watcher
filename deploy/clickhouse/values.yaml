@@ -8,7 +8,7 @@ fullnameOverride: clickhouse
 
 image:
   repository: clickhouse/clickhouse-server
-  tag: "26.5.5.8-stable"
+  tag: "26.5.5.8"
   pullPolicy: IfNotPresent
 
 # standalone — single StatefulSet (implemented).
@@ -73,7 +73,6 @@ lightweightUpdate:
   # default — kept explicit for upgrade safety and documentation.
   enableLightweightUpdate: true
   allowExperimentalLightweightUpdate: true
-  applyPatchesOnRead: true
 
 resources:
   requests:

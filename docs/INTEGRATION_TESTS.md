@@ -125,7 +125,7 @@ flowchart LR
   - 寫入面：exporter `history:` 依 `istioHistoryConfigYAML`（native `clickhouse://…:9000`）建四張 POC-shape 版本表並 ingest 真實 Service/Deployment/Istio Gateway/VirtualService。
   - 覆蓋 create table（含 bloom index、`closeMode: update` 的 patch-part 表設定）、欄位型別（`encode: kv`/`json`、`Array(String)`）、client 端 filter、server 端 labelSelector、`valid_to` 版本鏈（open sentinel、update 收版、delete 無 tombstone）。
   - 亦覆蓋 `history.constants`（`valueEnv: CLUSTER_NAME` → 每張表 `cluster_name`）、欄位 `value`（Service `source`）、以及 path `onMissing` hit/miss（Deployment `team=platform`／Service miss → `unknown`）。
-  - e2e config 以 **`closeMode: update`**（lightweight UPDATE 關版，ClickHouse 25.8）執行；`valid_to` 子測試因此同時驗證 update-close 的版本鏈語意與 rewrite 模式等價。
+  - e2e config 以 **`closeMode: update`**（lightweight UPDATE 關版，ClickHouse 26.5.5.8）執行；`valid_to` 子測試因此同時驗證 update-close 的版本鏈語意與 rewrite 模式等價。
 - `TestHistory_ClickHouseHTTP`
   - 與上者共用同一 fixture／斷言（`runHistoryClickHouseIstioSchema`），DSN 改為 **`http://clickhouse:8123/default`**，驗證 HTTP 協定寫入路徑（DDL、`PrepareBatch`、lightweight UPDATE）無需改程式即可運作。
   - 讀取斷言仍經 pod 內 `clickhouse-client`（native），與 writer protocol 解耦；覆蓋「經 HTTP proxy / ingress 連 ClickHouse」的部署形狀。

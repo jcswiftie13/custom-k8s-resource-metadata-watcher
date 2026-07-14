@@ -3,7 +3,7 @@ name: clickhouse
 description: Single-instance ClickHouse for metadata-exporter history (lightweight UPDATE)
 type: application
 version: 0.1.0
-appVersion: "26.5.5.8-stable"
+appVersion: "26.5.5.8"
 keywords:
   - clickhouse
   - metadata-exporter

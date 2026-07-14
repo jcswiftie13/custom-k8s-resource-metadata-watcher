@@ -13,7 +13,7 @@ services:
       POC_ROUTERCHECK_IMAGE: envoyproxy/envoy:tools-v1.34-latest
 
   clickhouse:
-    image: clickhouse/clickhouse-server:25.5
+    image: clickhouse/clickhouse-server:26.5.5.8
     hostname: clickhouse
     ulimits:
       nofile:
@@ -21,6 +21,7 @@ services:
         hard: 262144
     volumes:
       - ../poc/route2a/testdata/clickhouse-open-users.xml:/etc/clickhouse-server/users.d/zzz-open-networks.xml:ro
+      - ../poc/route2a/testdata/clickhouse-lightweight-update.xml:/etc/clickhouse-server/users.d/zzz-lightweight-update.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
       interval: 2s

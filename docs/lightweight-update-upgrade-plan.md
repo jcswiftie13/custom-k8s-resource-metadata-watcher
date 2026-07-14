@@ -4,9 +4,11 @@
 > `docs/istio-virtualservice-routing-history-design.md`、`docs/CONFIG.md` §14.5、
 > `poc/route2a/internal/chstore/chstore.go` package doc（no-FINAL reader 模式）。
 >
-> **實測結論（ClickHouse 25.8.28，2026-07）**：
-> - lightweight `UPDATE` 在 25.8 **預設啟用**（`enable_lightweight_update = 1`、
->   `allow_experimental_lightweight_update = 1`），無需 per-query 設定。
+> **實測結論（ClickHouse 25.8.28 / 26.5.5.8，2026-07）**：
+> - lightweight `UPDATE` 在 25.8+ **預設啟用**（`enable_lightweight_update = 1`、
+>   `allow_experimental_lightweight_update = 1`），無需 per-query 設定。26.5.5.8 亦同；
+>   整合測試／poc／devcontainer 的 users.d profile 與 `deploy/clickhouse` Helm chart
+>   顯式對齊上述三項設定。
 > - **需要表級設定** `enable_block_number_column = 1, enable_block_offset_column = 1`，
 >   否則 UPDATE 報 `NOT_IMPLEMENTED`；對既有表 `ALTER TABLE ... MODIFY SETTING` 即可，
 >   **舊 parts 也隨即可被 UPDATE**（實測通過）。
@@ -49,10 +51,10 @@ liveness/overlap 判斷在去重**之後**於 Go 端執行。代價：會多抓�
 
 | # | 條件 | 驗證方式 |
 |---|------|---------|
-| 1 | ClickHouse ≥ **25.7**（lightweight `UPDATE ... SET` / patch parts） | 所有環境：prod 叢集、`test/integration/manifests/clickhouse-deployment.yaml`、poc `Makefile` 的 `CH_IMAGE`（目前皆 25.5，**需升版**） |
+| 1 | ClickHouse ≥ **25.7**（lightweight `UPDATE ... SET` / patch parts） | 所有環境已升版至 **26.5.5.8**：prod Helm（`deploy/clickhouse`）、`test/integration/manifests/clickhouse-deployment.yaml`、poc `Makefile` `CH_IMAGE`、`.devcontainer/docker-compose.yml` |
 | 2 | 確認該版本 lightweight UPDATE 的成熟度旗標（初期為 `allow_experimental_lightweight_update`；以部署版本的 release note 為準） | `SELECT value FROM system.settings WHERE name LIKE '%lightweight_update%'` |
 | 3 | 被更新欄位不在 ORDER BY key | 已成立：`valid_to` 刻意排除在 `(namespace, name, valid_from, resource_version, deleted)` 之外（`pkg/store/ddl.go`） |
-| 4 | `apply_patches_on_read = 1`（預設）——UPDATE 後續讀立即可見，無可見性窗口 | 設定檢查 |
+| 4 | UPDATE 後續讀立即可見（26.5+ 已內建；`apply_patches_on_read` profile 設定已移除） | 設定檢查 / e2e `valid_to` 子測試 |
 | 5 | **Writer 重啟冪等**（見 §3.3）——這是拿掉 reader 去重保險的必要條件，不做則 dedup 必須永久保留 | 重啟測試 |
 
 ## 3. Writer 改動（`pkg/history` / `pkg/store`）
@@ -124,7 +126,7 @@ rewrite-close 與 update-close 兩種 writer **都正確**（去重對唯一行�
 
 ## 5. 遷移步驟（依序）
 
-1. **升 ClickHouse**：prod / e2e manifests / poc CH_IMAGE → ≥ 25.7；確認 §2 旗標。
+1. **升 ClickHouse**：prod / e2e manifests / poc CH_IMAGE → **26.5.5.8**（已完成）；確認 §2 旗標。
 2. **歷史資料收斂（一次性）**：`OPTIMIZE TABLE <t> FINAL` 四張表，把既有 rewrite-close
    的重複對收斂掉（此後 reader 若搬回 WHERE 過濾才不會踩到舊重複）。
 3. **部署新 writer**（update-close + 重啟冪等），reader 不動（去重模式相容兩者）。

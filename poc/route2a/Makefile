@@ -95,7 +95,7 @@ clean:
 # Scale/version knobs: POC_GATEWAYS POC_VS
 #   POC_VER_DEPLOY POC_VER_SVC POC_VER_GW POC_VER_VS POC_VER_KSVC (default 1 each)
 
-CH_IMAGE ?= clickhouse/clickhouse-server:25.8
+CH_IMAGE ?= clickhouse/clickhouse-server:26.5.5.8
 CH_NAME  ?= route2a-ch
 CH_ADDR  ?= 127.0.0.1:9000
 
@@ -106,6 +106,7 @@ ch-up:
 	docker run -d --rm --name $(CH_NAME) -p 9000:9000 -p 8123:8123 \
 	  --ulimit nofile=262144:262144 \
 	  -v "$(CURDIR)/testdata/clickhouse-open-users.xml:/etc/clickhouse-server/users.d/zzz-open-networks.xml:ro" \
+	  -v "$(CURDIR)/testdata/clickhouse-lightweight-update.xml:/etc/clickhouse-server/users.d/zzz-lightweight-update.xml:ro" \
 	  $(CH_IMAGE)
 	@echo "waiting for ClickHouse to accept host connections on the mapped ports..."
 	@for i in $$(seq 1 90); do \
