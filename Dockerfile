@@ -17,11 +17,15 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags="-s -w" -o /out/metadata-exporter ./cmd
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM busybox:1.38
 
-COPY --from=build /out/metadata-exporter /usr/local/bin/metadata-exporter
+# World-readable/executable so non-root can run and `cp` the binary into a volume.
+COPY --from=build --chmod=0555 /out/metadata-exporter /usr/local/bin/metadata-exporter
 
-USER nonroot:nonroot
+# Numeric UID required when Kubernetes runAsNonRoot is set without runAsUser.
+# 65532 matches the previous distroless nonroot user and integration manifests.
+USER 65532:65532
+
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/metadata-exporter"]

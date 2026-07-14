@@ -19,7 +19,7 @@ spec:
       serviceAccountName: metadata-exporter
       securityContext:
         runAsNonRoot: true
-        # Distroless image uses USER nonroot; kubelet requires a numeric UID when runAsNonRoot is set.
+        # Image USER is 65532; kubelet requires a numeric UID when runAsNonRoot is set.
         runAsUser: 65532
         runAsGroup: 65532
         seccompProfile:
