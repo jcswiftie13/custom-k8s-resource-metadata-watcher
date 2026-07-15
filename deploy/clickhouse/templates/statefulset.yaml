@@ -97,6 +97,11 @@ spec:
             - name: users-config
               mountPath: /etc/clickhouse-server/users.d
               readOnly: true
+            {{- if .Values.schema.init.enabled }}
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            {{- end }}
             - name: data
               mountPath: /var/lib/clickhouse
             {{- with .Values.extraVolumeMounts }}
@@ -109,6 +114,11 @@ spec:
         - name: users-config
           configMap:
             name: {{ include "clickhouse.usersConfigMapName" . }}
+        {{- if .Values.schema.init.enabled }}
+        - name: initdb
+          configMap:
+            name: {{ include "clickhouse.initdbConfigMapName" . }}
+        {{- end }}
         {{- if not .Values.persistence.enabled }}
         - name: data
           emptyDir: {}

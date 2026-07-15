@@ -74,6 +74,16 @@ lightweightUpdate:
   enableLightweightUpdate: true
   allowExperimentalLightweightUpdate: true
 
+# First-boot DDL via /docker-entrypoint-initdb.d (official ClickHouse image).
+# Scripts run only when the data directory is empty (new PVC / emptyDir).
+# Existing PVCs keep their tables; changing the ConfigMap alone does not re-run init.
+schema:
+  init:
+    # POC route2a four tables: service_versions, deploy_versions, gw_versions, vs_versions
+    # (see files/initdb/01-poc-route2a-schema.sql, mirrors poc/route2a/internal/chstore).
+    # Disable when using metadata-exporter createSchema / out-of-band prod DDL instead.
+    enabled: true
+
 resources:
   requests:
     cpu: 250m

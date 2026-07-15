@@ -65,6 +65,10 @@ ConfigMap names.
 {{- printf "%s-users" (include "clickhouse.fullname" .) }}
 {{- end }}
 
+{{- define "clickhouse.initdbConfigMapName" -}}
+{{- printf "%s-initdb" (include "clickhouse.fullname" .) }}
+{{- end }}
+
 {{/*
 Architecture mode validation (cluster hook is reserved, not implemented).
 */}}

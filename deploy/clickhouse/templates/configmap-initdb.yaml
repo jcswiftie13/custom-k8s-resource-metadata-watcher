@@ -1,0 +1,13 @@
+{{- if .Values.schema.init.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "clickhouse.initdbConfigMapName" . }}
+  labels:
+    {{- include "clickhouse.labels" . | nindent 4 }}
+data:
+{{- range $path, $_ := .Files.Glob "files/initdb/*.sql" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}
