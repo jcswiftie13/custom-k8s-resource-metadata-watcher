@@ -770,8 +770,8 @@ var historyFilterOps = map[string]struct{}{
 // reservedHistoryColumns are the implicit envelope columns present on every
 // history table; a resource may not redeclare them.
 var reservedHistoryColumns = map[string]struct{}{
-	"namespace": {}, "name": {}, "uid": {}, "resource_version": {},
-	"valid_from": {}, "valid_to": {}, "deleted": {}, "spec_hash": {}, "ingest_seq": {},
+	"namespace": {}, "name": {}, "uid": {},
+	"valid_from": {}, "valid_to": {}, "ingest_seq": {},
 }
 
 // Batch defaults for the history ingest writer.

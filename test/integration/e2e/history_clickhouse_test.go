@@ -251,7 +251,7 @@ func runHistoryClickHouseIstioSchema(t *testing.T, ns, dsn string) {
 	})
 
 	t.Run("filter", func(t *testing.T) {
-		if got := chQuery(t, "SELECT count() FROM service_versions FINAL WHERE name='svc-lb' AND deleted=0"); got == "0" {
+		if got := chQuery(t, "SELECT count() FROM service_versions FINAL WHERE name='svc-lb'"); got == "0" {
 			t.Fatalf("svc-lb should pass the type filter, got count %q", got)
 		}
 		if got := chQuery(t, "SELECT count() FROM service_versions WHERE name='svc-clusterip'"); got != "0" {
@@ -260,7 +260,7 @@ func runHistoryClickHouseIstioSchema(t *testing.T, ns, dsn string) {
 	})
 
 	t.Run("label_selector", func(t *testing.T) {
-		if got := chQuery(t, "SELECT count() FROM gw_versions FINAL WHERE name='gw-keep' AND deleted=0"); got == "0" {
+		if got := chQuery(t, "SELECT count() FROM gw_versions FINAL WHERE name='gw-keep'"); got == "0" {
 			t.Fatalf("gw-keep should pass the labelSelector, got count %q", got)
 		}
 		if got := chQuery(t, "SELECT count() FROM gw_versions WHERE name='gw-drop'"); got != "0" {
@@ -335,15 +335,16 @@ func runHistoryClickHouseIstioSchema(t *testing.T, ns, dsn string) {
 		}
 
 		// Deleting closes the last version. Deletion is expressed purely by
-		// valid_to — no deleted=1 tombstone row is ever written.
+		// valid_to — no tombstone row is ever written (the schema has no such
+		// column), so the delete adds no row: it only sets valid_to on v2.
 		deleteObject(t, dyn, svcGVR, ns, "svc-lb")
 		waitForCHCount(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to <= now()", 2)
 
 		if got := chQuery(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to > now()"); got != "0" {
 			t.Fatalf("no version should remain open after delete, got %q", got)
 		}
-		if got := chQuery(t, "SELECT count() FROM service_versions WHERE "+svc+" AND deleted=1"); got != "0" {
-			t.Fatalf("delete must not write a tombstone row, got %q", got)
+		if got := chQuery(t, "SELECT count() FROM service_versions FINAL WHERE "+svc); got != "2" {
+			t.Fatalf("delete must not add a row (only close v2), still expected 2 versions, got %q", got)
 		}
 	})
 }

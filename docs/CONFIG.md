@@ -774,8 +774,18 @@ history:
 | `encode` | `""`（scalar）、`json`（需 `type: String`）、`kv`（需 `type: Array(String)`）；不可與 `onMissing` 或 constant 並用 |
 | `index` | `""` 或 `bloom_filter`（產生 skip index，加速 `has`/`hasAll` 查詢）|
 
-**Envelope 欄位為隱含、每張表都有**（不可重複宣告）：`namespace`、`name`、`uid`、`resource_version`、
-`valid_from`、`valid_to`、`deleted`、`spec_hash`、`ingest_seq`。
+**Envelope 欄位為隱含、每張表都有**（不可重複宣告），型別由寫入端固定（`pkg/store/ddl.go`）：
+
+| Envelope 欄位 | ClickHouse 型別 | 意義 |
+|---------------|-----------------|------|
+| `namespace` | `LowCardinality(String)` | 物件 namespace（cluster-scoped 資源為空字串）|
+| `name` | `String` | 物件名稱 |
+| `uid` | `String` | 物件 UID；進 ORDER BY key，讓同名刪建（不同 uid）成為各自的時間線 |
+| `valid_from` | `DateTime64(3)` | 版本起始（Add 用 `creationTimestamp`，其餘為觀測時間）；每 uid 嚴格遞增 |
+| `valid_to` | `DateTime64(3)` | 版本結束；開放版本為哨兵 `2200-01-01`，關版／刪除時物化。刻意排除於 ORDER BY 之外 |
+| `ingest_seq` | `UInt64` | 寫入序號；`ReplacingMergeTree` 的版本欄，同排序鍵取最大者勝出 |
+
+排序鍵為 `ORDER BY (namespace, name, uid, valid_from)`（見 §14.5）。
 
 ### 14.3 `filters`：client 端欄位過濾（支援 regex）
 
@@ -811,21 +821,25 @@ history:
 - **`rewrite`（預設，任何 CH 版本可用）**：把前一版**整列**以相同排序鍵、更高 `ingest_seq` 重插一次並填上
   `valid_to`（= 新版的 `valid_from`）；`ReplacingMergeTree(ingest_seq)` 於 merge 時折疊，收尾列勝出。
   merge 收斂前同 key 會短暫存在兩列（stale 開放列 + 收尾列），**讀取端必須套 no-FINAL dedup 模式**
-  （SQL 不過濾 `valid_to`、client 依 `(namespace,name,valid_from)` 取 max `ingest_seq` 後才套 liveness）。
+  （SQL 不過濾 `valid_to`、client 依 `(namespace,name,uid,valid_from)` 取 max `ingest_seq` 後才套 liveness）。
 - **`update`（需 ClickHouse ≥ 25.8）**：以 lightweight `UPDATE`（patch parts）**原地**把開放列的 `valid_to`
   收攏——每個版本恆為唯一一列、寫入當下即最終、不依賴 merge 時機。需要表級設定
   `enable_block_number_column = 1, enable_block_offset_column = 1`（`createSchema: true` 時自動建立／
   以 `ALTER TABLE ... MODIFY SETTING` 加法遷移既有表；`createSchema: false` 時啟動會驗證並 fail fast）。
   UPDATE 條件鎖定 `(namespace, name, uid, valid_from, valid_to=哨兵)`，天然冪等；ingest 迴圈保證
-  同批次內 INSERT 先送、close 後執行。**重啟冪等**：啟動時（informer 起動前）自動從 CH 恢復
-  last-state（每 uid 最新開放列的 spec_hash），re-LIST 不會重插已寫入的版本，並掃除 crash 遺留的
-  stale 開放列。升級與回滾流程見 `docs/lightweight-update-upgrade-plan.md`。
+  同批次內 INSERT 先送、close 後執行。升級與回滾流程見 `docs/lightweight-update-upgrade-plan.md`。
 
-兩種模式下 Delete 都只收尾最後一版（`valid_to` = 刪除觀測時刻），**不寫 `deleted=1` tombstone**——
+**重啟冪等（兩種模式皆執行）**：啟動時（informer 起動前）自動從 CH 恢復 last-state——讀回每 uid 最新
+開放列的**宣告欄位值**並就地重算 column hash（hash 不落庫），re-LIST 不會重插已寫入的版本。
+`update` 模式另會掃除 crash 遺留的 stale 開放列。
+
+兩種模式下 Delete 都只收尾最後一版（`valid_to` = 刪除觀測時刻），**不寫 tombstone 列**——
 `valid_to` 已完整表達刪除語意。
 
-去重分兩層：ingest 端 **spec-hash**（丟棄 resync no-op），CH 端 `ReplacingMergeTree(ingest_seq)` +
-`ORDER BY (namespace, name, valid_from, resource_version, deleted)`（rewrite 模式重啟 re-LIST 同版本冪等）。
+去重分兩層：ingest 端 **column-hash**（只雜湊會寫入的宣告欄位值，行程內比對、不落庫；丟棄 resync／
+無宣告欄變動的 no-op），CH 端 `ReplacingMergeTree(ingest_seq)` +
+`ORDER BY (namespace, name, uid, valid_from)`。`uid` 進 key 讓同名刪建（不同 uid）成為各自的時間線；
+`valid_from` 由 ingest 保證每 uid 嚴格遞增（同毫秒變更 +1ms），取代舊 `resource_version` 的角色。
 **`valid_to` 刻意排除於 ORDER BY 之外**：唯有排序鍵相同，收尾列才折疊得掉它所收尾的開放列（rewrite），
 且 lightweight UPDATE 不能改排序鍵欄位（update）。
 

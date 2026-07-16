@@ -101,7 +101,7 @@ func TestIngest_AddUpdateDedupDelete(t *testing.T) {
 	if len(q) != 1 {
 		t.Fatalf("Add: expected 1 row, got %d", len(q))
 	}
-	if q[0].table != "svc_versions" || q[0].row.Deleted || q[0].row.Values["cluster_ip"] != "10.0.0.1" {
+	if q[0].table != "svc_versions" || q[0].row.Values["cluster_ip"] != "10.0.0.1" {
 		t.Fatalf("Add row wrong: %+v", q[0].row)
 	}
 	// Add uses creationTimestamp for valid_from.
@@ -121,7 +121,7 @@ func TestIngest_AddUpdateDedupDelete(t *testing.T) {
 	if len(q) != 2 {
 		t.Fatalf("update: expected 2 rows (close + new), got %d", len(q))
 	}
-	if q[0].row.ResourceVersion != "1" || q[0].row.ValidTo == store.FarFuture {
+	if q[0].row.Values["cluster_ip"] != "10.0.0.1" || q[0].row.ValidTo == store.FarFuture {
 		t.Fatalf("update: first row should close v1, got %+v", q[0].row)
 	}
 	if q[1].row.Values["cluster_ip"] != "10.0.0.2" || q[1].row.ValidTo != store.FarFuture {
@@ -134,8 +134,10 @@ func TestIngest_AddUpdateDedupDelete(t *testing.T) {
 	if len(q) != 1 {
 		t.Fatalf("delete: expected 1 closing row, got %d", len(q))
 	}
-	if q[0].row.Deleted {
-		t.Fatalf("delete: must not write a deleted=1 tombstone, got %+v", q[0].row)
+	// No tombstone row: deletion is recorded only by closing valid_to. The
+	// closing row re-inserts the prior version's payload with valid_to filled in.
+	if q[0].row.Values["cluster_ip"] != "10.0.0.2" {
+		t.Fatalf("delete: closing row should carry the prior payload, got %+v", q[0].row)
 	}
 	if q[0].row.ValidTo == store.FarFuture || !q[0].row.ValidTo.After(q[0].row.ValidFrom) {
 		t.Fatalf("delete: valid_to should close the version, got %+v", q[0].row)
@@ -171,9 +173,8 @@ func TestIngest_ValidToChain(t *testing.T) {
 
 	// The closing row is v1 with valid_to filled in: same sort key, higher seq.
 	if v1Close.Namespace != v1Open.Namespace || v1Close.Name != v1Open.Name ||
-		!v1Close.ValidFrom.Equal(v1Open.ValidFrom) ||
-		v1Close.ResourceVersion != v1Open.ResourceVersion ||
-		v1Close.Deleted != v1Open.Deleted {
+		v1Close.UID != v1Open.UID ||
+		!v1Close.ValidFrom.Equal(v1Open.ValidFrom) {
 		t.Fatalf("closing row must share v1's sort key:\nopen=%+v\nclose=%+v", v1Open, v1Close)
 	}
 	if v1Close.IngestSeq <= v1Open.IngestSeq {
@@ -193,7 +194,7 @@ func TestIngest_ValidToChain(t *testing.T) {
 		t.Fatalf("delete: expected 1 row, got %d", len(q))
 	}
 	v2Close := q[0].row
-	if v2Close.ResourceVersion != v2Open.ResourceVersion || !v2Close.ValidFrom.Equal(v2Open.ValidFrom) {
+	if v2Close.UID != v2Open.UID || !v2Close.ValidFrom.Equal(v2Open.ValidFrom) {
 		t.Fatalf("delete must close v2, got %+v", v2Close)
 	}
 	if v2Close.IngestSeq <= v2Open.IngestSeq {
@@ -334,17 +335,15 @@ func TestIngest_UpdateClose_FlushOrder(t *testing.T) {
 // re-LIST dedups instead of re-inserting, and sweeps stale open rows left by
 // a crash between an insert flush and its close.
 func TestIngest_RecoverPopulatesAndSweeps(t *testing.T) {
-	current := svcObj("uid-1", "prod-web", "10.0.0.2", "2")
-	hash, err := SpecHash(current.Object)
-	if err != nil {
-		t.Fatal(err)
-	}
 	vf1 := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
 	vf2 := time.Date(2026, 3, 2, 0, 0, 0, 0, time.UTC)
+	// Open rows carry declared column Values; Recover recomputes the dedup hash
+	// from them (no persisted spec_hash). The latest row's payload matches the
+	// object re-LISTed below, so an unchanged re-LIST dedups.
 	fs := &fakeStore{open: map[string][]store.OpenVersion{
 		"svc_versions": {
-			{Namespace: "prod-web", Name: "api", UID: "uid-1", SpecHash: "h-old", ValidFrom: vf1, IngestSeq: 1},
-			{Namespace: "prod-web", Name: "api", UID: "uid-1", SpecHash: hash, ValidFrom: vf2, IngestSeq: 3},
+			{Namespace: "prod-web", Name: "api", UID: "uid-1", Values: map[string]any{"cluster_ip": "10.0.0.1"}, ValidFrom: vf1, IngestSeq: 1},
+			{Namespace: "prod-web", Name: "api", UID: "uid-1", Values: map[string]any{"cluster_ip": "10.0.0.2"}, ValidFrom: vf2, IngestSeq: 3},
 		},
 	}}
 	in, cr := newTestIngesterMode(t, config.CloseModeUpdate, fs)
@@ -358,7 +357,7 @@ func TestIngest_RecoverPopulatesAndSweeps(t *testing.T) {
 	}
 
 	// Re-LIST of the unchanged object dedups against the recovered hash.
-	in.onEvent(cr, current, eventAdd)
+	in.onEvent(cr, svcObj("uid-1", "prod-web", "10.0.0.2", "2"), eventAdd)
 	if q := drain(in); len(q) != 0 {
 		t.Fatalf("unchanged re-LIST must be a no-op, got %d items", len(q))
 	}
@@ -378,17 +377,23 @@ func TestIngest_RecoverPopulatesAndSweeps(t *testing.T) {
 		t.Fatalf("new version must start at observation time, not creationTimestamp: %v", q[1].row.ValidFrom)
 	}
 
-	// Rewrite mode: Recover is a no-op (memory-only last-state).
+	// Rewrite mode: Recover now also rebuilds last-state (so a re-LIST dedups),
+	// but it does NOT sweep stale opens — that needs an in-place close.
 	fsR := &fakeStore{open: fs.open}
-	inR, _ := newTestIngesterMode(t, config.CloseModeRewrite, fsR)
+	inR, crR := newTestIngesterMode(t, config.CloseModeRewrite, fsR)
 	if err := inR.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(fsR.closes) != 0 {
-		t.Fatalf("rewrite-mode Recover must not touch the store, got %+v", fsR.closes)
+		t.Fatalf("rewrite-mode Recover must not close/sweep, got %+v", fsR.closes)
 	}
-	if _, hadPrior, _ := inR.priorOpen("uid-1", hash); hadPrior {
-		t.Fatal("rewrite-mode Recover must not populate last-state")
+	if _, hadPrior := inR.lookup("uid-1"); !hadPrior {
+		t.Fatal("rewrite-mode Recover must populate last-state")
+	}
+	// And the recovered payload lets an unchanged re-LIST dedup in rewrite mode too.
+	inR.onEvent(crR, svcObj("uid-1", "prod-web", "10.0.0.2", "2"), eventAdd)
+	if q := drain(inR); len(q) != 0 {
+		t.Fatalf("rewrite-mode unchanged re-LIST must be a no-op, got %d items", len(q))
 	}
 }
 

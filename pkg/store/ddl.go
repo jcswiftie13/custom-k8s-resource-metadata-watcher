@@ -24,11 +24,8 @@ var envelopeColumns = []envelopeColumn{
 	{"namespace", "LowCardinality(String)"},
 	{"name", "String"},
 	{"uid", "String"},
-	{"resource_version", "String"},
 	{"valid_from", "DateTime64(3)"},
 	{"valid_to", "DateTime64(3)"},
-	{"deleted", "UInt8"},
-	{"spec_hash", "String"},
 	{"ingest_seq", "UInt64"},
 }
 
@@ -62,17 +59,18 @@ func createTableSQL(t TableSchema, updateClose bool) string {
 	}
 	// Trim trailing comma+newline.
 	s := strings.TrimRight(b.String(), ",\n")
-	// ORDER BY doubles as the ReplacingMergeTree dedup key. resource_version
-	// keeps genuinely distinct versions apart (k8s bumps it on every change,
-	// and it is stable across a restart re-LIST so the same version dedups).
-	// deleted is retained for schema stability but is always 0: a deletion is
-	// recorded by closing valid_to, not by a tombstone row.
+	// ORDER BY doubles as the ReplacingMergeTree dedup key. uid is in the key so
+	// a same-name delete/re-create (a fresh uid) forms its own version timeline
+	// instead of colliding with the old object's. valid_from distinguishes an
+	// object's successive versions; the ingester guarantees it is strictly
+	// increasing per uid (bumping by 1ms on a same-millisecond change), which is
+	// what lets us key on it without resource_version.
 	//
 	// Invariant: valid_to MUST stay out of ORDER BY. Closing a version re-inserts
 	// the same row with valid_to filled in and a higher ingest_seq; if valid_to
 	// were part of the key the open row and its closing row would sort apart and
 	// both survive the merge, so the close would never take effect.
-	s += "\n) ENGINE = ReplacingMergeTree(ingest_seq)\nORDER BY (namespace, name, valid_from, resource_version, deleted)"
+	s += "\n) ENGINE = ReplacingMergeTree(ingest_seq)\nORDER BY (namespace, name, uid, valid_from)"
 	if updateClose {
 		s += "\nSETTINGS " + patchPartSettings
 	}

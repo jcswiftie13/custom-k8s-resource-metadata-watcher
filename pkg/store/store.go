@@ -42,28 +42,26 @@ type TableSchema struct {
 // every declared column with a Go value matching its ClickHouse type
 // (string, []string, int64, uint64, float64, bool, time.Time).
 type Row struct {
-	Namespace       string
-	Name            string
-	UID             string
-	ResourceVersion string
-	ValidFrom       time.Time
-	ValidTo         time.Time
-	Deleted         bool
-	SpecHash        string
-	IngestSeq       uint64
-	Values          map[string]any
+	Namespace string
+	Name      string
+	UID       string
+	ValidFrom time.Time
+	ValidTo   time.Time
+	IngestSeq uint64
+	Values    map[string]any
 }
 
-// OpenVersion is one open (valid_to = FarFuture) row as seen by recovery: just
-// the identity + dedup hash the ingester needs to rebuild its last-state after
-// a restart, never the declared column values.
+// OpenVersion is one open (valid_to = FarFuture) row as seen by recovery: the
+// identity, ordering keys, and declared column Values the ingester needs to
+// rebuild its last-state — including recomputing the dedup hash — after a
+// restart.
 type OpenVersion struct {
 	Namespace string
 	Name      string
 	UID       string
-	SpecHash  string
 	ValidFrom time.Time
 	IngestSeq uint64
+	Values    map[string]any
 }
 
 // Store is the write surface used by the ingest path.

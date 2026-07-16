@@ -48,18 +48,23 @@ func dt64Lit(t time.Time) string {
 }
 
 // OpenVersions returns every row of table still carrying the FarFuture
-// sentinel — the ingester's restart-recovery input. Rows are returned raw
-// (ordered by uid, valid_from, ingest_seq); the caller collapses duplicates
-// (same uid+valid_from, higher ingest_seq wins) and decides which open rows
-// are stale.
+// sentinel — the ingester's restart-recovery input. Each row carries its
+// declared column Values so the caller can recompute the dedup hash. Rows are
+// returned raw (ordered by uid, valid_from, ingest_seq); the caller collapses
+// duplicates (same uid+valid_from, higher ingest_seq wins) and decides which
+// open rows are stale.
 func (s *chStore) OpenVersions(ctx context.Context, table string) ([]OpenVersion, error) {
-	if _, ok := s.schemas[table]; !ok {
+	schema, ok := s.schemas[table]
+	if !ok {
 		return nil, fmt.Errorf("unknown table %q (EnsureSchema not called for it)", table)
 	}
+	cols := "namespace, name, uid, valid_from, ingest_seq"
+	for _, c := range schema.Columns {
+		cols += ", " + c.Name
+	}
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(
-		`SELECT namespace, name, uid, spec_hash, valid_from, ingest_seq
-		 FROM %s WHERE valid_to = %s
-		 ORDER BY uid, valid_from, ingest_seq`, table, dt64Lit(FarFuture)))
+		`SELECT %s FROM %s WHERE valid_to = %s
+		 ORDER BY uid, valid_from, ingest_seq`, cols, table, dt64Lit(FarFuture)))
 	if err != nil {
 		return nil, fmt.Errorf("open versions %s: %w", table, err)
 	}
@@ -67,10 +72,75 @@ func (s *chStore) OpenVersions(ctx context.Context, table string) ([]OpenVersion
 	var out []OpenVersion
 	for rows.Next() {
 		var v OpenVersion
-		if err := rows.Scan(&v.Namespace, &v.Name, &v.UID, &v.SpecHash, &v.ValidFrom, &v.IngestSeq); err != nil {
+		dest := []any{&v.Namespace, &v.Name, &v.UID, &v.ValidFrom, &v.IngestSeq}
+		targets := make([]any, len(schema.Columns))
+		for i, c := range schema.Columns {
+			p, err := scanTarget(c.Type)
+			if err != nil {
+				return nil, fmt.Errorf("open versions %s: column %q: %w", table, c.Name, err)
+			}
+			targets[i] = p
+			dest = append(dest, p)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return nil, err
+		}
+		v.Values = make(map[string]any, len(schema.Columns))
+		for i, c := range schema.Columns {
+			v.Values[c.Name] = derefTarget(targets[i])
 		}
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// scanTarget allocates a pointer of the Go type clickhouse-go scans a column of
+// the given ClickHouse type into. It mirrors the ingester's columnValue type
+// switch so a value written by the ingest path reads back as the same Go type.
+func scanTarget(chType string) (any, error) {
+	switch chType {
+	case "String":
+		return new(string), nil
+	case "Array(String)":
+		return new([]string), nil
+	case "Int64":
+		return new(int64), nil
+	case "UInt64":
+		return new(uint64), nil
+	case "Float64":
+		return new(float64), nil
+	case "Bool":
+		return new(bool), nil
+	case "DateTime64(3)":
+		return new(time.Time), nil
+	default:
+		return nil, fmt.Errorf("unsupported column type %q", chType)
+	}
+}
+
+// derefTarget reads the value behind a scanTarget pointer, normalizing to the
+// same representation buildRow produces so the recomputed hash matches: a nil
+// Array(String) becomes an empty slice, and DateTime64(3) is millisecond UTC.
+func derefTarget(p any) any {
+	switch x := p.(type) {
+	case *string:
+		return *x
+	case *[]string:
+		if *x == nil {
+			return []string{}
+		}
+		return *x
+	case *int64:
+		return *x
+	case *uint64:
+		return *x
+	case *float64:
+		return *x
+	case *bool:
+		return *x
+	case *time.Time:
+		return x.UTC().Truncate(time.Millisecond)
+	default:
+		return nil
+	}
 }

@@ -2,6 +2,7 @@ package history
 
 import (
 	"testing"
+	"time"
 
 	"github.com/example/metadata-exporter/pkg/collector"
 	"github.com/example/metadata-exporter/pkg/config"
@@ -240,36 +241,59 @@ func TestFilters_AndSemanticsAndRegexOrdering(t *testing.T) {
 	}
 }
 
-func TestSpecHash_StableAndVolatileInsensitive(t *testing.T) {
-	a := sampleService()
-	b := sampleService()
-	// change only volatile fields
-	b["metadata"].(map[string]interface{})["resourceVersion"] = "999"
-	b["metadata"].(map[string]interface{})["generation"] = int64(7)
-
-	ha, err := SpecHash(a)
+func TestColumnHash(t *testing.T) {
+	base := map[string]any{
+		"cluster_ip": "10.0.0.1",
+		"ports":      []string{"80", "443"},
+		"replicas":   int64(3),
+	}
+	h1, err := ColumnHash(base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hb, err := SpecHash(b)
-	if err != nil {
-		t.Fatal(err)
+
+	// Key order is irrelevant — equal values hash equal.
+	same := map[string]any{
+		"replicas":   int64(3),
+		"ports":      []string{"80", "443"},
+		"cluster_ip": "10.0.0.1",
 	}
-	if ha != hb {
-		t.Fatalf("hash changed on volatile-only diff: %s vs %s", ha, hb)
+	if h2, _ := ColumnHash(same); h1 != h2 {
+		t.Fatalf("hash changed for equal values: %s vs %s", h1, h2)
 	}
 
-	// a real spec change must change the hash
-	c := sampleService()
-	c["spec"].(map[string]interface{})["clusterIP"] = "10.0.0.9"
-	hc, _ := SpecHash(c)
-	if ha == hc {
-		t.Fatal("hash did not change on spec change")
+	// A declared-column change flips the hash.
+	changed := map[string]any{
+		"cluster_ip": "10.0.0.2",
+		"ports":      []string{"80", "443"},
+		"replicas":   int64(3),
+	}
+	if h3, _ := ColumnHash(changed); h1 == h3 {
+		t.Fatal("hash did not change on a declared-column change")
 	}
 
-	// SpecHash must not mutate the input (shared informer object)
-	if _, ok := a["metadata"].(map[string]interface{})["resourceVersion"]; !ok {
-		t.Fatal("SpecHash mutated the input object's metadata")
+	// Type tags prevent cross-type collisions: string "3" != int64(3).
+	hStr, _ := ColumnHash(map[string]any{"replicas": "3"})
+	hInt, _ := ColumnHash(map[string]any{"replicas": int64(3)})
+	if hStr == hInt {
+		t.Fatal("string and int column values must not collide")
+	}
+
+	// Slice-element boundaries matter: ["a","b"] != ["ab"].
+	hAB, _ := ColumnHash(map[string]any{"x": []string{"a", "b"}})
+	hCat, _ := ColumnHash(map[string]any{"x": []string{"ab"}})
+	if hAB == hCat {
+		t.Fatal("array element boundaries must be preserved in the hash")
+	}
+
+	// Time hashes at millisecond precision (matches DateTime64(3) readback), so
+	// a sub-millisecond difference — which ClickHouse truncates away — must not
+	// change the hash.
+	base2 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	hA, _ := ColumnHash(map[string]any{"t": base2})
+	hB, _ := ColumnHash(map[string]any{"t": base2.Add(500 * time.Microsecond)})
+	if hA != hB {
+		t.Fatal("sub-millisecond time difference must not change the hash")
 	}
 }
 

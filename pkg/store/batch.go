@@ -64,19 +64,12 @@ func (s *chStore) writeChunk(ctx context.Context, insertSQL string, schema Table
 // rowArgs assembles positional insert args aligned with allColumns(schema):
 // the envelope columns followed by the declared columns in order.
 func rowArgs(schema TableSchema, r *Row) ([]any, error) {
-	deleted := uint8(0)
-	if r.Deleted {
-		deleted = 1
-	}
 	args := []any{
 		r.Namespace,
 		r.Name,
 		r.UID,
-		r.ResourceVersion,
 		r.ValidFrom,
 		r.ValidTo,
-		deleted,
-		r.SpecHash,
 		r.IngestSeq,
 	}
 	for _, c := range schema.Columns {

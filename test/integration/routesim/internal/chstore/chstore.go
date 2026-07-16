@@ -5,8 +5,8 @@
 //
 // The tables it reads are written by the metadata-exporter's history ingest
 // (pkg/history + pkg/store): ReplacingMergeTree(ingest_seq) with ORDER BY
-// (namespace, name, valid_from, resource_version, deleted) — see the main
-// module's pkg/store/ddl.go. That writer closes a version by REWRITING the
+// (namespace, name, uid, valid_from) — see the main module's pkg/store/ddl.go.
+// That writer closes a version by REWRITING the
 // previous open row (same ORDER BY key, higher ingest_seq, valid_to pulled in),
 // so until background merges collapse the pair, both the stale open row
 // (valid_to = far-future sentinel) and its closing rewrite are visible. The
@@ -23,7 +23,7 @@
 //     valid_to) would be dropped pre-dedup while its stale twin (sentinel
 //     valid_to) passes — the stale row would then win dedup unopposed and a
 //     dead version would appear live throughout the window.
-//  2. The client dedups rows per version slot (namespace, name, valid_from),
+//  2. The client dedups rows per version slot (namespace, name, uid, valid_from),
 //     keeping the highest ingest_seq (dedupLatest) — the exact collapse
 //     ReplacingMergeTree performs at merge time. Distinct versions keep
 //     distinct valid_from so they all survive; two versions landing in the
@@ -135,17 +135,18 @@ func (s *Store) prune(t0 time.Time) string {
 func (s *Store) Close() error { return s.conn.Close() }
 
 // versionRow is the dedup/liveness envelope every read scans alongside its
-// payload columns: the version-slot identity (namespace, name, valid_from), the
+// payload columns: the version-slot identity (namespace, name, uid, valid_from), the
 // writer sequence that picks the authoritative row within a slot, and the
 // materialized valid_to that overlap is checked against AFTER dedup.
 type versionRow struct {
 	ns, name string
+	uid      string
 	vf, vt   time.Time
 	seq      uint64
 }
 
 func (r versionRow) slot() string {
-	return r.ns + "\x00" + r.name + "\x00" + strconv.FormatInt(r.vf.UnixMilli(), 10)
+	return r.ns + "\x00" + r.name + "\x00" + r.uid + "\x00" + strconv.FormatInt(r.vf.UnixMilli(), 10)
 }
 
 // overlapsWindow reports vf < t1 && t0 < vt (checked post-dedup).
@@ -153,7 +154,7 @@ func (r versionRow) overlapsWindow(t0, t1 time.Time) bool {
 	return r.vf.Before(t1) && t0.Before(r.vt)
 }
 
-// dedupLatest keeps, per version slot (namespace, name, valid_from), only the
+// dedupLatest keeps, per version slot (namespace, name, uid, valid_from), only the
 // row with the highest ingest_seq — the reader-side equivalent of the
 // ReplacingMergeTree(ingest_seq) collapse FINAL would apply server-side.
 // First-seen slot order is preserved.
@@ -224,12 +225,12 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 	var w store.TrafficWindow
 
 	svcVer := func(r store.ServiceRow) versionRow {
-		return versionRow{ns: r.Namespace, name: r.Name, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
+		return versionRow{ns: r.Namespace, name: r.Name, uid: r.UID, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
 	}
 
 	// 1. Ingress Service versions serving this IP.
 	svcRows, err := s.conn.Query(ctx, fmt.Sprintf(
-		`SELECT namespace, name, valid_from, valid_to, ingress_ips, selector_kv, spec_json, ingest_seq
+		`SELECT namespace, name, uid, valid_from, valid_to, ingress_ips, selector_kv, spec_json, ingest_seq
 		 FROM service_versions
 		 WHERE has(ingress_ips, ?) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
 		ip)
@@ -280,7 +281,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 	var deps []store.DeployRow
 	for _, sel := range selectors {
 		depRows, err := s.conn.Query(ctx, fmt.Sprintf(
-			`SELECT namespace, name, valid_from, valid_to, pod_labels_kv, ingest_seq
+			`SELECT namespace, name, uid, valid_from, valid_to, pod_labels_kv, ingest_seq
 			 FROM deploy_versions
 			 WHERE has(?, namespace) AND hasAll(pod_labels_kv, ?) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
 			nsList, sel)
@@ -289,7 +290,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 		}
 		for depRows.Next() {
 			var r store.DeployRow
-			if err := depRows.Scan(&r.Namespace, &r.Name, &r.ValidFrom, &r.ValidTo, &r.PodLabels, &r.IngestSeq); err != nil {
+			if err := depRows.Scan(&r.Namespace, &r.Name, &r.UID, &r.ValidFrom, &r.ValidTo, &r.PodLabels, &r.IngestSeq); err != nil {
 				depRows.Close()
 				return w, err
 			}
@@ -300,7 +301,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 		}
 	}
 	deps = dedupOverlap(s, deps, func(r store.DeployRow) versionRow {
-		return versionRow{ns: r.Namespace, name: r.Name, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
+		return versionRow{ns: r.Namespace, name: r.Name, uid: r.UID, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
 	}, t0, t1)
 	labelSeen := map[string]bool{}
 	var labelUnion []string
@@ -318,7 +319,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 	var gwRefs []string
 	if len(labelUnion) > 0 {
 		gwRows, err := s.conn.Query(ctx, fmt.Sprintf(
-			`SELECT namespace, name, valid_from, valid_to, selector_kv, server_hosts, spec_json, ingest_seq
+			`SELECT namespace, name, uid, valid_from, valid_to, selector_kv, server_hosts, spec_json, ingest_seq
 			 FROM gw_versions
 			 WHERE hasAll(?, selector_kv) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
 			labelUnion)
@@ -328,7 +329,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 		var gws []store.GatewayRow
 		for gwRows.Next() {
 			var r store.GatewayRow
-			if err := gwRows.Scan(&r.Namespace, &r.Name, &r.ValidFrom, &r.ValidTo,
+			if err := gwRows.Scan(&r.Namespace, &r.Name, &r.UID, &r.ValidFrom, &r.ValidTo,
 				&r.SelectorKV, &r.ServerHosts, &r.SpecJSON, &r.IngestSeq); err != nil {
 				gwRows.Close()
 				return w, err
@@ -339,7 +340,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 			return w, fmt.Errorf("window gateways: %w", err)
 		}
 		gws = dedupOverlap(s, gws, func(r store.GatewayRow) versionRow {
-			return versionRow{ns: r.Namespace, name: r.Name, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
+			return versionRow{ns: r.Namespace, name: r.Name, uid: r.UID, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
 		}, t0, t1)
 		refSeen := map[string]bool{}
 		for _, r := range gws {
@@ -361,7 +362,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 	var destHosts []string
 	if len(gwRefs) > 0 {
 		vsRows, err := s.conn.Query(ctx, fmt.Sprintf(
-			`SELECT namespace, name, valid_from, valid_to, bound_gateways, spec_json, ingest_seq
+			`SELECT namespace, name, uid, valid_from, valid_to, bound_gateways, spec_json, ingest_seq
 			 FROM vs_versions
 			 WHERE hasAny(bound_gateways, ?) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
 			gwRefs)
@@ -371,7 +372,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 		var vses []store.VSRow
 		for vsRows.Next() {
 			var r store.VSRow
-			if err := vsRows.Scan(&r.Namespace, &r.Name, &r.ValidFrom, &r.ValidTo,
+			if err := vsRows.Scan(&r.Namespace, &r.Name, &r.UID, &r.ValidFrom, &r.ValidTo,
 				&r.BoundGateways, &r.SpecJSON, &r.IngestSeq); err != nil {
 				vsRows.Close()
 				return w, err
@@ -382,7 +383,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 			return w, fmt.Errorf("window virtualservices: %w", err)
 		}
 		vses = dedupOverlap(s, vses, func(r store.VSRow) versionRow {
-			return versionRow{ns: r.Namespace, name: r.Name, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
+			return versionRow{ns: r.Namespace, name: r.Name, uid: r.UID, vf: r.ValidFrom, vt: r.ValidTo, seq: r.IngestSeq}
 		}, t0, t1)
 		hostSeen := map[string]bool{}
 		for _, r := range vses {
@@ -406,7 +407,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 	var backends []store.ServiceRow
 	for _, chunk := range chunkStrings(backendKeys(destHosts), hostChunk) {
 		bsRows, err := s.conn.Query(ctx, fmt.Sprintf(
-			`SELECT namespace, name, valid_from, valid_to, ingress_ips, selector_kv, spec_json, ingest_seq
+			`SELECT namespace, name, uid, valid_from, valid_to, ingress_ips, selector_kv, spec_json, ingest_seq
 			 FROM service_versions
 			 WHERE has(?, concat(namespace, '/', name)) AND valid_from < %s%s`, dt64Lit(t1), s.prune(t0)),
 			chunk)
@@ -435,7 +436,7 @@ func (s *Store) LoadTrafficWindow(ctx context.Context, ip string, t0, t1 time.Ti
 func scanServiceRow(rows driver.Rows) (store.ServiceRow, error) {
 	var r store.ServiceRow
 	var specJSON string
-	if err := rows.Scan(&r.Namespace, &r.Name, &r.ValidFrom, &r.ValidTo,
+	if err := rows.Scan(&r.Namespace, &r.Name, &r.UID, &r.ValidFrom, &r.ValidTo,
 		&r.IngressIPs, &r.Selector, &specJSON, &r.IngestSeq); err != nil {
 		return r, err
 	}

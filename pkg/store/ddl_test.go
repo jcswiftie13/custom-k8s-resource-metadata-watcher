@@ -20,18 +20,15 @@ func TestCreateTableSQL(t *testing.T) {
   namespace LowCardinality(String),
   name String,
   uid String,
-  resource_version String,
   valid_from DateTime64(3),
   valid_to DateTime64(3),
-  deleted UInt8,
-  spec_hash String,
   ingest_seq UInt64,
   cluster_ip String,
   selector_kv Array(String),
   port Int64,
   INDEX idx_selector_kv selector_kv TYPE bloom_filter GRANULARITY 1
 ) ENGINE = ReplacingMergeTree(ingest_seq)
-ORDER BY (namespace, name, valid_from, resource_version, deleted)`
+ORDER BY (namespace, name, uid, valid_from)`
 
 	if got != want {
 		t.Fatalf("DDL mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
@@ -44,7 +41,7 @@ func TestCreateTableSQL_NoIndex(t *testing.T) {
 	if strings.Contains(got, "INDEX") {
 		t.Fatalf("did not expect an INDEX clause:\n%s", got)
 	}
-	if !strings.HasSuffix(got, "ORDER BY (namespace, name, valid_from, resource_version, deleted)") {
+	if !strings.HasSuffix(got, "ORDER BY (namespace, name, uid, valid_from)") {
 		t.Fatalf("unexpected suffix:\n%s", got)
 	}
 }

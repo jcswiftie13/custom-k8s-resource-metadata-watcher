@@ -1,9 +1,9 @@
 // Package store holds the value types of the versioned routing-config store as
 // the reader side sees them. It is a read-only trim of poc/route2a/internal/store
 // adapted to the PRODUCTION schema — the four *_versions tables written by the
-// metadata-exporter's history ingest (pkg/history + pkg/store), which carry
-// envelope columns (uid, resource_version, deleted, spec_hash) instead of the
-// PoC's synthetic `rev` oracle column. This package imports no backend, so it
+// metadata-exporter's history ingest (pkg/history + pkg/store), whose envelope
+// is (namespace, name, uid, valid_from, valid_to, ingest_seq) — no synthetic
+// `rev` oracle column like the PoC. This package imports no backend, so it
 // stays a leaf (the backend imports it).
 package store
 
@@ -21,6 +21,7 @@ import (
 // see BackendFQDN / ParseBackendHost.
 type ServiceRow struct {
 	Namespace, Name      string
+	UID                  string
 	ValidFrom, ValidTo   time.Time
 	IngressIPs, Selector []string
 	Ports                []SvcPort
@@ -94,6 +95,7 @@ type GatewayCand struct {
 // rebuild off the loaded rows.
 type DeployRow struct {
 	Namespace, Name    string
+	UID                string
 	ValidFrom, ValidTo time.Time
 	PodLabels          []string
 	IngestSeq          uint64
@@ -101,6 +103,7 @@ type DeployRow struct {
 
 type GatewayRow struct {
 	Namespace, Name    string
+	UID                string
 	ValidFrom, ValidTo time.Time
 	SelectorKV         []string
 	ServerHosts        []string
@@ -110,6 +113,7 @@ type GatewayRow struct {
 
 type VSRow struct {
 	Namespace, Name    string
+	UID                string
 	ValidFrom, ValidTo time.Time
 	BoundGateways      []string
 	SpecJSON           string

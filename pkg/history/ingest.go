@@ -110,27 +110,25 @@ func NewIngester(st store.Store, informers InformerSource, resources []*Compiled
 	}
 }
 
-// Recover rebuilds the ingester's last-state from the store's open rows —
-// restart idempotency for closeMode=update. Without it, the initial re-LIST
-// after a restart re-inserts a row for every live object (the in-memory
-// last-state is empty), breaking the "every version is exactly one row"
-// guarantee update mode exists for. Call after EnsureSchema and BEFORE the
-// informers start.
+// Recover rebuilds the ingester's last-state from the store's open rows so a
+// post-restart re-LIST dedups instead of re-inserting a row for every live
+// object. Call after EnsureSchema and BEFORE the informers start.
 //
 // Per uid it keeps the newest open row (max valid_from, then max ingest_seq —
 // raw rows may still contain rewrite-era duplicates) as the object's open
-// version: matching spec_hash on re-LIST is then a no-op, a differing hash
-// closes it and opens a new version at observation time. Any OLDER open row of
-// the same uid is a stale leftover from a crash between an INSERT flush and
-// its close — it is closed here at the next version's valid_from, the exact
-// boundary the lost close would have written.
+// version, recomputing the dedup hash from its declared column Values (there is
+// no persisted hash): a matching column hash on re-LIST is then a no-op, a
+// differing one closes the version and opens a new one at observation time.
 //
-// Rewrite mode keeps its memory-only last-state (re-LIST duplicates there are
-// same-key rows the readers' dedup already collapses), so Recover is a no-op.
+// It runs in BOTH close modes — without it, dropping resource_version from the
+// key would let a re-LIST of an object last changed by an Update re-open a
+// false version at a fresh valid_from. Any OLDER open row of the same uid is a
+// stale leftover from a crash between an INSERT flush and its close; the
+// stale-open sweep closes it at the next version's valid_from (the exact
+// boundary the lost close would have written). That sweep is update-mode only:
+// rewrite has no in-place close, so its crash-window stale opens are left to
+// the readers' dedup.
 func (in *Ingester) Recover(ctx context.Context) error {
-	if !in.updateClose {
-		return nil
-	}
 	tables := map[string]struct{}{}
 	for _, cr := range in.byKind {
 		tables[cr.Table] = struct{}{}
@@ -156,16 +154,25 @@ func (in *Ingester) Recover(ctx context.Context) error {
 		}
 		for uid, vs := range byUID {
 			latest := vs[len(vs)-1]
-			in.remember(uid, latest.SpecHash, store.Row{
+			hash, err := ColumnHash(latest.Values)
+			if err != nil {
+				return fmt.Errorf("history recover %s: hash open row uid=%s: %w", table, uid, err)
+			}
+			in.remember(uid, hash, store.Row{
 				Namespace: latest.Namespace,
 				Name:      latest.Name,
 				UID:       uid,
 				ValidFrom: latest.ValidFrom,
 				ValidTo:   store.FarFuture,
+				Values:    latest.Values,
 			})
 			recovered++
+			if !in.updateClose {
+				continue
+			}
 			// Stale opens: every open row before the latest lost its close in a
-			// crash window; its true end is the next version's start.
+			// crash window; its true end is the next version's start. Only update
+			// mode can patch them in place.
 			for i := 0; i < len(vs)-1; i++ {
 				if err := in.store.CloseVersion(ctx, table,
 					vs[i].Namespace, vs[i].Name, uid, vs[i].ValidFrom, vs[i+1].ValidFrom); err != nil {
@@ -279,8 +286,8 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 
 	if kind == eventDelete {
 		// Only close out objects we actually wrote (passed filters before). The
-		// close alone records the deletion — valid_to now bounds the last
-		// version, so no deleted=1 tombstone row is written.
+		// close alone records the deletion — valid_to bounds the last version, so
+		// no tombstone row is written.
 		prior, ok := in.forgetIfSeen(uid)
 		if !ok {
 			return
@@ -293,15 +300,7 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 		return
 	}
 
-	hash, err := SpecHash(objMap)
-	if err != nil {
-		in.log.Error("history spec hash failed", "kind", cr.Kind, "uid", uid, "err", err)
-		return
-	}
-	prior, hadPrior, same := in.priorOpen(uid, hash)
-	if same {
-		return // resync / no-op: unchanged content
-	}
+	prev, hadPrior := in.lookup(uid)
 
 	// An Add for a uid we already track is a change observed as a re-LIST
 	// (restart recovery, informer replay): the change happened while we were
@@ -316,12 +315,28 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 		in.log.Error("history build row failed", "kind", cr.Kind, "uid", uid, "err", err)
 		return
 	}
-	row.SpecHash = hash
+	hash, err := ColumnHash(row.Values)
+	if err != nil {
+		in.log.Error("history column hash failed", "kind", cr.Kind, "uid", uid, "err", err)
+		return
+	}
+	if hadPrior && prev.hash == hash {
+		return // resync / no-op: declared columns unchanged
+	}
+
+	// valid_from must strictly increase per uid: without resource_version in the
+	// key, two content versions landing in the same millisecond would share the
+	// (namespace, name, uid, valid_from) key and ReplacingMergeTree would keep
+	// only one. Bump to prev+1ms; the prior version then closes at this same
+	// (bumped) instant, so successor-start == predecessor-end still holds.
+	if hadPrior && !row.ValidFrom.After(prev.row.ValidFrom) {
+		row.ValidFrom = prev.row.ValidFrom.Add(time.Millisecond)
+	}
 	in.remember(uid, hash, row)
 
 	// The superseded version ends where the new one begins.
 	if hadPrior {
-		in.enqueueClose(cr.Table, prior, row.ValidFrom)
+		in.enqueueClose(cr.Table, prev.row, row.ValidFrom)
 	}
 	in.enqueue(cr.Table, row, nil)
 }
@@ -345,18 +360,17 @@ func (in *Ingester) enqueueClose(table string, prev store.Row, closeAt time.Time
 	in.enqueue(table, in.closingRow(prev, closeAt), nil)
 }
 
-// buildRow assembles the open version row for an Add/Update. Deleted stays
-// false: a deletion is recorded by closing valid_to, never by a tombstone row.
+// buildRow assembles the open version row for an Add/Update. A deletion is
+// recorded by closing valid_to, never by a tombstone row.
 func (in *Ingester) buildRow(cr *CompiledResource, u *unstructured.Unstructured, lookup srcLookup, kind eventKind) (store.Row, error) {
 	row := store.Row{
-		Namespace:       u.GetNamespace(),
-		Name:            u.GetName(),
-		UID:             string(u.GetUID()),
-		ResourceVersion: u.GetResourceVersion(),
-		ValidFrom:       validFrom(u, kind),
-		ValidTo:         store.FarFuture,
-		IngestSeq:       in.seq.Add(1),
-		Values:          make(map[string]any, len(cr.Columns)),
+		Namespace: u.GetNamespace(),
+		Name:      u.GetName(),
+		UID:       string(u.GetUID()),
+		ValidFrom: validFrom(u, kind),
+		ValidTo:   store.FarFuture,
+		IngestSeq: in.seq.Add(1),
+		Values:    make(map[string]any, len(cr.Columns)),
 	}
 	for i := range cr.Columns {
 		c := &cr.Columns[i]
@@ -423,7 +437,10 @@ func (in *Ingester) columnValue(c *CompiledColumn, lookup srcLookup) (any, error
 		if err != nil {
 			return time.Unix(0, 0).UTC(), nil
 		}
-		return t.UTC(), nil
+		// Truncate to the millisecond precision DateTime64(3) stores, so the
+		// in-memory value equals the value read back on restart and ColumnHash
+		// matches (see store.OpenVersions / derefTarget).
+		return t.UTC().Truncate(time.Millisecond), nil
 	}
 	return nil, fmt.Errorf("unsupported column type %q", c.Type)
 }
@@ -470,18 +487,15 @@ func (in *Ingester) enqueue(table string, row store.Row, close *closeOp) {
 	}
 }
 
-// priorOpen returns the last open row written for uid, and whether the incoming
-// hash matches it (a resync / no-op). The informer delivers events for one
-// object sequentially, so the caller may build the new row between this lookup
-// and the matching remember() without racing itself.
-func (in *Ingester) priorOpen(uid, hash string) (prior store.Row, hadPrior, same bool) {
+// lookup returns the last-state (open row + its column hash) written for uid.
+// The informer delivers events for one object sequentially, so the caller may
+// build the new row and compare hashes between this lookup and the matching
+// remember() without racing itself.
+func (in *Ingester) lookup(uid string) (prev lastState, hadPrior bool) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	prev, ok := in.last[uid]
-	if !ok {
-		return store.Row{}, false, false
-	}
-	return prev.row, true, prev.hash == hash
+	return prev, ok
 }
 
 // remember records the row just written as uid's open version.
