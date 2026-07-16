@@ -10,8 +10,9 @@ import (
 // the anchor object only (single changed object per event).
 type srcLookup func(source string) map[string]interface{}
 
-// Passes reports whether every filter accepts the object. Filters are ordered
-// cheap-first (regex last); the first rejecting filter short-circuits.
+// Passes reports whether every filter group accepts the object (AND across
+// groups, OR within a group). Groups are ordered cheap-first (regex last); the
+// first rejecting group short-circuits.
 func (cr *CompiledResource) Passes(ev *collector.Evaluator, lookup srcLookup) bool {
 	for i := range cr.Filters {
 		if !cr.Filters[i].matches(ev, lookup) {
@@ -19,6 +20,16 @@ func (cr *CompiledResource) Passes(ev *collector.Evaluator, lookup srcLookup) bo
 		}
 	}
 	return true
+}
+
+// matches reports whether any leaf in the group accepts the object (OR).
+func (g *CompiledFilterGroup) matches(ev *collector.Evaluator, lookup srcLookup) bool {
+	for i := range g.Leaves {
+		if g.Leaves[i].matches(ev, lookup) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *CompiledFilter) matches(ev *collector.Evaluator, lookup srcLookup) bool {

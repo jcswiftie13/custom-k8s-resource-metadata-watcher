@@ -791,7 +791,7 @@ history:
 
 除了 `watch.resources` 的 **server 端 `labelSelector`／`fieldSelector`**（只支援 k8s 的 `=`／`in`／`exists`，
 **不支援 regex**）之外，`filters` 可對「watch 回來的任意欄位值」再做一層 **client 端**過濾，**符合才寫入**。
-同一資源的多個 filter 為 **AND**。
+同一資源的多個頂層 filter 為 **AND**；一個頂層 entry 可以改用 `anyOf` 宣告 **OR 群組**（任一子條件符合即通過）。
 
 | 欄位 | 說明 |
 |------|------|
@@ -800,9 +800,21 @@ history:
 | `value` | scalar 運算元（`equals`/`prefix`/`suffix`/`contains`/`regex`）|
 | `values` | `op: in` 的集合 |
 | `negate` | 反轉結果 |
+| `anyOf` | OR 群組：子條件（同上述 leaf 欄位）任一符合即通過；與所有 leaf 欄位**互斥**，且**不可再巢狀** `anyOf`（僅一層）。群組本身不支援 `negate`（`NOT(a OR b)` 可用兩個頂層 negated leaf 表達）；子條件內的 `negate` 照常可用 |
+
+```yaml
+filters:
+  # 頂層 entries 彼此 AND
+  - { path: "spec.type", op: in, values: [LoadBalancer, NodePort] }
+  # anyOf 內子條件 OR
+  - anyOf:
+      - { path: "metadata.namespace", op: prefix, value: "prod-" }
+      - { path: "metadata.labels['tier']", op: equals, value: "critical" }
+```
 
 **效能**：regex 用 Go RE2（線性時間、無 catastrophic backtracking）；編譯一次於啟動（壞 pattern 立即 fail）。
-執行時 **非 regex filter 先算、regex 最後**，遇第一個不符即短路；只抽取 filter 引用到的 path。regex **無法**
+執行時 **非 regex filter 先算、regex 最後**（頂層以群組為單位排序，`anyOf` 群組內亦同），遇第一個不符的頂層
+entry 即短路（`anyOf` 內則遇第一個符合即短路）；只抽取 filter 引用到的 path。regex **無法**
 下推給 apiserver，只能在此 client 端做——這也是本層存在的原因。
 
 ### 14.4 Schema 由誰定義（`createSchema`）

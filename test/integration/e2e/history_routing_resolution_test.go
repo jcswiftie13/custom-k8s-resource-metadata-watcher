@@ -107,7 +107,7 @@ func TestHistory_RoutingResolution(t *testing.T) {
 	setServiceLBIngressIP(t, dyn, ns, "ingress-lb", ingressIP)
 
 	// Backend Services: NodePort so they pass the history filter
-	// (spec.type in LoadBalancer,NodePort). Both exist from the start; only the
+	// (anyOf: spec.type equals LoadBalancer/NodePort). Both exist from the start; only the
 	// VirtualService's destination changes between versions.
 	for _, name := range []string{"backend-a", "backend-b"} {
 		createObject(t, dyn, svcGVR, ns, map[string]interface{}{

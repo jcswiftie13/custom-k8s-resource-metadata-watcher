@@ -230,14 +230,90 @@ func TestFilters_AndSemanticsAndRegexOrdering(t *testing.T) {
 			{Extract: config.Extract{Path: "metadata.name"}, Op: "equals", Value: "does-not-match"},
 		},
 	})
-	if cr.Filters[0].isRegex {
+	if cr.Filters[0].Leaves[0].isRegex {
 		t.Fatal("regex filter must be ordered last, not first")
 	}
-	if cr.Filters[len(cr.Filters)-1].Regex == nil {
+	if cr.Filters[len(cr.Filters)-1].Leaves[0].Regex == nil {
 		t.Fatal("last filter should be the regex")
 	}
 	if cr.Passes(collector.NewEvaluator(), anchorLookup(sampleService())) {
 		t.Fatal("AND semantics: a failing filter must reject the object")
+	}
+}
+
+func TestFilters_AnyOf(t *testing.T) {
+	obj := sampleService() // namespace=prod-web, labels{app:api, tier:frontend}
+	ev := collector.NewEvaluator()
+	prefixProd := config.HistoryFilter{Extract: config.Extract{Path: "metadata.namespace"}, Op: "prefix", Value: "prod-"}
+	tierCritical := config.HistoryFilter{Extract: config.Extract{Path: `metadata.labels["tier"]`}, Op: "equals", Value: "critical"}
+	nsStaging := config.HistoryFilter{Extract: config.Extract{Path: "metadata.namespace"}, Op: "equals", Value: "staging"}
+
+	cases := []struct {
+		name    string
+		filters []config.HistoryFilter
+		want    bool
+	}{
+		{"first child passes", []config.HistoryFilter{{AnyOf: []config.HistoryFilter{prefixProd, tierCritical}}}, true},
+		{"second child passes", []config.HistoryFilter{{AnyOf: []config.HistoryFilter{nsStaging, prefixProd}}}, true},
+		{"all children fail", []config.HistoryFilter{{AnyOf: []config.HistoryFilter{nsStaging, tierCritical}}}, false},
+		{"anyOf AND failing leaf", []config.HistoryFilter{
+			{AnyOf: []config.HistoryFilter{prefixProd, tierCritical}},
+			nsStaging,
+		}, false},
+		{"anyOf AND passing leaf", []config.HistoryFilter{
+			{AnyOf: []config.HistoryFilter{nsStaging, prefixProd}},
+			{Extract: config.Extract{Path: "metadata.name"}, Op: "equals", Value: "api"},
+		}, true},
+		{"negated child inside anyOf", []config.HistoryFilter{
+			{AnyOf: []config.HistoryFilter{
+				nsStaging,
+				{Extract: config.Extract{Path: `metadata.labels["tier"]`}, Op: "equals", Value: "critical", Negate: true},
+			}},
+		}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cr := mustCompile(t, config.HistoryResource{
+				Kind:    "Service",
+				Columns: []config.HistoryColumn{{Extract: config.Extract{Path: "metadata.name"}, Name: "name", Type: "String"}},
+				Filters: tc.filters,
+			})
+			if got := cr.Passes(ev, anchorLookup(obj)); got != tc.want {
+				t.Fatalf("Passes = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFilters_AnyOfRegexOrdering(t *testing.T) {
+	// A regex-bearing anyOf group and a plain equals leaf: the plain group must
+	// come first, the regex group last, and within the group the regex leaf last.
+	cr := mustCompile(t, config.HistoryResource{
+		Kind:    "Service",
+		Columns: []config.HistoryColumn{{Extract: config.Extract{Path: "metadata.name"}, Name: "name", Type: "String"}},
+		Filters: []config.HistoryFilter{
+			{AnyOf: []config.HistoryFilter{
+				{Extract: config.Extract{Path: "metadata.namespace"}, Op: "regex", Value: "^prod-"},
+				{Extract: config.Extract{Path: "metadata.name"}, Op: "equals", Value: "api"},
+			}},
+			{Extract: config.Extract{Path: "metadata.name"}, Op: "equals", Value: "api"},
+		},
+	})
+	if len(cr.Filters) != 2 {
+		t.Fatalf("groups = %d, want 2", len(cr.Filters))
+	}
+	if cr.Filters[0].hasRegex || len(cr.Filters[0].Leaves) != 1 {
+		t.Fatalf("plain leaf group must be first, got %+v", cr.Filters[0])
+	}
+	g := cr.Filters[1]
+	if !g.hasRegex || len(g.Leaves) != 2 {
+		t.Fatalf("regex-bearing group must be last, got %+v", g)
+	}
+	if g.Leaves[0].isRegex || !g.Leaves[len(g.Leaves)-1].isRegex {
+		t.Fatal("within a group the regex leaf must be ordered last")
+	}
+	if !cr.Passes(collector.NewEvaluator(), anchorLookup(sampleService())) {
+		t.Fatal("object should pass both groups")
 	}
 }
 

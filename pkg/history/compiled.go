@@ -46,14 +46,21 @@ type CompiledFilter struct {
 	Extract collector.CompiledExtract
 }
 
-// CompiledResource holds the compiled columns and filters for one Kind. Filters
-// are ordered cheap-first (non-regex before regex) so short-circuiting avoids
-// regex cost whenever a cheaper predicate already fails.
+// CompiledFilterGroup is one top-level filter entry: 1..N leaves OR'd
+// together. A plain (non-anyOf) filter compiles to a single-leaf group.
+type CompiledFilterGroup struct {
+	Leaves   []CompiledFilter // regex leaves ordered last within the group
+	hasRegex bool             // any leaf is regex; used for top-level ordering
+}
+
+// CompiledResource holds the compiled columns and filters for one Kind. Filter
+// groups are ordered cheap-first (regex-free groups before regex-bearing ones)
+// so short-circuiting avoids regex cost whenever a cheaper group already fails.
 type CompiledResource struct {
 	Kind    string
 	Table   string
 	Columns []CompiledColumn
-	Filters []CompiledFilter
+	Filters []CompiledFilterGroup
 }
 
 // Compile builds a CompiledResource from one resource config (without injecting
@@ -69,36 +76,67 @@ func Compile(r config.HistoryResource) (*CompiledResource, error) {
 		cr.Columns = append(cr.Columns, cc)
 	}
 
-	var regexFilters []CompiledFilter
-	for _, f := range r.Filters {
-		ce, err := collector.CompileExtract(f.Extract)
-		if err != nil {
-			return nil, fmt.Errorf("filter (op=%s): %w", f.Op, err)
-		}
-		cf := CompiledFilter{Op: f.Op, Value: f.Value, Negate: f.Negate, Extract: ce}
-		switch f.Op {
-		case "in":
-			cf.Values = make(map[string]struct{}, len(f.Values))
-			for _, v := range f.Values {
-				cf.Values[v] = struct{}{}
+	var regexGroups []CompiledFilterGroup
+	for i, f := range r.Filters {
+		var g CompiledFilterGroup
+		if len(f.AnyOf) > 0 {
+			// OR group: cheap leaves first (OR short-circuits on first success),
+			// regex leaves last.
+			var regexLeaves []CompiledFilter
+			for j, child := range f.AnyOf {
+				leaf, err := compileLeafFilter(child)
+				if err != nil {
+					return nil, fmt.Errorf("filter[%d].anyOf[%d]: %w", i, j, err)
+				}
+				if leaf.isRegex {
+					regexLeaves = append(regexLeaves, leaf)
+				} else {
+					g.Leaves = append(g.Leaves, leaf)
+				}
 			}
-		case "regex":
-			re, err := regexp.Compile(f.Value)
-			if err != nil {
-				return nil, fmt.Errorf("filter (op=regex): %w", err)
-			}
-			cf.Regex = re
-			cf.isRegex = true
-		}
-		if cf.isRegex {
-			regexFilters = append(regexFilters, cf)
+			g.Leaves = append(g.Leaves, regexLeaves...)
+			g.hasRegex = len(regexLeaves) > 0
 		} else {
-			cr.Filters = append(cr.Filters, cf)
+			leaf, err := compileLeafFilter(f)
+			if err != nil {
+				return nil, fmt.Errorf("filter[%d]: %w", i, err)
+			}
+			g.Leaves = []CompiledFilter{leaf}
+			g.hasRegex = leaf.isRegex
+		}
+		if g.hasRegex {
+			regexGroups = append(regexGroups, g)
+		} else {
+			cr.Filters = append(cr.Filters, g)
 		}
 	}
-	// Regex filters run last so a failing cheap predicate short-circuits first.
-	cr.Filters = append(cr.Filters, regexFilters...)
+	// Regex-bearing groups run last so a failing cheap group short-circuits first.
+	cr.Filters = append(cr.Filters, regexGroups...)
 	return cr, nil
+}
+
+// compileLeafFilter compiles one leaf predicate (a filter without anyOf).
+func compileLeafFilter(f config.HistoryFilter) (CompiledFilter, error) {
+	ce, err := collector.CompileExtract(f.Extract)
+	if err != nil {
+		return CompiledFilter{}, fmt.Errorf("(op=%s): %w", f.Op, err)
+	}
+	cf := CompiledFilter{Op: f.Op, Value: f.Value, Negate: f.Negate, Extract: ce}
+	switch f.Op {
+	case "in":
+		cf.Values = make(map[string]struct{}, len(f.Values))
+		for _, v := range f.Values {
+			cf.Values[v] = struct{}{}
+		}
+	case "regex":
+		re, err := regexp.Compile(f.Value)
+		if err != nil {
+			return CompiledFilter{}, fmt.Errorf("(op=regex): %w", err)
+		}
+		cf.Regex = re
+		cf.isRegex = true
+	}
+	return cf, nil
 }
 
 // CompileAll compiles every resource in the history config, prepending any

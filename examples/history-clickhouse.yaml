@@ -95,4 +95,9 @@ history:
         - { name: ingress_ips, type: "Array(String)", path: "status.loadBalancer.ingress[*].ip", index: bloom_filter }
         - { name: selector_kv, type: "Array(String)", path: "spec.selector", encode: kv }
       filters:
+        # Top-level filters are AND-combined; an anyOf entry passes when ANY of
+        # its child conditions matches (OR). anyOf may not nest further anyOf.
         - { path: "spec.type", op: in, values: ["LoadBalancer", "NodePort"] }
+        - anyOf:
+            - { path: "metadata.namespace", op: prefix, value: "prod-" }
+            - { path: "metadata.labels['tier']", op: equals, value: "critical" }

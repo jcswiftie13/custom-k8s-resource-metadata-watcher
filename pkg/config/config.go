@@ -991,8 +991,10 @@ func (c HistoryColumn) IsConstant() bool {
 	return c.Value != "" || c.ValueEnv != ""
 }
 
-// HistoryFilter declares one client-side predicate on an extracted field. All
-// filters on a resource must pass (AND) for the object to be written.
+// HistoryFilter declares one client-side predicate on an extracted field.
+// Top-level filter entries on a resource are AND-combined: every entry must
+// pass for the object to be written. An entry is either a leaf predicate
+// (Extract + Op) or an AnyOf OR-group of leaf predicates.
 type HistoryFilter struct {
 	Extract
 	// Op is one of the allowlisted operators.
@@ -1003,6 +1005,10 @@ type HistoryFilter struct {
 	Values []string `json:"values,omitempty"`
 	// Negate inverts the match result.
 	Negate bool `json:"negate,omitempty"`
+	// AnyOf, when set, makes this entry an OR group: it passes if any child
+	// leaf filter passes. Mutually exclusive with all leaf fields; children
+	// may not nest anyOf (one level only).
+	AnyOf []HistoryFilter `json:"anyOf,omitempty"`
 }
 
 func (h History) validate(reg *Registry) error {
@@ -1171,6 +1177,24 @@ func validateConstantValue(typ, value, valueEnv string) error {
 }
 
 func (f *HistoryFilter) validate(reg *Registry) error {
+	if f.AnyOf != nil {
+		if len(f.AnyOf) == 0 {
+			return fmt.Errorf("anyOf: requires at least one child filter")
+		}
+		if f.Op != "" || f.Value != "" || len(f.Values) > 0 || f.Negate ||
+			f.Path != "" || f.Source != "" || len(f.Fallbacks) > 0 || f.OnMissing != nil {
+			return fmt.Errorf("anyOf is mutually exclusive with path/source/fallbacks/onMissing/op/value/values/negate")
+		}
+		for i := range f.AnyOf {
+			if f.AnyOf[i].AnyOf != nil {
+				return fmt.Errorf("anyOf[%d]: nested anyOf is not supported (one level only)", i)
+			}
+			if err := f.AnyOf[i].validate(reg); err != nil {
+				return fmt.Errorf("anyOf[%d]: %w", i, err)
+			}
+		}
+		return nil
+	}
 	if _, ok := historyFilterOps[f.Op]; !ok {
 		return fmt.Errorf("op %q: unsupported (allowed: exists, equals, notEquals, prefix, suffix, contains, in, regex)", f.Op)
 	}

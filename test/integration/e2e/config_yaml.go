@@ -98,7 +98,11 @@ history:
         - { name: source, type: "String", value: "metadata-exporter" }
         - { name: team, type: "String", path: 'metadata.labels["team"]', onMissing: "unknown" }
       filters:
-        - { path: "spec.type", op: in, values: ["LoadBalancer", "NodePort"] }
+        # Semantically equivalent to op:in over [LoadBalancer, NodePort];
+        # written as anyOf to exercise OR groups end-to-end.
+        - anyOf:
+            - { path: "spec.type", op: equals, value: "LoadBalancer" }
+            - { path: "spec.type", op: equals, value: "NodePort" }
     - kind: Deployment
       table: deploy_versions
       columns:

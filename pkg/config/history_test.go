@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 )
 
 func boolPtr(b bool) *bool { return &b }
@@ -240,6 +242,39 @@ func TestHistory_ValidationErrors(t *testing.T) {
 		{"constants missing value", func(c *Config) {
 			c.History.Constants = []HistoryConstant{{Name: "cluster_name", Type: "String"}}
 		}, "value or valueEnv is required"},
+		{"anyOf empty", func(c *Config) {
+			c.History.Resources[0].Filters[0] = HistoryFilter{AnyOf: []HistoryFilter{}}
+		}, "at least one child"},
+		{"anyOf with op", func(c *Config) {
+			c.History.Resources[0].Filters[0] = HistoryFilter{
+				Op:    "equals",
+				AnyOf: []HistoryFilter{{Extract: Extract{Path: "metadata.name"}, Op: "exists"}},
+			}
+		}, "mutually exclusive"},
+		{"anyOf with path", func(c *Config) {
+			c.History.Resources[0].Filters[0] = HistoryFilter{
+				Extract: Extract{Path: "metadata.name"},
+				AnyOf:   []HistoryFilter{{Extract: Extract{Path: "metadata.name"}, Op: "exists"}},
+			}
+		}, "mutually exclusive"},
+		{"anyOf with negate", func(c *Config) {
+			c.History.Resources[0].Filters[0] = HistoryFilter{
+				Negate: true,
+				AnyOf:  []HistoryFilter{{Extract: Extract{Path: "metadata.name"}, Op: "exists"}},
+			}
+		}, "mutually exclusive"},
+		{"anyOf nested", func(c *Config) {
+			c.History.Resources[0].Filters[0] = HistoryFilter{
+				AnyOf: []HistoryFilter{{
+					AnyOf: []HistoryFilter{{Extract: Extract{Path: "metadata.name"}, Op: "exists"}},
+				}},
+			}
+		}, "nested anyOf"},
+		{"anyOf bad child op", func(c *Config) {
+			c.History.Resources[0].Filters[0] = HistoryFilter{
+				AnyOf: []HistoryFilter{{Extract: Extract{Path: "metadata.name"}, Op: "glob"}},
+			}
+		}, "op \"glob\""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -253,6 +288,56 @@ func TestHistory_ValidationErrors(t *testing.T) {
 				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantSub)
 			}
 		})
+	}
+}
+
+// TestHistory_AnyOfValidates pins the positive path: a two-child anyOf group
+// alongside a plain leaf filter is a valid config.
+func TestHistory_AnyOfValidates(t *testing.T) {
+	c := baseHistoryConfig()
+	c.History.Resources[0].Filters = append(c.History.Resources[0].Filters, HistoryFilter{
+		AnyOf: []HistoryFilter{
+			{Extract: Extract{Path: "metadata.namespace"}, Op: "prefix", Value: "prod-"},
+			{Extract: Extract{Path: "metadata.labels.tier"}, Op: "equals", Value: "critical", Negate: true},
+		},
+	})
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+}
+
+// TestHistory_AnyOfYAML guards the tag layout: anyOf children unmarshal with
+// the embedded Extract fields promoted flat, same as top-level filters.
+func TestHistory_AnyOfYAML(t *testing.T) {
+	raw := []byte(`
+filters:
+  - path: spec.type
+    op: in
+    values: [LoadBalancer, NodePort]
+  - anyOf:
+      - path: metadata.namespace
+        op: prefix
+        value: prod-
+      - path: metadata.labels.tier
+        op: equals
+        value: critical
+`)
+	var r HistoryResource
+	if err := yaml.Unmarshal(raw, &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(r.Filters) != 2 {
+		t.Fatalf("filters = %d, want 2", len(r.Filters))
+	}
+	if r.Filters[0].AnyOf != nil || r.Filters[0].Op != "in" {
+		t.Fatalf("leaf filter parsed wrong: %+v", r.Filters[0])
+	}
+	g := r.Filters[1]
+	if len(g.AnyOf) != 2 || g.Op != "" || g.Path != "" {
+		t.Fatalf("anyOf group parsed wrong: %+v", g)
+	}
+	if g.AnyOf[0].Path != "metadata.namespace" || g.AnyOf[0].Op != "prefix" || g.AnyOf[0].Value != "prod-" {
+		t.Fatalf("anyOf child parsed wrong: %+v", g.AnyOf[0])
 	}
 }
 
