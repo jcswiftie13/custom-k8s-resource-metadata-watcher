@@ -742,6 +742,10 @@ history:
     createSchema: true          # dev；prod 預設 false（見 14.4）
     closeMode: rewrite          # rewrite（預設）| update（需 CH >= 25.8，見 14.5）
     batch: { maxRows: 5000, flushIntervalMs: 1000 }
+    reconnect:                  # 背景連線／重連調校（皆選填，見 14.7）
+      initialBackoffMs: 1000    # 首次重試間隔
+      maxBackoffMs: 30000       # 重試間隔上限（指數退避 ×2，±20% jitter）
+      pingTimeoutMs: 5000       # 單次連線／健康檢查的逾時
     # --- 身分驗證（皆選填，見 14.6）---
     username: default
     passwordEnv: CH_PASSWORD    # 由 k8s Secret 注入的 env 變數（優先於 password）
@@ -879,6 +883,37 @@ entry 即短路（`anyOf` 內則遇第一個符合即短路）；只抽取 filte
   `clickhouse://host:8123` 仍是 native，連到 HTTP listener 會失敗。HTTP 寫入路徑會預設啟用 LZ4 block compression；
   DSN 若已設 `compress=` 則不覆寫。e2e：`TestHistory_ClickHouseHTTP`。
 - 未涵蓋：mTLS client 憑證、LDAP/Kerberos（未來如需再擴充）。
+
+### 14.7 降級啟動與背景重連（`store.reconnect`）
+
+ClickHouse 連不上**不會**阻止 exporter 啟動：metrics/watcher 功能照常運作，history 子系統由背景 manager
+以指數退避（`initialBackoffMs` 起 ×2、上限 `maxBackoffMs`、±20% jitter）持續重試連線，連上後才依序執行
+schema 驗證 → 重啟復原（Recover）→ 註冊事件 handler 開始寫入。晚註冊時 informer cache 會完整重放為 Add
+事件，等同重新 LIST——**斷線窗口內的「最終狀態」不會漏**，但窗口內的中間版本（改兩次只留一版、建了又刪）
+不會被記錄，語意與 exporter 重啟相同。連線後另有 reconciliation sweep：在停機／斷線期間**被刪除**的物件，
+其殘留的 open row 會以觀測時間補上 `valid_to`。
+
+執行期行為：
+
+- manager 每 15s ping 一次；失敗即進入 degraded（`/readyz` 的 `history.state` 與
+  `exporter_history_store_connected=0` 可觀測），期間寫入 fail-soft——失敗批次直接丟棄並計數
+  （`exporter_history_write_failures_total`），不會重啟 process。
+- **恢復語意 = 重啟語意**：恢復連線時，若斷線期間有任何資料損失（flush 失敗、queue 淘汰、
+  close 側緩衝溢出），manager 會 teardown 現有 ingest pipeline 並重走一次初始化
+  （Recover → cache replay → reconciliation sweep），把所有 resource 的現況補寫回 ClickHouse——
+  斷線期間變更過的物件不會停留在舊版本。零損失的短暫閃斷則原地恢復、不重建。重建之間有
+  最小間隔（60s）避免 flapping 造成重建風暴。斷線期間的**中間版本**（改兩次只留一版、
+  建了又刪）仍會遺失，與 process 重啟的語意一致。
+- ingest queue（容量 `2×batch.maxRows`）滿時**丟最舊的 insert**（不再是舊版的阻塞等待；
+  `exporter_history_dropped_events_total{kind="insert"}` 計數）。close 操作不丟——被擠出時進側緩衝區、
+  下輪 flush 優先送出，避免留下永不關閉的 stale open row；僅在側緩衝區也滿（極端積壓）時才丟並計入
+  `kind="close"`。**注意**：這代表 ClickHouse 只是「慢」（未斷線）且事件量持續超過寫入速率時，可能丟棄
+  本來等一下就補得上的版本——以 dropped counter 告警即可察覺。
+- `/healthz` 維持純 liveness（process 活著即 200）；`/readyz` 在 informer cache 同步前回 503，
+  之後回 200 並附上 history 狀態 JSON——**history 降級不會讓 pod 退出 ready**，這正是本設計的目的。
+
+相關 metrics：`exporter_history_store_connected`（gauge）、`exporter_history_dropped_events_total{kind}`、
+`exporter_history_write_failures_total`、`exporter_history_reconnect_attempts_total`。
 
 ---
 

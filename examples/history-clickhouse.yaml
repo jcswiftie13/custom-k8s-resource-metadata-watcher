@@ -50,6 +50,14 @@ history:
     batch:
       maxRows: 5000
       flushIntervalMs: 1000
+    # Background connect/reconnect tuning (all optional). ClickHouse being
+    # unreachable never prevents the exporter from starting: history retries
+    # with exponential backoff (initial → doubling → max, ±20% jitter) and
+    # begins ingesting once connected. pingTimeoutMs bounds each attempt.
+    # reconnect:
+    #   initialBackoffMs: 1000
+    #   maxBackoffMs: 30000
+    #   pingTimeoutMs: 5000
     # Authentication (all optional; override credentials embedded in the DSN).
     # Prefer the *Env forms in production so secrets come from a k8s Secret
     # (mounted as env vars) instead of living in the ConfigMap.

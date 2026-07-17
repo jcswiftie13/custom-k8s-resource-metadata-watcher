@@ -780,6 +780,13 @@ const (
 	DefaultBatchFlushMs = 1000
 )
 
+// Reconnect defaults for the history store's background connect loop.
+const (
+	DefaultReconnectInitialBackoffMs = 1000
+	DefaultReconnectMaxBackoffMs     = 30000
+	DefaultReconnectPingTimeoutMs    = 5000
+)
+
 // History configures the optional event-driven ClickHouse version store.
 // Every informer event for a declared resource appends a version row; the store
 // is append-only, and valid_to is materialized by re-inserting the superseded
@@ -837,6 +844,11 @@ type StoreConfig struct {
 	CloseMode string `json:"closeMode,omitempty"`
 	// Batch tunes the ingest writer.
 	Batch BatchConfig `json:"batch,omitempty"`
+	// Reconnect tunes the background connect/reconnect loop. ClickHouse being
+	// unreachable never prevents the exporter from starting: the history
+	// manager keeps retrying with exponential backoff and begins ingesting
+	// once a connection succeeds.
+	Reconnect ReconnectConfig `json:"reconnect,omitempty"`
 
 	// --- Authentication (all optional). When set, these override any
 	// credentials embedded in DSN. For secrets, prefer the *Env variants
@@ -941,6 +953,40 @@ func (b BatchConfig) FlushIntervalMsOrDefault() int {
 	return DefaultBatchFlushMs
 }
 
+// ReconnectConfig tunes the history store's background connect/reconnect loop.
+// Backoff between failed connection attempts doubles from InitialBackoffMs up
+// to MaxBackoffMs (with ±20% jitter, not configurable); PingTimeoutMs bounds
+// each individual connect/ping attempt.
+type ReconnectConfig struct {
+	InitialBackoffMs int `json:"initialBackoffMs,omitempty"`
+	MaxBackoffMs     int `json:"maxBackoffMs,omitempty"`
+	PingTimeoutMs    int `json:"pingTimeoutMs,omitempty"`
+}
+
+// InitialBackoffMsOrDefault returns the configured initial backoff or the default.
+func (r ReconnectConfig) InitialBackoffMsOrDefault() int {
+	if r.InitialBackoffMs > 0 {
+		return r.InitialBackoffMs
+	}
+	return DefaultReconnectInitialBackoffMs
+}
+
+// MaxBackoffMsOrDefault returns the configured backoff cap or the default.
+func (r ReconnectConfig) MaxBackoffMsOrDefault() int {
+	if r.MaxBackoffMs > 0 {
+		return r.MaxBackoffMs
+	}
+	return DefaultReconnectMaxBackoffMs
+}
+
+// PingTimeoutMsOrDefault returns the configured per-attempt timeout or the default.
+func (r ReconnectConfig) PingTimeoutMsOrDefault() int {
+	if r.PingTimeoutMs > 0 {
+		return r.PingTimeoutMs
+	}
+	return DefaultReconnectPingTimeoutMs
+}
+
 // HistoryResource declares one watched Kind's columns and filters. The Kind
 // must also appear in watch.resources so the informer cache is populated.
 type HistoryResource struct {
@@ -1030,6 +1076,14 @@ func (h History) validate(reg *Registry) error {
 		h.Store.Password != "" || h.Store.PasswordEnv != ""
 	if hasToken && hasBasic {
 		return fmt.Errorf("store: token/tokenEnv is mutually exclusive with username/password (JWT replaces basic auth)")
+	}
+	rc := h.Store.Reconnect
+	if rc.InitialBackoffMs < 0 || rc.MaxBackoffMs < 0 || rc.PingTimeoutMs < 0 {
+		return fmt.Errorf("store.reconnect: backoff/timeout values must not be negative")
+	}
+	if rc.InitialBackoffMsOrDefault() > rc.MaxBackoffMsOrDefault() {
+		return fmt.Errorf("store.reconnect: initialBackoffMs (%d) must not exceed maxBackoffMs (%d)",
+			rc.InitialBackoffMsOrDefault(), rc.MaxBackoffMsOrDefault())
 	}
 	if len(h.Resources) == 0 {
 		return fmt.Errorf("resources: at least one resource is required when a history block is declared")

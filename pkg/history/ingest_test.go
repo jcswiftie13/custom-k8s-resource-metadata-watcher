@@ -2,10 +2,12 @@ package history
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/example/metadata-exporter/pkg/config"
@@ -18,14 +20,19 @@ type fakeClose struct {
 }
 
 type fakeStore struct {
-	tables map[string][]store.Row
-	closes []fakeClose
-	open   map[string][]store.OpenVersion // OpenVersions fixture for Recover tests
-	ops    []string                       // "batch:<table>" / "close:<table>" in execution order
+	tables   map[string][]store.Row
+	closes   []fakeClose
+	open     map[string][]store.OpenVersion // OpenVersions fixture for Recover tests
+	ops      []string                       // "batch:<table>" / "close:<table>" in execution order
+	batchErr bool                           // WriteBatch fails when set
+	closeErr bool                           // CloseVersion fails when set
 }
 
 func (f *fakeStore) EnsureSchema(_ context.Context, _ []store.TableSchema) error { return nil }
 func (f *fakeStore) WriteBatch(_ context.Context, table string, rows []store.Row) error {
+	if f.batchErr {
+		return errors.New("write batch failed")
+	}
 	if f.tables == nil {
 		f.tables = map[string][]store.Row{}
 	}
@@ -34,6 +41,9 @@ func (f *fakeStore) WriteBatch(_ context.Context, table string, rows []store.Row
 	return nil
 }
 func (f *fakeStore) CloseVersion(_ context.Context, table, namespace, name, uid string, validFrom, closeAt time.Time) error {
+	if f.closeErr {
+		return errors.New("close version failed")
+	}
 	f.closes = append(f.closes, fakeClose{table, namespace, name, uid, validFrom, closeAt})
 	f.ops = append(f.ops, "close:"+table)
 	return nil
@@ -41,7 +51,8 @@ func (f *fakeStore) CloseVersion(_ context.Context, table, namespace, name, uid 
 func (f *fakeStore) OpenVersions(_ context.Context, table string) ([]store.OpenVersion, error) {
 	return f.open[table], nil
 }
-func (f *fakeStore) Close() error { return nil }
+func (f *fakeStore) Ping(_ context.Context) error { return nil }
+func (f *fakeStore) Close() error                 { return nil }
 
 func svcObj(uid, ns, clusterIP, resourceVersion string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]interface{}{
@@ -75,7 +86,7 @@ func newTestIngesterMode(t *testing.T, closeMode string, fs *fakeStore) (*Ingest
 			{Extract: config.Extract{Path: "metadata.namespace"}, Op: "prefix", Value: "prod-"},
 		},
 	})
-	in := NewIngester(fs, nil, []*CompiledResource{cr}, config.BatchConfig{}, closeMode, slog.Default())
+	in := NewIngester(fs, nil, []*CompiledResource{cr}, config.BatchConfig{}, closeMode, slog.Default(), nil)
 	return in, cr
 }
 
@@ -299,7 +310,6 @@ func TestIngest_UpdateClose_FlushOrder(t *testing.T) {
 	in, cr := newTestIngesterMode(t, config.CloseModeUpdate, fs)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	in.ctxDone = ctx.Done()
 	done := make(chan struct{})
 	go func() { in.loop(ctx); close(done) }()
 
@@ -432,7 +442,7 @@ func TestIngest_ConstantsAndOnMissing(t *testing.T) {
 		t.Fatalf("CompileAll: %v", err)
 	}
 	cr := rs[0]
-	in := NewIngester(&fakeStore{}, nil, rs, config.BatchConfig{}, config.CloseModeRewrite, slog.Default())
+	in := NewIngester(&fakeStore{}, nil, rs, config.BatchConfig{}, config.CloseModeRewrite, slog.Default(), nil)
 
 	in.onEvent(cr, svcObj("uid-c", "prod-web", "10.0.0.1", "1"), eventAdd)
 	q := drain(in)
@@ -459,5 +469,209 @@ func TestIngest_ConstantsAndOnMissing(t *testing.T) {
 	newOpen := q[1].row
 	if newOpen.Values["cluster_name"] != "prod" || newOpen.Values["cluster_ip"] != "10.0.0.2" {
 		t.Fatalf("updated row = %+v", newOpen.Values)
+	}
+}
+
+// --- drop-oldest / close-stash behavior -------------------------------------
+
+// smallQueueIngester builds an ingester with queue capacity 2 (MaxRows: 1) and
+// real (unregistered) metrics, without starting the flush loop.
+func smallQueueIngester(t *testing.T, closeMode string, fs *fakeStore) (*Ingester, *CompiledResource, *Metrics) {
+	t.Helper()
+	cr := mustCompile(t, config.HistoryResource{
+		Kind:  "Service",
+		Table: "svc_versions",
+		Columns: []config.HistoryColumn{
+			{Extract: config.Extract{Path: "spec.clusterIP"}, Name: "cluster_ip", Type: "String"},
+		},
+	})
+	m := NewMetrics(nil)
+	in := NewIngester(fs, nil, []*CompiledResource{cr}, config.BatchConfig{MaxRows: 1}, closeMode, slog.Default(), m)
+	return in, cr, m
+}
+
+func counterValue(t *testing.T, m *Metrics, kind string) float64 {
+	t.Helper()
+	return testutil.ToFloat64(m.dropped.WithLabelValues(kind))
+}
+
+// A full queue must never block the informer handler: the oldest INSERT is
+// evicted (counted), newest ops win.
+func TestIngest_EnqueueDropsOldestInsertWhenFull(t *testing.T) {
+	in, _, m := smallQueueIngester(t, config.CloseModeRewrite, &fakeStore{})
+
+	mkRow := func(ip string) queued {
+		return queued{table: "svc_versions", row: store.Row{UID: "uid-" + ip, Values: map[string]any{"cluster_ip": ip}}}
+	}
+	done := make(chan struct{})
+	go func() {
+		in.enqueue(mkRow("1"))
+		in.enqueue(mkRow("2"))
+		in.enqueue(mkRow("3")) // queue cap is 2: must evict "1", not block
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("enqueue blocked on a full queue")
+	}
+
+	q := drain(in)
+	if len(q) != 2 || q[0].row.UID != "uid-2" || q[1].row.UID != "uid-3" {
+		t.Fatalf("queue after eviction = %+v", q)
+	}
+	if got := counterValue(t, m, droppedKindInsert); got != 1 {
+		t.Fatalf("dropped{insert} = %v, want 1", got)
+	}
+	if got := in.droppedTotal.Load(); got != 1 {
+		t.Fatalf("droppedTotal = %d, want 1", got)
+	}
+}
+
+// Evicted closes are stashed, not dropped — in both close modes — and the next
+// flush sends them.
+func TestIngest_EvictedClosePreservedAndFlushed(t *testing.T) {
+	for _, mode := range []string{config.CloseModeUpdate, config.CloseModeRewrite} {
+		t.Run(mode, func(t *testing.T) {
+			fs := &fakeStore{}
+			in, _, m := smallQueueIngester(t, mode, fs)
+
+			prev := store.Row{Namespace: "prod-web", Name: "api", UID: "uid-1",
+				ValidFrom: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+				ValidTo:   store.FarFuture, Values: map[string]any{"cluster_ip": "10.0.0.1"}}
+			closeAt := prev.ValidFrom.Add(time.Hour)
+
+			in.enqueueClose("svc_versions", prev, closeAt) // will be evicted
+			in.enqueue(queued{table: "svc_versions", row: store.Row{UID: "uid-2", Values: map[string]any{"cluster_ip": "2"}}})
+			in.enqueue(queued{table: "svc_versions", row: store.Row{UID: "uid-3", Values: map[string]any{"cluster_ip": "3"}}})
+
+			if got := counterValue(t, m, droppedKindClose); got != 0 {
+				t.Fatalf("dropped{close} = %v, the evicted close must be stashed not dropped", got)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() { in.loop(ctx); close(done) }()
+			for len(in.queue) > 0 {
+				time.Sleep(time.Millisecond)
+			}
+			cancel()
+			<-done
+
+			if mode == config.CloseModeUpdate {
+				if len(fs.closes) != 1 || fs.closes[0].uid != "uid-1" || !fs.closes[0].closeAt.Equal(closeAt) {
+					t.Fatalf("stashed close not flushed: %+v", fs.closes)
+				}
+			} else {
+				// rewrite: the close is a closing row (valid_to materialized).
+				found := false
+				for _, r := range fs.tables["svc_versions"] {
+					if r.UID == "uid-1" && r.ValidTo.Equal(closeAt) {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("stashed closing row not flushed: %+v", fs.tables["svc_versions"])
+				}
+			}
+		})
+	}
+}
+
+// Only when the stash itself overflows (extreme backlog) is a close dropped
+// for real, under its own counter kind.
+func TestIngest_CloseStashOverflowCounted(t *testing.T) {
+	in, _, m := smallQueueIngester(t, config.CloseModeUpdate, &fakeStore{}) // closeStashMax = MaxRows = 1
+
+	prev := store.Row{Namespace: "prod-web", Name: "api", UID: "uid-1",
+		ValidFrom: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), ValidTo: store.FarFuture}
+	// Fill the queue with two closes, then push inserts to evict both: the
+	// first eviction lands in the stash, the second finds it full.
+	in.enqueueClose("svc_versions", prev, prev.ValidFrom.Add(time.Hour))
+	in.enqueueClose("svc_versions", prev, prev.ValidFrom.Add(2*time.Hour))
+	in.enqueue(queued{table: "svc_versions", row: store.Row{UID: "uid-2"}})
+	in.enqueue(queued{table: "svc_versions", row: store.Row{UID: "uid-3"}})
+
+	if got := counterValue(t, m, droppedKindClose); got != 1 {
+		t.Fatalf("dropped{close} = %v, want 1 (stash overflow)", got)
+	}
+	if got := len(in.drainCloseStash()); got != 1 {
+		t.Fatalf("stash size = %d, want 1", got)
+	}
+}
+
+// Store write failures during flush are counted (the batch is lost, fail-soft).
+func TestIngest_FlushFailureCounted(t *testing.T) {
+	fs := &fakeStore{batchErr: true, closeErr: true}
+	in, cr, m := smallQueueIngester(t, config.CloseModeUpdate, fs)
+
+	in.onEvent(cr, svcObj("uid-1", "prod-web", "10.0.0.1", "1"), eventAdd)
+	in.onEvent(cr, svcObj("uid-1", "prod-web", "10.0.0.2", "2"), eventUpdate)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { in.loop(ctx); close(done) }()
+	for len(in.queue) > 0 {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	// v1+v2 inserts fail in (at least) one WriteBatch call and the close fails
+	// in one CloseVersion call.
+	if got := testutil.ToFloat64(m.writeFailures); got < 2 {
+		t.Fatalf("writeFailures = %v, want >= 2", got)
+	}
+}
+
+// ReconcileOpens closes rows for objects that vanished (or were recreated
+// under a new uid) while nobody was watching, and leaves live ones alone.
+func TestIngest_ReconcileOpens(t *testing.T) {
+	vf := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	fs := &fakeStore{open: map[string][]store.OpenVersion{
+		"svc_versions": {
+			{Namespace: "prod-web", Name: "api", UID: "uid-live", Values: map[string]any{"cluster_ip": "1"}, ValidFrom: vf, IngestSeq: 1},
+			{Namespace: "prod-web", Name: "gone", UID: "uid-gone", Values: map[string]any{"cluster_ip": "2"}, ValidFrom: vf, IngestSeq: 2},
+			{Namespace: "prod-web", Name: "reborn", UID: "uid-old", Values: map[string]any{"cluster_ip": "3"}, ValidFrom: vf, IngestSeq: 3},
+		},
+	}}
+	cr := mustCompile(t, config.HistoryResource{
+		Kind:  "Service",
+		Table: "svc_versions",
+		Columns: []config.HistoryColumn{
+			{Extract: config.Extract{Path: "spec.clusterIP"}, Name: "cluster_ip", Type: "String"},
+		},
+	})
+	live := svcObj("uid-live", "prod-web", "1", "1")
+	live.SetName("api")
+	reborn := svcObj("uid-new", "prod-web", "3", "1") // same name, new uid
+	reborn.SetName("reborn")
+	inf := newFakeInformer(nil, live, reborn)
+
+	in := NewIngester(fs, fakeInformerSource{inf: inf}, []*CompiledResource{cr},
+		config.BatchConfig{}, config.CloseModeUpdate, slog.Default(), nil)
+	if err := in.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	if got := in.ReconcileOpens(); got != 2 {
+		t.Fatalf("ReconcileOpens closed %d, want 2 (uid-gone + uid-old)", got)
+	}
+	q := drain(in)
+	closedUIDs := map[string]bool{}
+	for _, op := range q {
+		if !op.isClose || op.close == nil {
+			t.Fatalf("expected only closeOps in queue, got %+v", op)
+		}
+		closedUIDs[op.close.uid] = true
+	}
+	if !closedUIDs["uid-gone"] || !closedUIDs["uid-old"] || len(closedUIDs) != 2 {
+		t.Fatalf("closed uids = %v", closedUIDs)
+	}
+	if _, ok := in.lookup("uid-live"); !ok {
+		t.Fatal("live uid must stay tracked")
+	}
+	// Idempotent: nothing left to close.
+	if got := in.ReconcileOpens(); got != 0 {
+		t.Fatalf("second ReconcileOpens closed %d, want 0", got)
 	}
 }

@@ -367,3 +367,46 @@ func TestHistory_ValueEnvColumn(t *testing.T) {
 		t.Fatalf("unexpected err: %v", err)
 	}
 }
+
+func TestReconnectConfig_Defaults(t *testing.T) {
+	var rc ReconnectConfig
+	if got := rc.InitialBackoffMsOrDefault(); got != DefaultReconnectInitialBackoffMs {
+		t.Fatalf("initial backoff default = %d", got)
+	}
+	if got := rc.MaxBackoffMsOrDefault(); got != DefaultReconnectMaxBackoffMs {
+		t.Fatalf("max backoff default = %d", got)
+	}
+	if got := rc.PingTimeoutMsOrDefault(); got != DefaultReconnectPingTimeoutMs {
+		t.Fatalf("ping timeout default = %d", got)
+	}
+	rc = ReconnectConfig{InitialBackoffMs: 500, MaxBackoffMs: 10000, PingTimeoutMs: 2000}
+	if rc.InitialBackoffMsOrDefault() != 500 || rc.MaxBackoffMsOrDefault() != 10000 || rc.PingTimeoutMsOrDefault() != 2000 {
+		t.Fatalf("overrides not honoured: %+v", rc)
+	}
+}
+
+func TestHistory_ReconnectValidation(t *testing.T) {
+	// Negative values are rejected.
+	c := baseHistoryConfig()
+	c.History.Store.Reconnect = ReconnectConfig{InitialBackoffMs: -1}
+	if err := c.Validate(); err == nil {
+		t.Fatal("negative initialBackoffMs must fail validation")
+	}
+	// initial > max is rejected, including via defaults (initial beyond default max).
+	c = baseHistoryConfig()
+	c.History.Store.Reconnect = ReconnectConfig{InitialBackoffMs: 5000, MaxBackoffMs: 1000}
+	if err := c.Validate(); err == nil {
+		t.Fatal("initialBackoffMs > maxBackoffMs must fail validation")
+	}
+	c = baseHistoryConfig()
+	c.History.Store.Reconnect = ReconnectConfig{InitialBackoffMs: DefaultReconnectMaxBackoffMs + 1}
+	if err := c.Validate(); err == nil {
+		t.Fatal("initialBackoffMs above the default max must fail validation")
+	}
+	// Sane overrides pass.
+	c = baseHistoryConfig()
+	c.History.Store.Reconnect = ReconnectConfig{InitialBackoffMs: 200, MaxBackoffMs: 5000, PingTimeoutMs: 1000}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid reconnect config rejected: %v", err)
+	}
+}

@@ -81,6 +81,9 @@ type Store interface {
 	// (same uid+valid_from, different ingest_seq) are NOT collapsed here — the
 	// caller dedups.
 	OpenVersions(ctx context.Context, table string) ([]OpenVersion, error)
+	// Ping verifies the connection is still usable. The history manager polls
+	// it to drive the connected/degraded state it reports on /readyz.
+	Ping(ctx context.Context) error
 	Close() error
 }
 
@@ -189,10 +192,13 @@ func Open(ctx context.Context, o Options) (Store, error) {
 		return nil, fmt.Errorf("open clickhouse: %w", err)
 	}
 	if err := conn.Ping(ctx); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("ping clickhouse: %w", err)
 	}
 	return &chStore{conn: conn, createSchema: o.CreateSchema, updateClose: o.UpdateClose}, nil
 }
+
+func (s *chStore) Ping(ctx context.Context) error { return s.conn.Ping(ctx) }
 
 func (s *chStore) Close() error { return s.conn.Close() }
 

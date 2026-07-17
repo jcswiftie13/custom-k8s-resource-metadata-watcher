@@ -34,11 +34,16 @@ const (
 
 // queued is one ordered write operation: an INSERT of row (close == nil) or an
 // in-place close of a previously inserted open row (closeMode=update). A
-// single FIFO queue keeps each object's operations in event order.
+// single FIFO queue keeps each object's operations in event order. isClose
+// marks BOTH close forms — closeOp and rewrite-mode closing rows are otherwise
+// indistinguishable from plain inserts — so drop-oldest eviction can preserve
+// them (losing a close corrupts the open/close invariant; losing an insert
+// only skips one version).
 type queued struct {
-	table string
-	row   store.Row
-	close *closeOp
+	table   string
+	row     store.Row
+	close   *closeOp
+	isClose bool
 }
 
 // closeOp pins the exact open row to patch: identity + valid_from + (implicit)
@@ -74,39 +79,74 @@ type Ingester struct {
 	mu   sync.Mutex
 	last map[string]lastState // uid -> last written open version
 
-	queue   chan queued
-	ctxDone <-chan struct{}
+	queue chan queued
+
+	// closeStash holds close ops evicted from a full queue: closes are never
+	// dropped while stash capacity (closeStashMax) remains, because a lost
+	// close leaves a stale open row. flush drains the stash first each cycle.
+	closeMu       sync.Mutex
+	closeStash    []queued
+	closeStashMax int
+
+	droppedTotal atomic.Uint64 // for rate-limited drop logging only; metrics hold the counters
+
+	// losses counts every operation that reached the ingester but never made
+	// it into the store: evicted inserts, overflowed closes, failed flush
+	// calls. The manager compares it against a baseline to decide whether an
+	// outage diverged the store from in-memory state (→ rebuild needed).
+	losses atomic.Uint64
+
+	// regs are the informer registrations from Register, kept so HasSynced can
+	// report replay delivery and Unregister can detach on teardown.
+	regs []handlerReg
+
+	// loopDone is closed when the flush loop exits; Start sets it.
+	loopDone chan struct{}
+
+	metrics *Metrics
+}
+
+// handlerReg pairs a registration with the informer it was added to, so
+// Unregister can remove it.
+type handlerReg struct {
+	inf cache.SharedIndexInformer
+	reg cache.ResourceEventHandlerRegistration
 }
 
 // lastState is the last open version written for a live uid: its spec hash (for
 // dedup) and the whole row, kept so a later version or a delete can re-insert it
 // with valid_to filled in. One entry per live object, not per historical
 // version. row.Values is built fresh by buildRow and never mutated afterwards,
-// so holding the reference is safe.
+// so holding the reference is safe. table and kind locate the uid's history
+// table and informer cache for ReconcileOpens.
 type lastState struct {
-	hash string
-	row  store.Row
+	hash  string
+	row   store.Row
+	table string
+	kind  string
 }
 
 // NewIngester builds an Ingester from compiled resources. closeMode is
 // config.CloseModeRewrite or config.CloseModeUpdate (see StoreConfig.CloseMode).
-func NewIngester(st store.Store, informers InformerSource, resources []*CompiledResource, batch config.BatchConfig, closeMode string, log *slog.Logger) *Ingester {
+func NewIngester(st store.Store, informers InformerSource, resources []*CompiledResource, batch config.BatchConfig, closeMode string, log *slog.Logger, metrics *Metrics) *Ingester {
 	byKind := make(map[string]*CompiledResource, len(resources))
 	for _, r := range resources {
 		byKind[r.Kind] = r
 	}
 	maxRows := batch.MaxRowsOrDefault()
 	return &Ingester{
-		store:       st,
-		informers:   informers,
-		ev:          collector.NewEvaluator(),
-		byKind:      byKind,
-		log:         log,
-		batchMax:    maxRows,
-		flushIvl:    time.Duration(batch.FlushIntervalMsOrDefault()) * time.Millisecond,
-		updateClose: closeMode == config.CloseModeUpdate,
-		last:        map[string]lastState{},
-		queue:       make(chan queued, maxRows*2),
+		store:         st,
+		informers:     informers,
+		ev:            collector.NewEvaluator(),
+		byKind:        byKind,
+		log:           log,
+		batchMax:      maxRows,
+		flushIvl:      time.Duration(batch.FlushIntervalMsOrDefault()) * time.Millisecond,
+		updateClose:   closeMode == config.CloseModeUpdate,
+		last:          map[string]lastState{},
+		queue:         make(chan queued, maxRows*2),
+		closeStashMax: maxRows,
+		metrics:       metrics,
 	}
 }
 
@@ -129,12 +169,11 @@ func NewIngester(st store.Store, informers InformerSource, resources []*Compiled
 // rewrite has no in-place close, so its crash-window stale opens are left to
 // the readers' dedup.
 func (in *Ingester) Recover(ctx context.Context) error {
-	tables := map[string]struct{}{}
-	for _, cr := range in.byKind {
-		tables[cr.Table] = struct{}{}
-	}
 	recovered, sweeps := 0, 0
-	for table := range tables {
+	// Config validation rejects duplicate tables, so kind <-> table is 1:1 and
+	// iterating byKind visits every table exactly once.
+	for kind, cr := range in.byKind {
+		table := cr.Table
 		open, err := in.store.OpenVersions(ctx, table)
 		if err != nil {
 			return fmt.Errorf("history recover %s: %w", table, err)
@@ -165,7 +204,7 @@ func (in *Ingester) Recover(ctx context.Context) error {
 				ValidFrom: latest.ValidFrom,
 				ValidTo:   store.FarFuture,
 				Values:    latest.Values,
-			})
+			}, table, kind)
 			recovered++
 			if !in.updateClose {
 				continue
@@ -186,8 +225,72 @@ func (in *Ingester) Recover(ctx context.Context) error {
 	return nil
 }
 
+// ReconcileOpens closes open rows whose objects no longer exist: an object
+// deleted while the exporter was down (or disconnected from the store) leaves
+// a single open row that Recover happily adopts as live, and the cache replay
+// never delivers a Delete for it. Call once per (re)initialization, after
+// Register and only once HasSynced is true — before that the caches are still
+// replaying and a merely-not-yet-delivered object would be closed by mistake.
+//
+// The close lands at observation time, consistent with how changes observed
+// via re-LIST are stamped (see onEvent). Racing a live Delete event is safe:
+// forgetIfSeen removes the uid atomically, so exactly one side wins.
+func (in *Ingester) ReconcileOpens() int {
+	type candidate struct {
+		uid   string
+		key   string
+		table string
+		kind  string
+	}
+	in.mu.Lock()
+	cands := make([]candidate, 0, len(in.last))
+	for uid, ls := range in.last {
+		key := ls.row.Name
+		if ls.row.Namespace != "" {
+			key = ls.row.Namespace + "/" + ls.row.Name
+		}
+		cands = append(cands, candidate{uid: uid, key: key, table: ls.table, kind: ls.kind})
+	}
+	in.mu.Unlock()
+
+	closed := 0
+	now := time.Now().UTC()
+	for _, c := range cands {
+		alive := false
+		for _, inf := range in.informers.Informers(c.kind) {
+			obj, exists, err := inf.GetStore().GetByKey(c.key)
+			if err != nil || !exists {
+				continue
+			}
+			// Same name recreated with a new uid is a different object; the
+			// old uid's row must still close.
+			if u := toUnstructured(obj); u != nil && string(u.GetUID()) == c.uid {
+				alive = true
+				break
+			}
+		}
+		if alive {
+			continue
+		}
+		prior, ok := in.forgetIfSeen(c.uid)
+		if !ok {
+			continue // a concurrent Delete event beat us to it
+		}
+		in.enqueueClose(c.table, prior, now)
+		closed++
+	}
+	if closed > 0 {
+		in.log.Info("history reconcile closed orphaned open rows", "objects", closed)
+	}
+	return closed
+}
+
 // Register attaches event handlers on every informer for each configured Kind.
-// Call before the informers are started.
+// Registering before the informers start captures the initial LIST as Add
+// events; registering after they started (the manager's reconnect path) makes
+// client-go replay the full cache as Add events instead — either way the
+// ingester sees a complete snapshot, deduped against the Recover baseline.
+// HasSynced reports when that replay has been delivered.
 func (in *Ingester) Register() error {
 	for kind, cr := range in.byKind {
 		infs := in.informers.Informers(kind)
@@ -196,7 +299,7 @@ func (in *Ingester) Register() error {
 		}
 		crLocal := cr
 		for _, inf := range infs {
-			_, err := inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			reg, err := inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
 				AddFunc:    func(o interface{}) { in.onEvent(crLocal, o, eventAdd) },
 				UpdateFunc: func(_, o interface{}) { in.onEvent(crLocal, o, eventUpdate) },
 				DeleteFunc: func(o interface{}) { in.onEvent(crLocal, o, eventDelete) },
@@ -204,16 +307,50 @@ func (in *Ingester) Register() error {
 			if err != nil {
 				return fmt.Errorf("history: add handler for %q: %w", kind, err)
 			}
+			in.regs = append(in.regs, handlerReg{inf: inf, reg: reg})
 		}
 	}
 	return nil
 }
 
+// Unregister detaches every event handler added by Register, so a torn-down
+// ingester stops producing before the manager rebuilds a fresh one. Removal
+// errors are logged, not returned: the ingester is being discarded anyway.
+func (in *Ingester) Unregister() {
+	for _, r := range in.regs {
+		if err := r.inf.RemoveEventHandler(r.reg); err != nil {
+			in.log.Warn("history: remove event handler failed", "err", err)
+		}
+	}
+	in.regs = nil
+}
+
+// HasSynced reports whether every registered handler has been delivered its
+// initial snapshot (LIST or late-registration cache replay). Only meaningful
+// after Register.
+func (in *Ingester) HasSynced() bool {
+	for _, r := range in.regs {
+		if !r.reg.HasSynced() {
+			return false
+		}
+	}
+	return true
+}
+
+// lossCount returns how many operations were lost since construction (evicted
+// inserts, overflowed closes, failed flushes). The manager uses deltas to
+// detect store/in-memory divergence.
+func (in *Ingester) lossCount() uint64 { return in.losses.Load() }
+
 // Start launches the batch flush loop. It returns immediately; the loop runs
-// until ctx is cancelled, flushing any buffered rows on exit.
+// until ctx is cancelled, flushing any buffered rows on exit (loopDone is
+// closed once that final flush finished).
 func (in *Ingester) Start(ctx context.Context) {
-	in.ctxDone = ctx.Done()
-	go in.loop(ctx)
+	in.loopDone = make(chan struct{})
+	go func() {
+		defer close(in.loopDone)
+		in.loop(ctx)
+	}()
 }
 
 func (in *Ingester) loop(ctx context.Context) {
@@ -228,17 +365,41 @@ func (in *Ingester) loop(ctx context.Context) {
 	// cycle's batch; and a close can safely run after its successor's INSERT
 	// because the close predicate pins the exact valid_from (see closeOp).
 	flush := func() {
+		// The exit flush runs after ctx was cancelled; writing with a dead
+		// context would fail unconditionally and silently drop the final
+		// buffer, so give it a short detached grace window instead.
+		wctx := ctx
+		if ctx.Err() != nil {
+			var cancel context.CancelFunc
+			wctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+		}
+		// Closes evicted from a full queue were stashed instead of dropped;
+		// fold them back in first. They predate everything currently queued,
+		// and a close is order-independent past its own INSERT (see closeOp),
+		// so merging them into this cycle is safe.
+		for _, q := range in.drainCloseStash() {
+			if q.close != nil {
+				closes = append(closes, q)
+			} else {
+				pending[q.table] = append(pending[q.table], q.row)
+			}
+		}
 		for table, rows := range pending {
 			if len(rows) == 0 {
 				continue
 			}
-			if err := in.store.WriteBatch(ctx, table, rows); err != nil {
+			if err := in.store.WriteBatch(wctx, table, rows); err != nil {
+				in.losses.Add(uint64(len(rows)))
+				in.metrics.incWriteFailure()
 				in.log.Error("history write batch failed", "table", table, "rows", len(rows), "err", err)
 			}
 		}
 		for _, q := range closes {
 			c := q.close
-			if err := in.store.CloseVersion(ctx, q.table, c.namespace, c.name, c.uid, c.validFrom, c.closeAt); err != nil {
+			if err := in.store.CloseVersion(wctx, q.table, c.namespace, c.name, c.uid, c.validFrom, c.closeAt); err != nil {
+				in.losses.Add(1)
+				in.metrics.incWriteFailure()
 				in.log.Error("history close version failed", "table", q.table,
 					"namespace", c.namespace, "name", c.name, "uid", c.uid, "err", err)
 			}
@@ -332,13 +493,13 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 	if hadPrior && !row.ValidFrom.After(prev.row.ValidFrom) {
 		row.ValidFrom = prev.row.ValidFrom.Add(time.Millisecond)
 	}
-	in.remember(uid, hash, row)
+	in.remember(uid, hash, row, cr.Table, cr.Kind)
 
 	// The superseded version ends where the new one begins.
 	if hadPrior {
 		in.enqueueClose(cr.Table, prev.row, row.ValidFrom)
 	}
-	in.enqueue(cr.Table, row, nil)
+	in.enqueue(queued{table: cr.Table, row: row})
 }
 
 // enqueueClose records that prev ends at closeAt, in whichever way the close
@@ -351,13 +512,13 @@ func (in *Ingester) enqueueClose(table string, prev store.Row, closeAt time.Time
 		closeAt = prev.ValidFrom
 	}
 	if in.updateClose {
-		in.enqueue(table, store.Row{}, &closeOp{
+		in.enqueue(queued{table: table, close: &closeOp{
 			namespace: prev.Namespace, name: prev.Name, uid: prev.UID,
 			validFrom: prev.ValidFrom, closeAt: closeAt,
-		})
+		}, isClose: true})
 		return
 	}
-	in.enqueue(table, in.closingRow(prev, closeAt), nil)
+	in.enqueue(queued{table: table, row: in.closingRow(prev, closeAt), isClose: true})
 }
 
 // buildRow assembles the open version row for an Add/Update. A deletion is
@@ -480,10 +641,61 @@ func (in *Ingester) evaluateRaw(c *CompiledColumn, lookup srcLookup) []interface
 	return nil
 }
 
-func (in *Ingester) enqueue(table string, row store.Row, close *closeOp) {
-	select {
-	case in.queue <- queued{table: table, row: row, close: close}:
-	case <-in.ctxDone:
+// enqueue never blocks: when the queue is full it evicts the oldest queued op
+// to make room (drop-oldest). Evicted inserts are lost — one version row the
+// store never sees, counted and rate-limit logged — while evicted closes are
+// stashed and re-sent by the next flush, because a lost close would leave a
+// stale open row (broken open/close invariant) rather than a mere gap.
+func (in *Ingester) enqueue(q queued) {
+	for {
+		select {
+		case in.queue <- q:
+			return
+		default:
+		}
+		select {
+		case old := <-in.queue:
+			if old.isClose {
+				in.stashClose(old)
+			} else {
+				in.dropInsert(old)
+			}
+		default:
+			// The flush loop drained the queue between our two selects; retry.
+		}
+	}
+}
+
+// stashClose preserves a close op evicted from the full queue. The stash is
+// capped (rewrite-mode closes carry full rows): beyond closeStashMax the close
+// is dropped for real and counted under kind="close".
+func (in *Ingester) stashClose(q queued) {
+	in.closeMu.Lock()
+	if len(in.closeStash) < in.closeStashMax {
+		in.closeStash = append(in.closeStash, q)
+		in.closeMu.Unlock()
+		return
+	}
+	in.closeMu.Unlock()
+	in.losses.Add(1)
+	in.metrics.incDropped(droppedKindClose)
+	in.log.Error("history close op dropped: queue and close stash both full", "table", q.table)
+}
+
+func (in *Ingester) drainCloseStash() []queued {
+	in.closeMu.Lock()
+	defer in.closeMu.Unlock()
+	out := in.closeStash
+	in.closeStash = nil
+	return out
+}
+
+func (in *Ingester) dropInsert(q queued) {
+	in.losses.Add(1)
+	in.metrics.incDropped(droppedKindInsert)
+	if n := in.droppedTotal.Add(1); n == 1 || n%10000 == 0 {
+		in.log.Error("history events dropped: ingest queue full (oldest inserts evicted)",
+			"table", q.table, "droppedTotal", n)
 	}
 }
 
@@ -499,10 +711,10 @@ func (in *Ingester) lookup(uid string) (prev lastState, hadPrior bool) {
 }
 
 // remember records the row just written as uid's open version.
-func (in *Ingester) remember(uid, hash string, row store.Row) {
+func (in *Ingester) remember(uid, hash string, row store.Row, table, kind string) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	in.last[uid] = lastState{hash: hash, row: row}
+	in.last[uid] = lastState{hash: hash, row: row, table: table, kind: kind}
 }
 
 // forgetIfSeen drops uid from the live set, returning its open row if present.

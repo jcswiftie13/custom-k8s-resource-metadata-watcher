@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log/slog"
@@ -101,9 +102,11 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// History ingest is fully opt-in and decoupled from the scrape path. It
-	// registers event handlers on the SAME informer cache the collector owns,
-	// so it must be wired before col.Start (which starts the informers).
+	// History ingest is fully opt-in and decoupled from the scrape path. Config
+	// and credential errors stay fail-fast here; the ClickHouse connection does
+	// NOT — the manager connects in the background with backoff, so an
+	// unreachable store degrades history instead of killing the exporter.
+	var histMgr *history.Manager
 	if cfg.HistoryEnabled() {
 		compiled, err := history.CompileAll(*cfg.History)
 		if err != nil {
@@ -126,43 +129,26 @@ func main() {
 			log.Error("history store token resolve failed", "err", err)
 			os.Exit(1)
 		}
-		histStore, err := store.Open(ctx, store.Options{
-			DSN:           sc.DSN,
-			Username:      user,
-			Password:      pw,
-			Database:      sc.Database,
-			Token:         tok,
-			Secure:        sc.SecureEnabled(),
-			TLSSkipVerify: sc.TLSSkipVerify,
-			CreateSchema:  sc.CreateSchemaEnabled(),
-			UpdateClose:   sc.CloseModeOrDefault() == config.CloseModeUpdate,
-		})
-		if err != nil {
-			log.Error("history store open failed", "err", err)
-			os.Exit(1)
-		}
-		defer func() { _ = histStore.Close() }()
-		if err := histStore.EnsureSchema(ctx, history.TableSchemas(compiled)); err != nil {
-			log.Error("history schema ensure failed", "err", err)
-			os.Exit(1)
-		}
-		ing := history.NewIngester(histStore, col.Informers(), compiled, cfg.History.Store.Batch,
-			cfg.History.Store.CloseModeOrDefault(), log)
-		// Restart idempotency (closeMode=update): rebuild last-state from the
-		// store's open rows BEFORE the informers start, so the initial re-LIST
-		// dedups against what was already written instead of re-inserting it.
-		if err := ing.Recover(ctx); err != nil {
-			log.Error("history last-state recovery failed", "err", err)
-			os.Exit(1)
-		}
-		if err := ing.Register(); err != nil {
-			log.Error("history handler register failed", "err", err)
-			os.Exit(1)
-		}
-		ing.Start(ctx)
-		log.Info("history ingest enabled", "resources", len(compiled),
-			"createSchema", cfg.History.Store.CreateSchemaEnabled(),
-			"closeMode", cfg.History.Store.CloseModeOrDefault())
+		histMgr = history.NewManager(history.ManagerOptions{
+			StoreOptions: store.Options{
+				DSN:           sc.DSN,
+				Username:      user,
+				Password:      pw,
+				Database:      sc.Database,
+				Token:         tok,
+				Secure:        sc.SecureEnabled(),
+				TLSSkipVerify: sc.TLSSkipVerify,
+				CreateSchema:  sc.CreateSchemaEnabled(),
+				UpdateClose:   sc.CloseModeOrDefault() == config.CloseModeUpdate,
+			},
+			Compiled:   compiled,
+			Informers:  col.Informers(),
+			Batch:      sc.Batch,
+			CloseMode:  sc.CloseModeOrDefault(),
+			Reconnect:  sc.Reconnect,
+			Registerer: reg,
+		}, log)
+		histMgr.Start(ctx)
 	}
 
 	mux := http.NewServeMux()
@@ -170,6 +156,25 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	// Readiness: 503 until the informer caches are synced. History store
+	// health is reported but deliberately never fails readiness — a degraded
+	// history must not eject the exporter from service endpoints.
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		type readyz struct {
+			InformersSynced bool                   `json:"informersSynced"`
+			History         *history.ManagerStatus `json:"history,omitempty"`
+		}
+		resp := readyz{InformersSynced: col.Ready()}
+		if histMgr != nil {
+			st := histMgr.Status()
+			resp.History = &st
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.InformersSynced {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 	server := &http.Server{
 		Addr:              *metricsAddr,
