@@ -347,6 +347,46 @@ func runHistoryClickHouseIstioSchema(t *testing.T, ns, dsn string) {
 			t.Fatalf("delete must not add a row (only close v2), still expected 2 versions, got %q", got)
 		}
 	})
+
+	// Regression for the ingest_seq restart incident: a live object's row is
+	// spuriously closed in the store, and after an exporter restart the
+	// corrective re-Add lands on the SAME sort-key slot (a genuine Add reuses
+	// creationTimestamp as valid_from). Before the time-based seq seeding, the
+	// restarted counter started near zero, so the re-open row lost the
+	// ReplacingMergeTree merge to the stale closed row forever; now it must win.
+	t.Run("restart_reopen_wins", func(t *testing.T) {
+		const svc = "name='svc-restart'"
+		createObject(t, dyn, svcGVR, ns, map[string]interface{}{
+			"apiVersion": "v1",
+			"kind":       "Service",
+			"metadata":   map[string]interface{}{"namespace": ns, "name": "svc-restart"},
+			"spec": map[string]interface{}{
+				"type":     "LoadBalancer",
+				"selector": map[string]interface{}{"app": "api"},
+				"ports": []interface{}{
+					map[string]interface{}{"port": int64(80), "name": "http", "protocol": "TCP"},
+				},
+			},
+		})
+		waitForCHCount(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to > now()", 1)
+
+		// Simulate the spurious close out-of-band: re-insert the open row with
+		// valid_to materialized and a higher seq — exactly what a rewrite-mode
+		// close writes. The object itself stays alive in the cluster.
+		if _, err := chExec("INSERT INTO service_versions SELECT * REPLACE (now64(3) AS valid_to, ingest_seq + 1 AS ingest_seq) FROM service_versions FINAL WHERE " + svc); err != nil {
+			t.Fatalf("simulate spurious close: %v", err)
+		}
+		waitForCHCount(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to > now()", 0)
+
+		// Restart: Recover finds nothing open for the uid, the informer replay
+		// delivers a genuine Add, and the re-open row must outrank the stale
+		// closed row under FINAL (max ingest_seq per key).
+		restartExporter(t)
+		waitForCHCount(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to > now()", 1)
+		if got := chQuery(t, "SELECT count() FROM service_versions FINAL WHERE "+svc+" AND valid_to = toDateTime64('2200-01-01 00:00:00', 3)"); got != "1" {
+			t.Fatalf("re-opened version should carry the FarFuture sentinel, got count %q", got)
+		}
+	})
 }
 
 // --- helpers ---

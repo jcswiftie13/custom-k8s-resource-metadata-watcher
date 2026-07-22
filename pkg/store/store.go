@@ -81,6 +81,14 @@ type Store interface {
 	// (same uid+valid_from, different ingest_seq) are NOT collapsed here — the
 	// caller dedups.
 	OpenVersions(ctx context.Context, table string) ([]OpenVersion, error)
+	// MaxIngestSeq returns the largest ingest_seq above floor across ALL rows
+	// of table — open AND closed, since a closing row can hold the maximum —
+	// or 0 when no row exceeds floor. The ingester calls it once per recovery
+	// with its time-derived counter base as floor: a non-zero result means
+	// rows from an earlier process outrank the base (clock stepped backwards)
+	// and the counter must be re-seeded above them, or post-restart rows
+	// would lose ReplacingMergeTree(ingest_seq) merges to stale ones.
+	MaxIngestSeq(ctx context.Context, table string, floor uint64) (uint64, error)
 	// Ping verifies the connection is still usable. The history manager polls
 	// it to drive the connected/degraded state it reports on /readyz.
 	Ping(ctx context.Context) error

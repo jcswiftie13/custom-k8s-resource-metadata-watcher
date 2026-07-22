@@ -134,7 +134,7 @@ func NewIngester(st store.Store, informers InformerSource, resources []*Compiled
 		byKind[r.Kind] = r
 	}
 	maxRows := batch.MaxRowsOrDefault()
-	return &Ingester{
+	in := &Ingester{
 		store:         st,
 		informers:     informers,
 		ev:            collector.NewEvaluator(),
@@ -148,6 +148,16 @@ func NewIngester(st store.Store, informers InformerSource, resources []*Compiled
 		closeStashMax: maxRows,
 		metrics:       metrics,
 	}
+	// ingest_seq base: milliseconds in the high 44 bits, the low 20 left for
+	// in-process increments (>1M rows/ms would be needed to overflow into the
+	// next millisecond — impossible). ReplacingMergeTree(ingest_seq) keeps the
+	// max-seq row per key, so the counter must outrank every row an earlier
+	// process persisted; a wall-clock base guarantees that across restarts
+	// without any store read (seq>>20 also decodes to the process start time
+	// for field debugging). Recover raises it further if the store holds
+	// higher seqs (clock stepped backwards since the previous process).
+	in.seq.Store(uint64(time.Now().UnixMilli()) << 20)
+	return in
 }
 
 // Recover rebuilds the ingester's last-state from the store's open rows so a
@@ -174,6 +184,18 @@ func (in *Ingester) Recover(ctx context.Context) error {
 	// iterating byKind visits every table exactly once.
 	for kind, cr := range in.byKind {
 		table := cr.Table
+		// Fuse for the time-derived counter base: any persisted seq above it
+		// means the wall clock stepped backwards across the restart; re-seed
+		// above the store's max or every new row sharing a key with an old one
+		// would lose the ReplacingMergeTree merge. Recover runs before Start
+		// and Register, so plain Load/Store on seq cannot race.
+		if max, err := in.store.MaxIngestSeq(ctx, table, in.seq.Load()); err != nil {
+			return fmt.Errorf("history recover %s: max ingest_seq: %w", table, err)
+		} else if max > in.seq.Load() {
+			in.log.Warn("history ingest_seq base below stored rows (clock stepped backwards?); re-seeding",
+				"table", table, "storeMax", max)
+			in.seq.Store(max)
+		}
 		open, err := in.store.OpenVersions(ctx, table)
 		if err != nil {
 			return fmt.Errorf("history recover %s: %w", table, err)
@@ -217,11 +239,16 @@ func (in *Ingester) Recover(ctx context.Context) error {
 					vs[i].Namespace, vs[i].Name, uid, vs[i].ValidFrom, vs[i+1].ValidFrom); err != nil {
 					return fmt.Errorf("history recover %s: close stale open row: %w", table, err)
 				}
+				in.metrics.incClose(closeReasonRecoverSweep)
+				in.log.Debug("history close version",
+					"table", table, "namespace", vs[i].Namespace, "name", vs[i].Name, "uid", uid,
+					"validFrom", vs[i].ValidFrom, "closeAt", vs[i+1].ValidFrom, "reason", closeReasonRecoverSweep)
 				sweeps++
 			}
 		}
 	}
-	in.log.Info("history last-state recovered from store", "objects", recovered, "staleOpensClosed", sweeps)
+	in.log.Info("history last-state recovered from store",
+		"objects", recovered, "staleOpensClosed", sweeps, "ingestSeqBase", in.seq.Load())
 	return nil
 }
 
@@ -235,7 +262,18 @@ func (in *Ingester) Recover(ctx context.Context) error {
 // The close lands at observation time, consistent with how changes observed
 // via re-LIST are stamped (see onEvent). Racing a live Delete event is safe:
 // forgetIfSeen removes the uid atomically, so exactly one side wins.
+//
+// "Absent from the cache" only implies "deleted" while the informers cover
+// the object's scope: a kind whose informers are missing entirely is skipped
+// (never mass-closed), but a narrowed watch scope — e.g. a namespace removed
+// from watch.resources between restarts — is indistinguishable from deletion
+// and WILL close those objects' rows. The mass-close Error log below flags
+// such wipes; check it before trusting a burst of reconcile_orphan closes.
 func (in *Ingester) ReconcileOpens() int {
+	if !in.HasSynced() {
+		in.log.Warn("history reconcile skipped: informer replay not yet delivered")
+		return 0
+	}
 	type candidate struct {
 		uid   string
 		key   string
@@ -244,20 +282,39 @@ func (in *Ingester) ReconcileOpens() int {
 	}
 	in.mu.Lock()
 	cands := make([]candidate, 0, len(in.last))
+	perKind := map[string]int{}
 	for uid, ls := range in.last {
 		key := ls.row.Name
 		if ls.row.Namespace != "" {
 			key = ls.row.Namespace + "/" + ls.row.Name
 		}
 		cands = append(cands, candidate{uid: uid, key: key, table: ls.table, kind: ls.kind})
+		perKind[ls.kind]++
 	}
 	in.mu.Unlock()
 
-	closed := 0
-	now := time.Now().UTC()
+	// A kind with no informer at all yields no aliveness signal — closing its
+	// rows would wipe every tracked object of that kind, so refuse.
+	informersByKind := make(map[string][]cache.SharedIndexInformer, len(perKind))
+	for kind := range perKind {
+		infs := in.informers.Informers(kind)
+		if len(infs) == 0 {
+			in.log.Warn("history reconcile: no informer for kind; refusing to close its open rows",
+				"kind", kind, "tracked", perKind[kind])
+			continue
+		}
+		informersByKind[kind] = infs
+	}
+
+	orphans := make([]candidate, 0)
+	orphansPerKind := map[string]int{}
 	for _, c := range cands {
+		infs, ok := informersByKind[c.kind]
+		if !ok {
+			continue
+		}
 		alive := false
-		for _, inf := range in.informers.Informers(c.kind) {
+		for _, inf := range infs {
 			obj, exists, err := inf.GetStore().GetByKey(c.key)
 			if err != nil || !exists {
 				continue
@@ -269,14 +326,33 @@ func (in *Ingester) ReconcileOpens() int {
 				break
 			}
 		}
-		if alive {
-			continue
+		if !alive {
+			orphans = append(orphans, c)
+			orphansPerKind[c.kind]++
 		}
+	}
+
+	// Mass-close sanity check: most of a kind vanishing at once looks like a
+	// coverage change (namespace scope narrowed, informer misconfigured), not
+	// deletions. Log-only — a real mass deletion must still be recorded.
+	for kind, n := range orphansPerKind {
+		if n > 10 && n*2 > perKind[kind] {
+			in.log.Error("history reconcile closing most tracked objects of a kind; "+
+				"verify the informer scope still covers them (namespace list unchanged?)",
+				"kind", kind, "closing", n, "tracked", perKind[kind])
+		}
+	}
+
+	closed := 0
+	now := time.Now().UTC()
+	for _, c := range orphans {
 		prior, ok := in.forgetIfSeen(c.uid)
 		if !ok {
 			continue // a concurrent Delete event beat us to it
 		}
-		in.enqueueClose(c.table, prior, now)
+		in.log.Info("history reconcile closing orphaned open row (object absent from informer cache)",
+			"kind", c.kind, "table", c.table, "namespace", prior.Namespace, "name", prior.Name, "uid", c.uid)
+		in.enqueueClose(c.table, prior, now, closeReasonReconcileOrphan)
 		closed++
 	}
 	if closed > 0 {
@@ -453,7 +529,7 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 		if !ok {
 			return
 		}
-		in.enqueueClose(cr.Table, prior, time.Now().UTC())
+		in.enqueueClose(cr.Table, prior, time.Now().UTC(), closeReasonDelete)
 		return
 	}
 
@@ -495,9 +571,14 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 	}
 	in.remember(uid, hash, row, cr.Table, cr.Kind)
 
-	// The superseded version ends where the new one begins.
+	// The superseded version ends where the new one begins. An Add promoted to
+	// Update (effKind) is a change first observed via re-LIST/replay, not live.
 	if hadPrior {
-		in.enqueueClose(cr.Table, prev.row, row.ValidFrom)
+		reason := closeReasonSupersede
+		if kind == eventAdd {
+			reason = closeReasonRelistChange
+		}
+		in.enqueueClose(cr.Table, prev.row, row.ValidFrom, reason)
 	}
 	in.enqueue(queued{table: cr.Table, row: row})
 }
@@ -506,11 +587,17 @@ func (in *Ingester) onEvent(cr *CompiledResource, o interface{}, kind eventKind)
 // mode dictates: rewrite re-inserts prev with valid_to materialized and a
 // higher ingest_seq (ReplacingMergeTree collapses the pair later); update
 // patches the open row in place. closeAt is clamped to prev's start so a
-// version can never span a negative interval (Add-after-Add).
-func (in *Ingester) enqueueClose(table string, prev store.Row, closeAt time.Time) {
+// version can never span a negative interval (Add-after-Add). reason is one
+// of the closeReason* constants; it stamps the metric and debug log so every
+// materialized valid_to is attributable to its code path.
+func (in *Ingester) enqueueClose(table string, prev store.Row, closeAt time.Time, reason string) {
 	if closeAt.Before(prev.ValidFrom) {
 		closeAt = prev.ValidFrom
 	}
+	in.metrics.incClose(reason)
+	in.log.Debug("history close version",
+		"table", table, "namespace", prev.Namespace, "name", prev.Name, "uid", prev.UID,
+		"validFrom", prev.ValidFrom, "closeAt", closeAt, "reason", reason)
 	if in.updateClose {
 		in.enqueue(queued{table: table, close: &closeOp{
 			namespace: prev.Namespace, name: prev.Name, uid: prev.UID,

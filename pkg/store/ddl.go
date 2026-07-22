@@ -137,6 +137,20 @@ func (s *chStore) validateTable(ctx context.Context, t TableSchema) error {
 			return fmt.Errorf("column %q type drift: config=%s live=%s", c.name, c.typ, got)
 		}
 	}
+	// The engine and its version column are load-bearing: every close and all
+	// read-side dedup assume ReplacingMergeTree keeps the max-ingest_seq row
+	// per key. ORDER BY is deliberately NOT validated — deployments may key
+	// differently from the built-in DDL (e.g. (cluster, namespace, name,
+	// valid_from) in deploy/clickhouse) as long as the engine contract holds.
+	var engineFull string
+	if err := s.conn.QueryRow(ctx,
+		"SELECT engine_full FROM system.tables WHERE database = currentDatabase() AND name = ?",
+		t.Table).Scan(&engineFull); err != nil {
+		return fmt.Errorf("read engine_full: %w", err)
+	}
+	if !strings.HasPrefix(engineFull, "ReplacingMergeTree(ingest_seq)") {
+		return fmt.Errorf("engine must be ReplacingMergeTree(ingest_seq), got %q", engineFull)
+	}
 	if s.updateClose {
 		if err := s.validatePatchPartSettings(ctx, t.Table); err != nil {
 			return err

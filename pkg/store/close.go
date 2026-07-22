@@ -94,6 +94,23 @@ func (s *chStore) OpenVersions(ctx context.Context, table string) ([]OpenVersion
 	return out, rows.Err()
 }
 
+// MaxIngestSeq scans only the ingest_seq column (Delta-compressed UInt64 —
+// millisecond-cheap even without an index) for the largest value above floor.
+// The floor predicate lets a minmax skip index on ingest_seq, when present,
+// prune every granule in the common no-clock-regression case; max() over an
+// empty match set returns 0, no NULL handling needed.
+func (s *chStore) MaxIngestSeq(ctx context.Context, table string, floor uint64) (uint64, error) {
+	if _, ok := s.schemas[table]; !ok {
+		return 0, fmt.Errorf("unknown table %q (EnsureSchema not called for it)", table)
+	}
+	var max uint64
+	if err := s.conn.QueryRow(ctx, fmt.Sprintf(
+		"SELECT max(ingest_seq) FROM %s WHERE ingest_seq > ?", table), floor).Scan(&max); err != nil {
+		return 0, fmt.Errorf("max ingest_seq %s: %w", table, err)
+	}
+	return max, nil
+}
+
 // scanTarget allocates a pointer of the Go type clickhouse-go scans a column of
 // the given ClickHouse type into. It mirrors the ingester's columnValue type
 // switch so a value written by the ingest path reads back as the same Go type.
