@@ -76,10 +76,12 @@ type Store interface {
 	// Requires ClickHouse >= 25.8 with the block-number table settings (see
 	// EnsureSchema / docs/lightweight-update-upgrade-plan.md).
 	CloseVersion(ctx context.Context, table, namespace, name, uid string, validFrom, closeAt time.Time) error
-	// OpenVersions lists every row still carrying the FarFuture sentinel, for
-	// the ingester's restart recovery. Raw rows: pre-migration duplicates
-	// (same uid+valid_from, different ingest_seq) are NOT collapsed here — the
-	// caller dedups.
+	// OpenVersions lists every version still open AFTER ReplacingMergeTree
+	// dedup (the read runs under FINAL), for the ingester's restart recovery.
+	// A raw open row shadowed by a higher-ingest_seq rewrite-close is NOT
+	// returned — recovery must never adopt a version the merge contract has
+	// already retired. Open rows of one uid at different valid_from are
+	// distinct sort keys and are all returned (stale-open sweep input).
 	OpenVersions(ctx context.Context, table string) ([]OpenVersion, error)
 	// MaxIngestSeq returns the largest ingest_seq above floor across ALL rows
 	// of table — open AND closed, since a closing row can hold the maximum —

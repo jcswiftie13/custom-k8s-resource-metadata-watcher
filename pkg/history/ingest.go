@@ -164,8 +164,9 @@ func NewIngester(st store.Store, informers InformerSource, resources []*Compiled
 // post-restart re-LIST dedups instead of re-inserting a row for every live
 // object. Call after EnsureSchema and BEFORE the informers start.
 //
-// Per uid it keeps the newest open row (max valid_from, then max ingest_seq —
-// raw rows may still contain rewrite-era duplicates) as the object's open
+// Per uid it keeps the newest open row (max valid_from; OpenVersions reads
+// under FINAL, so a slot shadowed by a higher-seq rewrite-close never arrives
+// and the max-ingest_seq collapse below is defensive) as the object's open
 // version, recomputing the dedup hash from its declared column Values (there is
 // no persisted hash): a matching column hash on re-LIST is then a no-op, a
 // differing one closes the version and opens a new one at observation time.

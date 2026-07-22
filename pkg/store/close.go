@@ -65,10 +65,22 @@ func dt64Lit(t time.Time) string {
 
 // OpenVersions returns every row of table still carrying the FarFuture
 // sentinel — the ingester's restart-recovery input. Each row carries its
-// declared column Values so the caller can recompute the dedup hash. Rows are
-// returned raw (ordered by uid, valid_from, ingest_seq); the caller collapses
-// duplicates (same uid+valid_from, higher ingest_seq wins) and decides which
-// open rows are stale.
+// declared column Values so the caller can recompute the dedup hash.
+//
+// The read goes through FINAL: a rewrite-mode close INSERTs a closed
+// duplicate (same sort key, higher ingest_seq) and leaves the raw open row on
+// disk until a merge collapses the pair. Without FINAL that shadowed open row
+// still matches the sentinel predicate, so recovery adopts a version the
+// merge contract has already retired — the replayed Add then dedups against
+// it and the corrective re-insert is never written, leaving a spuriously
+// closed object closed forever (and letting ReconcileOpens re-close deleted
+// objects at restart time, overwriting their true delete timestamp). FINAL
+// applies the ReplacingMergeTree(ingest_seq) collapse before the sentinel
+// filter, so only versions that are open AFTER dedup survive.
+//
+// Rows come back ordered by uid, valid_from, ingest_seq; open rows of the
+// same uid at different valid_from (distinct sort keys, so FINAL keeps both)
+// are the caller's stale-open sweep input.
 func (s *chStore) OpenVersions(ctx context.Context, table string) ([]OpenVersion, error) {
 	schema, ok := s.schemas[table]
 	if !ok {
@@ -80,7 +92,7 @@ func (s *chStore) OpenVersions(ctx context.Context, table string) ([]OpenVersion
 	}
 	pred, args := s.scopePredicate()
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(
-		`SELECT %s FROM %s WHERE valid_to = %s%s
+		`SELECT %s FROM %s FINAL WHERE valid_to = %s%s
 		 ORDER BY uid, valid_from, ingest_seq`, cols, table, dt64Lit(FarFuture), pred), args...)
 	if err != nil {
 		return nil, fmt.Errorf("open versions %s: %w", table, err)
