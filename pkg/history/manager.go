@@ -193,7 +193,8 @@ func (m *Manager) run(ctx context.Context) {
 		m.lastErr = nil
 		m.mu.Unlock()
 		m.log.Info("history ingest enabled", "resources", len(m.o.Compiled),
-			"createSchema", m.o.StoreOptions.CreateSchema, "closeMode", m.o.CloseMode)
+			"createSchema", m.o.StoreOptions.CreateSchema, "closeMode", m.o.CloseMode,
+			"scopeColumn", m.o.StoreOptions.Scope.Column, "scopeValue", m.o.StoreOptions.Scope.Value)
 
 		runningSince := time.Now()
 		reinit := m.watch(ctx, st, ing, pingTimeout)

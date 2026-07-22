@@ -31,13 +31,29 @@ func (s *chStore) CloseVersion(ctx context.Context, table, namespace, name, uid 
 	if _, ok := s.schemas[table]; !ok {
 		return fmt.Errorf("unknown table %q (EnsureSchema not called for it)", table)
 	}
+	pred, args := s.scopePredicate()
 	stmt := fmt.Sprintf(
-		"UPDATE %s SET valid_to = %s WHERE namespace = ? AND name = ? AND uid = ? AND valid_from = %s AND valid_to = %s",
-		table, dt64Lit(closeAt), dt64Lit(validFrom), dt64Lit(FarFuture))
-	if err := s.conn.Exec(ctx, stmt, namespace, name, uid); err != nil {
+		"UPDATE %s SET valid_to = %s WHERE namespace = ? AND name = ? AND uid = ? AND valid_from = %s AND valid_to = %s%s",
+		table, dt64Lit(closeAt), dt64Lit(validFrom), dt64Lit(FarFuture), pred)
+	if err := s.conn.Exec(ctx, stmt, append([]any{namespace, name, uid}, args...)...); err != nil {
 		return fmt.Errorf("close version %s %s/%s uid=%s: %w", table, namespace, name, uid, err)
 	}
 	return nil
+}
+
+// scopePredicate renders the writer-scope restriction as an appendable SQL
+// fragment plus its bind value, or ("", nil) when no scope is configured. The
+// column name comes from validated config (a checked ClickHouse identifier),
+// so interpolating it is safe; the value is always bound. uid already makes
+// CloseVersion unambiguous across writers — the scope there is for primary
+// index pruning (the scope column leads the deployed ORDER BY) — while for
+// OpenVersions and MaxIngestSeq the scope is CORRECTNESS: recovery must never
+// adopt (and orphan-reconciliation must never close) another writer's rows.
+func (s *chStore) scopePredicate() (string, []any) {
+	if s.scope.Column == "" {
+		return "", nil
+	}
+	return fmt.Sprintf(" AND %s = ?", s.scope.Column), []any{s.scope.Value}
 }
 
 // dt64Lit renders t as a DateTime64(3) literal in UTC, truncated to the same
@@ -62,9 +78,10 @@ func (s *chStore) OpenVersions(ctx context.Context, table string) ([]OpenVersion
 	for _, c := range schema.Columns {
 		cols += ", " + c.Name
 	}
+	pred, args := s.scopePredicate()
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(
-		`SELECT %s FROM %s WHERE valid_to = %s
-		 ORDER BY uid, valid_from, ingest_seq`, cols, table, dt64Lit(FarFuture)))
+		`SELECT %s FROM %s WHERE valid_to = %s%s
+		 ORDER BY uid, valid_from, ingest_seq`, cols, table, dt64Lit(FarFuture), pred), args...)
 	if err != nil {
 		return nil, fmt.Errorf("open versions %s: %w", table, err)
 	}
@@ -104,8 +121,10 @@ func (s *chStore) MaxIngestSeq(ctx context.Context, table string, floor uint64) 
 		return 0, fmt.Errorf("unknown table %q (EnsureSchema not called for it)", table)
 	}
 	var max uint64
+	pred, args := s.scopePredicate()
 	if err := s.conn.QueryRow(ctx, fmt.Sprintf(
-		"SELECT max(ingest_seq) FROM %s WHERE ingest_seq > ?", table), floor).Scan(&max); err != nil {
+		"SELECT max(ingest_seq) FROM %s WHERE ingest_seq > ?%s", table, pred),
+		append([]any{floor}, args...)...).Scan(&max); err != nil {
 		return 0, fmt.Errorf("max ingest_seq %s: %w", table, err)
 	}
 	return max, nil

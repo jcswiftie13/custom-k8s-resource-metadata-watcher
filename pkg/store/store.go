@@ -95,12 +95,34 @@ type Store interface {
 	Close() error
 }
 
+// Scope restricts a writer's restart-recovery reads (OpenVersions,
+// MaxIngestSeq) — and, defensively, its CloseVersion patches — to rows it
+// wrote itself, identified by a declared constant column equal to Value.
+// Required when multiple writers share one table (one exporter per cluster):
+// without it, one writer's orphan reconciliation closes every other writer's
+// live rows. The zero value disables filtering (single-writer deployments).
+type Scope struct {
+	Column string
+	Value  string
+}
+
 // chStore is the ClickHouse-backed Store.
 type chStore struct {
 	conn         driver.Conn
 	createSchema bool
 	updateClose  bool                   // closeMode=update: DDL adds patch-part table settings
+	scope        Scope                  // zero value = no recovery-read filtering
 	schemas      map[string]TableSchema // table name -> schema, set by EnsureSchema
+}
+
+// hasColumn reports whether the table declares the named column.
+func hasColumn(t TableSchema, name string) bool {
+	for _, c := range t.Columns {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Options configures the ClickHouse connection, including authentication. DSN
@@ -121,6 +143,9 @@ type Options struct {
 	// enable_block_number_column / enable_block_offset_column table settings
 	// that ClickHouse lightweight UPDATEs need.
 	UpdateClose bool
+	// Scope, when non-zero, filters recovery reads to this writer's own rows
+	// (see Scope). The column must be declared on every table.
+	Scope Scope
 }
 
 // buildClickHouseOptions resolves the DSN and applies auth/TLS overrides. It
@@ -203,7 +228,7 @@ func Open(ctx context.Context, o Options) (Store, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("ping clickhouse: %w", err)
 	}
-	return &chStore{conn: conn, createSchema: o.CreateSchema, updateClose: o.UpdateClose}, nil
+	return &chStore{conn: conn, createSchema: o.CreateSchema, updateClose: o.UpdateClose, scope: o.Scope}, nil
 }
 
 func (s *chStore) Ping(ctx context.Context) error { return s.conn.Ping(ctx) }
@@ -215,6 +240,9 @@ func (s *chStore) Close() error { return s.conn.Close() }
 func (s *chStore) EnsureSchema(ctx context.Context, tables []TableSchema) error {
 	s.schemas = make(map[string]TableSchema, len(tables))
 	for _, t := range tables {
+		if s.scope.Column != "" && !hasColumn(t, s.scope.Column) {
+			return fmt.Errorf("table %q: scope column %q is not declared (scopeColumn must be a constant present in every table)", t.Table, s.scope.Column)
+		}
 		s.schemas[t.Table] = t
 		if s.createSchema {
 			if err := s.createTable(ctx, t); err != nil {

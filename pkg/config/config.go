@@ -842,6 +842,18 @@ type StoreConfig struct {
 	// (added automatically when createSchema is on). See
 	// docs/lightweight-update-upgrade-plan.md.
 	CloseMode string `json:"closeMode,omitempty"`
+	// ScopeColumn names a global constant (history.constants) whose value
+	// identifies THIS exporter's rows in a table shared by multiple writers —
+	// e.g. one exporter per cluster, all writing to one ClickHouse, each with
+	// a different `cluster` constant. Restart recovery (open-row adoption,
+	// orphan reconciliation, the ingest_seq fuse) then only considers rows
+	// whose column equals this writer's value. Without it, a shared-table
+	// deployment self-destructs: writer B's ReconcileOpens closes every other
+	// writer's live rows because their objects are absent from B's informers.
+	// Required for multi-writer shared tables; leave empty for a single
+	// writer. Must reference a String constant so every table carries the
+	// column with a fixed per-process value.
+	ScopeColumn string `json:"scopeColumn,omitempty"`
 	// Batch tunes the ingest writer.
 	Batch BatchConfig `json:"batch,omitempty"`
 	// Reconnect tunes the background connect/reconnect loop. ClickHouse being
@@ -1102,6 +1114,23 @@ func (h History) validate(reg *Registry) error {
 			return fmt.Errorf("constants[%d]: column %q is duplicated", i, c.Name)
 		}
 		constNames[c.Name] = struct{}{}
+	}
+
+	if sc := h.Store.ScopeColumn; sc != "" {
+		found := false
+		for i := range h.Constants {
+			if h.Constants[i].Name != sc {
+				continue
+			}
+			if h.Constants[i].Type != "String" {
+				return fmt.Errorf("store.scopeColumn: constant %q must have type String (got %s)", sc, h.Constants[i].Type)
+			}
+			found = true
+			break
+		}
+		if !found {
+			return fmt.Errorf("store.scopeColumn: %q must name a history.constants entry (a fixed per-process value present in every table)", sc)
+		}
 	}
 
 	seenTable := map[string]struct{}{}

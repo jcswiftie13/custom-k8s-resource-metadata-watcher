@@ -174,6 +174,17 @@ func TestHistory_TokenBasicMutuallyExclusive(t *testing.T) {
 	}
 }
 
+// TestHistory_ScopeColumnValidates pins the multi-writer scope opt-in: a
+// scopeColumn naming a String global constant is accepted.
+func TestHistory_ScopeColumnValidates(t *testing.T) {
+	c := baseHistoryConfig()
+	c.History.Constants = []HistoryConstant{{Name: "cluster", Type: "String", Value: "cluster-a"}}
+	c.History.Store.ScopeColumn = "cluster"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+}
+
 func TestHistory_ValidationErrors(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -242,6 +253,16 @@ func TestHistory_ValidationErrors(t *testing.T) {
 		{"constants missing value", func(c *Config) {
 			c.History.Constants = []HistoryConstant{{Name: "cluster_name", Type: "String"}}
 		}, "value or valueEnv is required"},
+		{"scopeColumn unknown", func(c *Config) {
+			c.History.Store.ScopeColumn = "cluster"
+		}, "must name a history.constants entry"},
+		{"scopeColumn not a constant", func(c *Config) {
+			c.History.Store.ScopeColumn = "cluster_ip" // a per-resource column, not a constant
+		}, "must name a history.constants entry"},
+		{"scopeColumn wrong type", func(c *Config) {
+			c.History.Constants = []HistoryConstant{{Name: "shard", Type: "Int64", Value: "1"}}
+			c.History.Store.ScopeColumn = "shard"
+		}, "must have type String"},
 		{"anyOf empty", func(c *Config) {
 			c.History.Resources[0].Filters[0] = HistoryFilter{AnyOf: []HistoryFilter{}}
 		}, "at least one child"},

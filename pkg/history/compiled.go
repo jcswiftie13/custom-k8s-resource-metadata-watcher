@@ -168,6 +168,34 @@ func CompileAll(h config.History) ([]*CompiledResource, error) {
 	return out, nil
 }
 
+// ScopeValue resolves the store.scopeColumn constant's per-process value from
+// the compiled resources, for store.Options.Scope. Config validation
+// guarantees the column is a String global constant prepended to every
+// resource, so the first resource suffices; an empty column means scoping is
+// off and returns "".
+func ScopeValue(compiled []*CompiledResource, column string) (string, error) {
+	if column == "" {
+		return "", nil
+	}
+	for _, cr := range compiled {
+		for i := range cr.Columns {
+			c := &cr.Columns[i]
+			if c.Name != column || !c.IsConstant {
+				continue
+			}
+			v, ok := c.Constant.(string)
+			if !ok {
+				return "", fmt.Errorf("scope column %q: constant resolves to %T, want string", column, c.Constant)
+			}
+			if v == "" {
+				return "", fmt.Errorf("scope column %q: constant resolves to an empty string (a writer identity must be non-empty)", column)
+			}
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("scope column %q: no such constant column in compiled resources", column)
+}
+
 func compileColumn(c config.HistoryColumn) (CompiledColumn, error) {
 	cc := CompiledColumn{Name: c.Name, Type: c.Type, Encode: c.Encode, Index: c.Index}
 	if c.IsConstant() {

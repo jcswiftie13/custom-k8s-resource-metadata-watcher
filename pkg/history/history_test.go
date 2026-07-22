@@ -181,6 +181,42 @@ func TestCompileAll_InjectsConstants(t *testing.T) {
 	}
 }
 
+// ScopeValue feeds store.Options.Scope: the resolved constant is the writer's
+// identity in a multi-writer shared table.
+func TestScopeValue(t *testing.T) {
+	t.Setenv("CLUSTER_NAME", "cluster-a")
+	rs, err := CompileAll(config.History{
+		Constants: []config.HistoryConstant{
+			{Name: "cluster", Type: "String", ValueEnv: "CLUSTER_NAME"},
+		},
+		Resources: []config.HistoryResource{{
+			Kind:  "Service",
+			Table: "svc_versions",
+			Columns: []config.HistoryColumn{
+				{Extract: config.Extract{Path: "spec.clusterIP"}, Name: "cluster_ip", Type: "String"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CompileAll: %v", err)
+	}
+
+	v, err := ScopeValue(rs, "cluster")
+	if err != nil || v != "cluster-a" {
+		t.Fatalf("ScopeValue = %q, %v; want cluster-a", v, err)
+	}
+	if v, err := ScopeValue(rs, ""); err != nil || v != "" {
+		t.Fatalf("empty column must disable scoping, got %q, %v", v, err)
+	}
+	if _, err := ScopeValue(rs, "no_such"); err == nil {
+		t.Fatal("unknown scope column must error")
+	}
+	// A path column (non-constant) is not a valid identity.
+	if _, err := ScopeValue(rs, "cluster_ip"); err == nil {
+		t.Fatal("non-constant scope column must error")
+	}
+}
+
 func TestFilters_Ops(t *testing.T) {
 	obj := sampleService()
 	ev := collector.NewEvaluator()

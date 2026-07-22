@@ -129,6 +129,11 @@ func main() {
 			log.Error("history store token resolve failed", "err", err)
 			os.Exit(1)
 		}
+		scopeVal, err := history.ScopeValue(compiled, sc.ScopeColumn)
+		if err != nil {
+			log.Error("history store scopeColumn resolve failed", "err", err)
+			os.Exit(1)
+		}
 		histMgr = history.NewManager(history.ManagerOptions{
 			StoreOptions: store.Options{
 				DSN:           sc.DSN,
@@ -140,6 +145,7 @@ func main() {
 				TLSSkipVerify: sc.TLSSkipVerify,
 				CreateSchema:  sc.CreateSchemaEnabled(),
 				UpdateClose:   sc.CloseModeOrDefault() == config.CloseModeUpdate,
+				Scope:         store.Scope{Column: sc.ScopeColumn, Value: scopeVal},
 			},
 			Compiled:   compiled,
 			Informers:  col.Informers(),
