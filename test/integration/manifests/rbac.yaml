@@ -31,6 +31,11 @@ rules:
   - apiGroups: ["integration.metadata-exporter.example.com"]
     resources: ["widgets", "discoverywidgets"]
     verbs: ["get", "list", "watch"]
+  # Istio CRDs exercised by the ClickHouse history e2e (minimal CRDs created by
+  # the test; the exporter must be able to watch them).
+  - apiGroups: ["networking.istio.io"]
+    resources: ["gateways", "virtualservices"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

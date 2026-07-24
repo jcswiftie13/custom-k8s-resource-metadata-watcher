@@ -19,7 +19,7 @@ spec:
       serviceAccountName: metadata-exporter
       securityContext:
         runAsNonRoot: true
-        # Distroless image uses USER nonroot; kubelet requires a numeric UID when runAsNonRoot is set.
+        # Image USER is 65532; kubelet requires a numeric UID when runAsNonRoot is set.
         runAsUser: 65532
         runAsGroup: 65532
         seccompProfile:
@@ -31,13 +31,17 @@ spec:
           args:
             - --config=/etc/metadata-exporter/config.yaml
             - --metrics-addr=:8080
+          env:
+            # Used by history e2e valueEnv (history.constants cluster_name).
+            - name: CLUSTER_NAME
+              value: e2e-cluster
           ports:
             - name: metrics
               containerPort: 8080
               protocol: TCP
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: metrics
             initialDelaySeconds: 3
             periodSeconds: 5

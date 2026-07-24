@@ -128,7 +128,16 @@ rules:
 | `metricPrefix` | 選填前綴；與各 `rules[].name` 組成註冊用 Prometheus metric 名稱，並受 metric 命名 regex 檢查。 |
 | `discovery` | 選填；`enabled: true` 時允許用 Kubernetes discovery 補齊缺少的 `resource` / `scope`。預設 `false`。 |
 | `watch` | 選填 `WatchScope`：以 `watch.resources[]` 宣告每個 resource 的 GVR/GVK、scope、namespace 與 selector。 |
-| `rules` | **必填**、非空之 `Rule` 陣列。 |
+| `rules` | 選填之 `Rule` 陣列；宣告要匯出的 Prometheus metric。 |
+| `history` | 選填；事件驅動的 ClickHouse 版本化儲存（見 §14）。**寫了這個區塊即代表啟用。** |
+
+`rules` 與 `history` 是兩條**互相獨立**的輸出路徑，各自都可以單獨使用：
+
+- **rules-only**（只有 `rules`）：純 Prometheus exporter，不連 ClickHouse。
+- **history-only**（只有 `history`）：只寫版本化歷史；`/metrics` 仍然服務，但不含任何 rule 產生的 `_info` series。
+- **兩者並存**：同一份 informer cache 同時餵給 scrape 與 history ingest。
+
+兩者**至少須設定其一**——都沒有的設定不會做任何事，會在啟動時直接被拒絕。
 
 ---
 
@@ -688,6 +697,223 @@ make bench-collect
 | Owner 鏈解析（`Resolve`） | `pkg/collector/resolver.go` |
 | Scoped informer 群（每 (resource, namespace) 一份 factory） | `pkg/collector/listers.go` |
 | 整合測設定形狀 | `test/integration/e2e/config_yaml.go` |
+| `history`（`StoreConfig`/`HistoryConstant`/`HistoryResource`/`HistoryColumn`/`HistoryFilter`）| `pkg/config/config.go` |
+| 欄位/filter 編譯、client 端 filter、事件 handler、spec-hash 去重 | `pkg/history/`（`compiled.go`/`filter.go`/`ingest.go`/`hash.go`）|
+| ClickHouse writer、DDL 產生／驗證、批次寫入 | `pkg/store/`（`store.go`/`ddl.go`/`batch.go`）|
+| 共用抽取介面（`CompileExtract`/`EvaluateExtractAll`/`EvaluateExtractRaw`）| `pkg/collector/extract.go` |
+
+---
+
+## 14. `history`：事件驅動 ClickHouse 版本化儲存
+
+`history` 是**選配、且與 Prometheus scrape 路徑完全解耦**的區塊。啟用後，每個 informer 事件會對宣告的資源
+**append 一筆版本記錄**到 ClickHouse，供「回放到任意過去時間點」的歷史／取證查詢。
+
+它重用 `rules` 相同的 path 抽取引擎（`source` + `path` + `fallbacks` + `onMissing`），因此欄位宣告方式與
+label 一致。
+
+### 14.0 啟用語意
+
+**寫了 `history:` 區塊就是啟用**，不需要額外記得寫 `enabled: true`：
+
+| 設定 | 結果 |
+|------|------|
+| 沒有 `history:` 區塊 | 停用；exporter 行為與純 rules 模式完全相同，不會連 ClickHouse。 |
+| 有 `history:` 區塊、未寫 `enabled` | **啟用**。 |
+| 有 `history:` 區塊、`enabled: true` | 啟用（明確寫出意圖，仍然合法且建議）。 |
+| 有 `history:` 區塊、`enabled: false` | 停用（明確 opt-out：想暫時關掉又不想刪掉整個區塊時用）。 |
+
+解耦是**雙向**的：`rules` 也是選配的，只寫 `history` 而完全不寫 `rules` 是合法的 history-only 設定
+（見 `examples/history-clickhouse.yaml`）。但 `rules` 與 `history` 至少要有一個——兩者皆無的設定不做任何事，
+會被拒絕。
+
+> **升級注意**：舊版的 `enabled` 預設為 `false`，寫了 history 區塊卻漏掉 `enabled: true` 會**靜默停用**
+> （連 history 設定都不驗證）。新版改為「有區塊即啟用」，這類設定升級後會開始寫入 ClickHouse；半成品的
+> history 區塊也會在啟動時直接報錯，而不再被默默忽略。若要維持停用，請明確寫 `enabled: false`。
+
+### 14.1 頂層結構
+
+```yaml
+history:
+  enabled: true               # 選填；省略即啟用。設 false 為明確停用（見 14.0）
+  store:
+    type: clickhouse
+    dsn: "clickhouse://host:9000/db"   # 或 http://host:8123/db（HTTP）；見 14.6
+    createSchema: true          # dev；prod 預設 false（見 14.4）
+    closeMode: rewrite          # rewrite（預設）| update（需 CH >= 25.8，見 14.5）
+    batch: { maxRows: 5000, flushIntervalMs: 1000 }
+    reconnect:                  # 背景連線／重連調校（皆選填，見 14.7）
+      initialBackoffMs: 1000    # 首次重試間隔
+      maxBackoffMs: 30000       # 重試間隔上限（指數退避 ×2，±20% jitter）
+      pingTimeoutMs: 5000       # 單次連線／健康檢查的逾時
+    # --- 身分驗證（皆選填，見 14.6）---
+    username: default
+    passwordEnv: CH_PASSWORD    # 由 k8s Secret 注入的 env 變數（優先於 password）
+    secure: true                # 開啟 TLS（https:// DSN 亦需）
+  # 固定值欄位，自動注入每一張 history 表（適合 cluster name）
+  constants:
+    - { name: cluster_name, type: String, valueEnv: CLUSTER_NAME }
+  resources:
+    - kind: VirtualService      # 必須同時出現在 watch.resources
+      table: vs_versions        # 選填，預設 <kind 小寫>_versions
+      columns: [ ... ]          # 見 14.2
+      filters: [ ... ]          # 見 14.3
+```
+
+### 14.2 `columns`：宣告 ClickHouse 欄位
+
+每個 column 有兩種互斥模式：
+
+1. **Path 模式**：從 K8s 物件用 json path 取值（可搭配 `fallbacks`／`onMissing`）。
+2. **Constant 模式**：`value` 或 `valueEnv` 寫入固定 scalar（與 path 互斥）。
+
+另可用頂層 [`history.constants`](#141-頂層結構) 把同一組常數注入**所有**表（不必在每個 resource 重複宣告）。
+
+| 欄位 | 說明 |
+|------|------|
+| `name` | ClickHouse 欄位名（合法識別字，不可與 envelope 或 `history.constants` 衝突）|
+| `type` | `String` / `Array(String)` / `Int64` / `UInt64` / `Float64` / `Bool` / `DateTime64(3)` |
+| `path` / `source` / `fallbacks` / `onMissing` | Path 模式；同 `rules` 的 `Extract`。wildcard `[*]` 產生 `Array(String)`。miss 時：有 `onMissing` 則用它，否則寫該型別零值（`""`／`[]`／`0`／…）|
+| `value` / `valueEnv` | Constant 模式（互斥）；僅 scalar 型別，不可與 path／encode／onMissing 並用。`valueEnv` 於啟動時 resolve，空則 fail fast |
+| `encode` | `""`（scalar）、`json`（需 `type: String`）、`kv`（需 `type: Array(String)`）；不可與 `onMissing` 或 constant 並用 |
+| `index` | `""` 或 `bloom_filter`（產生 skip index，加速 `has`/`hasAll` 查詢）|
+
+**Envelope 欄位為隱含、每張表都有**（不可重複宣告），型別由寫入端固定（`pkg/store/ddl.go`）：
+
+| Envelope 欄位 | ClickHouse 型別 | 意義 |
+|---------------|-----------------|------|
+| `namespace` | `LowCardinality(String)` | 物件 namespace（cluster-scoped 資源為空字串）|
+| `name` | `String` | 物件名稱 |
+| `uid` | `String` | 物件 UID；進 ORDER BY key，讓同名刪建（不同 uid）成為各自的時間線 |
+| `valid_from` | `DateTime64(3)` | 版本起始（Add 用 `creationTimestamp`，其餘為觀測時間）；每 uid 嚴格遞增 |
+| `valid_to` | `DateTime64(3)` | 版本結束；開放版本為哨兵 `2200-01-01`，關版／刪除時物化。刻意排除於 ORDER BY 之外 |
+| `ingest_seq` | `UInt64` | 寫入序號；`ReplacingMergeTree` 的版本欄，同排序鍵取最大者勝出 |
+
+排序鍵為 `ORDER BY (namespace, name, uid, valid_from)`（見 §14.5）。
+
+### 14.3 `filters`：client 端欄位過濾（支援 regex）
+
+除了 `watch.resources` 的 **server 端 `labelSelector`／`fieldSelector`**（只支援 k8s 的 `=`／`in`／`exists`，
+**不支援 regex**）之外，`filters` 可對「watch 回來的任意欄位值」再做一層 **client 端**過濾，**符合才寫入**。
+同一資源的多個頂層 filter 為 **AND**；一個頂層 entry 可以改用 `anyOf` 宣告 **OR 群組**（任一子條件符合即通過）。
+
+| 欄位 | 說明 |
+|------|------|
+| `path` / `source` | 要比對的欄位（同 `Extract`）；wildcard path 採 **match-any** |
+| `op` | `exists` / `equals` / `notEquals` / `prefix` / `suffix` / `contains` / `in` / `regex` |
+| `value` | scalar 運算元（`equals`/`prefix`/`suffix`/`contains`/`regex`）|
+| `values` | `op: in` 的集合 |
+| `negate` | 反轉結果 |
+| `anyOf` | OR 群組：子條件（同上述 leaf 欄位）任一符合即通過；與所有 leaf 欄位**互斥**，且**不可再巢狀** `anyOf`（僅一層）。群組本身不支援 `negate`（`NOT(a OR b)` 可用兩個頂層 negated leaf 表達）；子條件內的 `negate` 照常可用 |
+
+```yaml
+filters:
+  # 頂層 entries 彼此 AND
+  - { path: "spec.type", op: in, values: [LoadBalancer, NodePort] }
+  # anyOf 內子條件 OR
+  - anyOf:
+      - { path: "metadata.namespace", op: prefix, value: "prod-" }
+      - { path: "metadata.labels['tier']", op: equals, value: "critical" }
+```
+
+**效能**：regex 用 Go RE2（線性時間、無 catastrophic backtracking）；編譯一次於啟動（壞 pattern 立即 fail）。
+執行時 **非 regex filter 先算、regex 最後**（頂層以群組為單位排序，`anyOf` 群組內亦同），遇第一個不符的頂層
+entry 即短路（`anyOf` 內則遇第一個符合即短路）；只抽取 filter 引用到的 path。regex **無法**
+下推給 apiserver，只能在此 client 端做——這也是本層存在的原因。
+
+### 14.4 Schema 由誰定義（`createSchema`）
+
+**config 是 schema 的唯一來源**（json path 取出的值無型別，只有 config 知道要對應成什麼 CH 型別）。exporter
+依 config 產生 DDL，行為由 `store.createSchema` 控制：
+
+- `true`（dev）→ `CREATE TABLE IF NOT EXISTS` + 加法式 `ADD COLUMN IF NOT EXISTS`（**永不** drop／改型別）。
+- `false`（**prod 預設**）→ 只查 `system.columns` **驗證**線上 schema 與 config 是否一致，**有偏差就 fail fast、不變更任何東西**。
+
+### 14.5 版本化語意與 `closeMode`
+
+每個事件產生一個新開放版本（`valid_from` 為觀測時間，Add 用 `creationTimestamp`；開放版本
+`valid_to` = 遠未來哨兵 `2200-01-01`），前一版的 `valid_to` **於寫入端物化**、由 `store.closeMode` 決定收尾方式：
+
+- **`rewrite`（預設，任何 CH 版本可用）**：把前一版**整列**以相同排序鍵、更高 `ingest_seq` 重插一次並填上
+  `valid_to`（= 新版的 `valid_from`）；`ReplacingMergeTree(ingest_seq)` 於 merge 時折疊，收尾列勝出。
+  merge 收斂前同 key 會短暫存在兩列（stale 開放列 + 收尾列），**讀取端必須套 no-FINAL dedup 模式**
+  （SQL 不過濾 `valid_to`、client 依 `(namespace,name,uid,valid_from)` 取 max `ingest_seq` 後才套 liveness）。
+- **`update`（需 ClickHouse ≥ 25.8）**：以 lightweight `UPDATE`（patch parts）**原地**把開放列的 `valid_to`
+  收攏——每個版本恆為唯一一列、寫入當下即最終、不依賴 merge 時機。需要表級設定
+  `enable_block_number_column = 1, enable_block_offset_column = 1`（`createSchema: true` 時自動建立／
+  以 `ALTER TABLE ... MODIFY SETTING` 加法遷移既有表；`createSchema: false` 時啟動會驗證並 fail fast）。
+  UPDATE 條件鎖定 `(namespace, name, uid, valid_from, valid_to=哨兵)`，天然冪等；ingest 迴圈保證
+  同批次內 INSERT 先送、close 後執行。升級與回滾流程見 `docs/lightweight-update-upgrade-plan.md`。
+
+**重啟冪等（兩種模式皆執行）**：啟動時（informer 起動前）自動從 CH 恢復 last-state——讀回每 uid 最新
+開放列的**宣告欄位值**並就地重算 column hash（hash 不落庫），re-LIST 不會重插已寫入的版本。
+`update` 模式另會掃除 crash 遺留的 stale 開放列。
+
+兩種模式下 Delete 都只收尾最後一版（`valid_to` = 刪除觀測時刻），**不寫 tombstone 列**——
+`valid_to` 已完整表達刪除語意。
+
+去重分兩層：ingest 端 **column-hash**（只雜湊會寫入的宣告欄位值，行程內比對、不落庫；丟棄 resync／
+無宣告欄變動的 no-op），CH 端 `ReplacingMergeTree(ingest_seq)` +
+`ORDER BY (namespace, name, uid, valid_from)`。`uid` 進 key 讓同名刪建（不同 uid）成為各自的時間線；
+`valid_from` 由 ingest 保證每 uid 嚴格遞增（同毫秒變更 +1ms），取代舊 `resource_version` 的角色。
+**`valid_to` 刻意排除於 ORDER BY 之外**：唯有排序鍵相同，收尾列才折疊得掉它所收尾的開放列（rewrite），
+且 lightweight UPDATE 不能改排序鍵欄位（update）。
+
+範例完整設定見 `examples/history-clickhouse.yaml`。
+
+### 14.6 身分驗證（`store` 的 auth 欄位）
+
+`dsn` 仍可內嵌帳密（`clickhouse://user:pass@host:9000/db`），但以下**第一級欄位會覆寫** DSN 內嵌值，並提供
+安全的憑證來源。皆為選填；不設就沿用 DSN。
+
+| 欄位 | 說明 |
+|------|------|
+| `username` / `usernameEnv` | 使用者；`usernameEnv` 指定 env 變數名並**優先** |
+| `password` / `passwordEnv` | 密碼；`passwordEnv` 指定 env 變數名並**優先** |
+| `database` | 覆寫目標 database |
+| `token` / `tokenEnv` | JWT／access token（ClickHouse Cloud）；設定時**取代** basic auth |
+| `secure` | 開啟 TLS（ClickHouse Cloud 必需；`https://` DSN 也需此欄或 DSN `?secure=true`） |
+| `tlsSkipVerify` | 略過 server 憑證驗證（測試／自簽用） |
+
+- **密鑰別放 ConfigMap**：production 用 `passwordEnv`/`tokenEnv`／`usernameEnv` 指向由 **k8s Secret 注入的環境變數**，
+  避免明文落在 ConfigMap；`*Env` 設了但該 env 為空會在啟動時 fail fast。
+- **`token` 與 `username`/`password` 互斥**（JWT 在 `clickhouse-go` 會取代 basic auth）；同時設定會驗證失敗。
+- `secure` 未開時走明文；authenticated ClickHouse（尤其 Cloud）通常需 `secure: true`。
+- **協定由 DSN scheme 決定**（非 port）：`clickhouse://` = native TCP；`http://` / `https://` = HTTP 介面（8123）。
+  `clickhouse://host:8123` 仍是 native，連到 HTTP listener 會失敗。HTTP 寫入路徑會預設啟用 LZ4 block compression；
+  DSN 若已設 `compress=` 則不覆寫。e2e：`TestHistory_ClickHouseHTTP`。
+- 未涵蓋：mTLS client 憑證、LDAP/Kerberos（未來如需再擴充）。
+
+### 14.7 降級啟動與背景重連（`store.reconnect`）
+
+ClickHouse 連不上**不會**阻止 exporter 啟動：metrics/watcher 功能照常運作，history 子系統由背景 manager
+以指數退避（`initialBackoffMs` 起 ×2、上限 `maxBackoffMs`、±20% jitter）持續重試連線，連上後才依序執行
+schema 驗證 → 重啟復原（Recover）→ 註冊事件 handler 開始寫入。晚註冊時 informer cache 會完整重放為 Add
+事件，等同重新 LIST——**斷線窗口內的「最終狀態」不會漏**，但窗口內的中間版本（改兩次只留一版、建了又刪）
+不會被記錄，語意與 exporter 重啟相同。連線後另有 reconciliation sweep：在停機／斷線期間**被刪除**的物件，
+其殘留的 open row 會以觀測時間補上 `valid_to`。
+
+執行期行為：
+
+- manager 每 15s ping 一次；失敗即進入 degraded（`/readyz` 的 `history.state` 與
+  `exporter_history_store_connected=0` 可觀測），期間寫入 fail-soft——失敗批次直接丟棄並計數
+  （`exporter_history_write_failures_total`），不會重啟 process。
+- **恢復語意 = 重啟語意**：恢復連線時，若斷線期間有任何資料損失（flush 失敗、queue 淘汰、
+  close 側緩衝溢出），manager 會 teardown 現有 ingest pipeline 並重走一次初始化
+  （Recover → cache replay → reconciliation sweep），把所有 resource 的現況補寫回 ClickHouse——
+  斷線期間變更過的物件不會停留在舊版本。零損失的短暫閃斷則原地恢復、不重建。重建之間有
+  最小間隔（60s）避免 flapping 造成重建風暴。斷線期間的**中間版本**（改兩次只留一版、
+  建了又刪）仍會遺失，與 process 重啟的語意一致。
+- ingest queue（容量 `2×batch.maxRows`）滿時**丟最舊的 insert**（不再是舊版的阻塞等待；
+  `exporter_history_dropped_events_total{kind="insert"}` 計數）。close 操作不丟——被擠出時進側緩衝區、
+  下輪 flush 優先送出，避免留下永不關閉的 stale open row；僅在側緩衝區也滿（極端積壓）時才丟並計入
+  `kind="close"`。**注意**：這代表 ClickHouse 只是「慢」（未斷線）且事件量持續超過寫入速率時，可能丟棄
+  本來等一下就補得上的版本——以 dropped counter 告警即可察覺。
+- `/healthz` 維持純 liveness（process 活著即 200）；`/readyz` 在 informer cache 同步前回 503，
+  之後回 200 並附上 history 狀態 JSON——**history 降級不會讓 pod 退出 ready**，這正是本設計的目的。
+
+相關 metrics：`exporter_history_store_connected`（gauge）、`exporter_history_dropped_events_total{kind}`、
+`exporter_history_write_failures_total`、`exporter_history_reconnect_attempts_total`。
 
 ---
 

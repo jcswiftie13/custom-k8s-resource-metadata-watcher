@@ -1,0 +1,45 @@
+metadata-exporter ClickHouse (single instance)
+
+Release: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+Native DSN (metadata-exporter history / poc chstore):
+{{- if include "clickhouse.auth.secretEnabled" . }}
+  clickhouse://default:<password>@{{ include "clickhouse.fullname" . }}:{{ .Values.service.nativePort }}/default
+  (read password from Secret {{ .Values.auth.secret.existingSecret }}, key {{ .Values.auth.secret.passwordKey }})
+{{- else }}
+  clickhouse://default@{{ include "clickhouse.fullname" . }}:{{ .Values.service.nativePort }}/default
+{{- end }}
+
+{{- if include "clickhouse.auth.secretEnabled" . }}
+Auth Secret (create out-of-band before install):
+  kubectl create secret generic {{ .Values.auth.secret.existingSecret }} \
+    -n {{ .Release.Namespace }} \
+    --from-literal={{ .Values.auth.secret.passwordKey }}='YOUR_PASSWORD'
+{{- end }}
+
+HTTP ping:
+  http://{{ include "clickhouse.fullname" . }}:{{ .Values.service.httpPort }}/ping
+
+Lightweight UPDATE profile settings are enabled in the default user profile.
+Table-level patch-part settings (enable_block_number_column / enable_block_offset_column)
+are applied by metadata-exporter when history.store.closeMode=update and createSchema=true.
+
+{{- if .Values.schema.init.enabled }}
+
+POC route2a tables (schema.init.enabled):
+  service_versions, deploy_versions, gw_versions, vs_versions
+  Created on first boot via /docker-entrypoint-initdb.d (empty data dir only).
+  DDL: files/initdb/01-poc-route2a-schema.sql (mirrors poc/route2a/internal/chstore).
+
+Verify tables:
+  kubectl exec -n {{ .Release.Namespace }} statefulset/{{ include "clickhouse.fullname" . }} -- \
+    clickhouse-client --query "SHOW TABLES"
+{{- end }}
+
+Verify after install:
+  kubectl exec -n {{ .Release.Namespace }} statefulset/{{ include "clickhouse.fullname" . }} -- \
+    clickhouse-client --query "SELECT name, value FROM system.settings WHERE name LIKE '%lightweight_update%'"
+
+Scale (standalone only — each replica is an independent instance until cluster mode ships):
+  helm upgrade {{ .Release.Name }} ./deploy/clickhouse -n {{ .Release.Namespace }} --set replicaCount=2

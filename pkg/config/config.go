@@ -7,6 +7,10 @@
 // declare expandLabels which flatten Kubernetes maps (typically
 // metadata.labels / metadata.annotations) into dynamic Prometheus label
 // names at scrape time.
+//
+// The optional history block is a second, independent output path (a ClickHouse
+// version store). Rules and history are each optional on their own, but a config
+// with neither does nothing and is rejected.
 package config
 
 import (
@@ -201,8 +205,23 @@ type Config struct {
 	// apiserver. It is disabled by default.
 	Discovery DiscoveryConfig `json:"discovery,omitempty"`
 
-	// Rules declares the set of metrics to export.
-	Rules []Rule `json:"rules"`
+	// Rules declares the set of metrics to export. It may be empty when a
+	// history block is declared (history-only mode).
+	Rules []Rule `json:"rules,omitempty"`
+
+	// History optionally enables the event-driven ClickHouse version store.
+	// It is fully decoupled from the scrape/export path; a nil History means
+	// the exporter behaves exactly as before.
+	History *History `json:"history,omitempty"`
+}
+
+// HistoryEnabled reports whether the history store should run. Declaring a
+// history block turns it on; enabled: false is the explicit opt-out.
+func (c *Config) HistoryEnabled() bool {
+	if c.History == nil {
+		return false
+	}
+	return c.History.Enabled == nil || *c.History.Enabled
 }
 
 // WatchScope describes which kinds to watch, optional namespace limits, and
@@ -730,6 +749,560 @@ func resourceName(r WatchResource) string {
 	return r.Kind
 }
 
+// chIdentRe matches a legal ClickHouse column/table identifier.
+var chIdentRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// historyColumnTypes is the allowlist of ClickHouse column types a history
+// column may declare. The type is authoritative: the exporter marshals the
+// json-path value into this type and generates matching DDL.
+var historyColumnTypes = map[string]struct{}{
+	"String": {}, "Array(String)": {}, "Int64": {}, "UInt64": {},
+	"Float64": {}, "Bool": {}, "DateTime64(3)": {},
+}
+
+// historyFilterOps is the allowlist of filter operators. Ordering guarantees
+// (cheap ops before regex, short-circuit) are enforced at evaluation time.
+var historyFilterOps = map[string]struct{}{
+	"exists": {}, "equals": {}, "notEquals": {}, "prefix": {},
+	"suffix": {}, "contains": {}, "in": {}, "regex": {},
+}
+
+// reservedHistoryColumns are the implicit envelope columns present on every
+// history table; a resource may not redeclare them.
+var reservedHistoryColumns = map[string]struct{}{
+	"namespace": {}, "name": {}, "uid": {},
+	"valid_from": {}, "valid_to": {}, "ingest_seq": {},
+}
+
+// Batch defaults for the history ingest writer.
+const (
+	DefaultBatchMaxRows = 5000
+	DefaultBatchFlushMs = 1000
+)
+
+// Reconnect defaults for the history store's background connect loop.
+const (
+	DefaultReconnectInitialBackoffMs = 1000
+	DefaultReconnectMaxBackoffMs     = 30000
+	DefaultReconnectPingTimeoutMs    = 5000
+)
+
+// History configures the optional event-driven ClickHouse version store.
+// Every informer event for a declared resource appends a version row; the store
+// is append-only, and valid_to is materialized by re-inserting the superseded
+// row with its end time (ReplacingMergeTree collapses the pair).
+type History struct {
+	// Enabled is an explicit opt-out: declaring a history block is what turns
+	// the store on, so nil (field omitted) means enabled. Set enabled: false to
+	// keep the block in place while turning ingest off.
+	Enabled *bool       `json:"enabled,omitempty"`
+	Store   StoreConfig `json:"store,omitempty"`
+	// Constants are fixed-value columns injected into every history table
+	// (e.g. cluster_name). Names must not collide with envelope columns or
+	// any per-resource column.
+	Constants []HistoryConstant `json:"constants,omitempty"`
+	Resources []HistoryResource `json:"resources,omitempty"`
+}
+
+// HistoryConstant declares a scalar column with a fixed value written on every
+// row of every history table. value and valueEnv are mutually exclusive; one
+// is required. Array(String) is not supported.
+type HistoryConstant struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Value    string `json:"value,omitempty"`
+	ValueEnv string `json:"valueEnv,omitempty"`
+	Index    string `json:"index,omitempty"`
+}
+
+// StoreConfig describes the ClickHouse backend for the history store.
+type StoreConfig struct {
+	// Type currently must be "clickhouse".
+	Type string `json:"type,omitempty"`
+	// DSN is a ClickHouse connection string. Supported schemes:
+	//   clickhouse://host:9000/db  — native TCP protocol (default / recommended)
+	//   http://host:8123/db        — HTTP interface (e.g. via ingress / proxy)
+	//   https://host/db            — HTTP over TLS; pair with secure: true
+	// clickhouse://host:8123 still speaks native and will fail against an HTTP
+	// listener — the scheme, not the port, selects the protocol.
+	DSN string `json:"dsn,omitempty"`
+	// CreateSchema toggles auto-DDL. nil/false (prod-safe default) means the
+	// exporter only validates the live schema against config and fails fast on
+	// drift, mutating nothing. true (dev) means CREATE TABLE IF NOT EXISTS plus
+	// additive ADD COLUMN IF NOT EXISTS. It never drops or retypes columns.
+	CreateSchema *bool `json:"createSchema,omitempty"`
+	// CloseMode selects how a superseded/deleted version's valid_to is
+	// materialized. "rewrite" (default) re-inserts the prior row with valid_to
+	// filled in and a higher ingest_seq, collapsed later by
+	// ReplacingMergeTree — works on any ClickHouse version but leaves
+	// transient duplicate rows until background merges run. "update" closes
+	// the open row in place with a lightweight UPDATE (patch parts) so every
+	// version is always exactly one row — requires ClickHouse >= 25.8 and the
+	// enable_block_number_column / enable_block_offset_column table settings
+	// (added automatically when createSchema is on). See
+	// docs/lightweight-update-upgrade-plan.md.
+	CloseMode string `json:"closeMode,omitempty"`
+	// ScopeColumn names a global constant (history.constants) whose value
+	// identifies THIS exporter's rows in a table shared by multiple writers —
+	// e.g. one exporter per cluster, all writing to one ClickHouse, each with
+	// a different `cluster` constant. Restart recovery (open-row adoption,
+	// orphan reconciliation, the ingest_seq fuse) then only considers rows
+	// whose column equals this writer's value. Without it, a shared-table
+	// deployment self-destructs: writer B's ReconcileOpens closes every other
+	// writer's live rows because their objects are absent from B's informers.
+	// Required for multi-writer shared tables; leave empty for a single
+	// writer. Must reference a String constant so every table carries the
+	// column with a fixed per-process value.
+	ScopeColumn string `json:"scopeColumn,omitempty"`
+	// Batch tunes the ingest writer.
+	Batch BatchConfig `json:"batch,omitempty"`
+	// Reconnect tunes the background connect/reconnect loop. ClickHouse being
+	// unreachable never prevents the exporter from starting: the history
+	// manager keeps retrying with exponential backoff and begins ingesting
+	// once a connection succeeds.
+	Reconnect ReconnectConfig `json:"reconnect,omitempty"`
+
+	// --- Authentication (all optional). When set, these override any
+	// credentials embedded in DSN. For secrets, prefer the *Env variants
+	// (populated from a Kubernetes Secret) so no plaintext lives in the
+	// ConfigMap; the *Env form takes precedence over its inline counterpart.
+	// token/tokenEnv (JWT / ClickHouse Cloud access token) is mutually
+	// exclusive with username/password (it replaces basic auth). ---
+
+	// Username is the ClickHouse user (inline).
+	Username string `json:"username,omitempty"`
+	// UsernameEnv names an env var holding the username; takes precedence.
+	UsernameEnv string `json:"usernameEnv,omitempty"`
+	// Password is the ClickHouse password (inline; dev only).
+	Password string `json:"password,omitempty"`
+	// PasswordEnv names an env var holding the password; takes precedence.
+	PasswordEnv string `json:"passwordEnv,omitempty"`
+	// Database overrides the target database.
+	Database string `json:"database,omitempty"`
+	// Token is a JWT / access token (inline). Replaces username/password.
+	Token string `json:"token,omitempty"`
+	// TokenEnv names an env var holding the token; takes precedence.
+	TokenEnv string `json:"tokenEnv,omitempty"`
+	// Secure enables TLS to ClickHouse (required by ClickHouse Cloud).
+	Secure *bool `json:"secure,omitempty"`
+	// TLSSkipVerify disables server certificate verification (test/self-signed).
+	TLSSkipVerify bool `json:"tlsSkipVerify,omitempty"`
+}
+
+// CreateSchemaEnabled reports whether auto-DDL is turned on.
+func (s StoreConfig) CreateSchemaEnabled() bool {
+	return s.CreateSchema != nil && *s.CreateSchema
+}
+
+// Close-mode values for StoreConfig.CloseMode.
+const (
+	CloseModeRewrite = "rewrite"
+	CloseModeUpdate  = "update"
+)
+
+// CloseModeOrDefault returns the configured close mode, defaulting to rewrite
+// (the mode with no ClickHouse version requirement).
+func (s StoreConfig) CloseModeOrDefault() string {
+	if s.CloseMode == "" {
+		return CloseModeRewrite
+	}
+	return s.CloseMode
+}
+
+// SecureEnabled reports whether TLS is turned on.
+func (s StoreConfig) SecureEnabled() bool {
+	return s.Secure != nil && *s.Secure
+}
+
+// resolveCred returns the value of envName (if set) or the inline fallback.
+// When envName is set but the environment variable is empty, it is treated as
+// a misconfiguration and an error is returned.
+func resolveCred(kind, envName, inline string) (string, error) {
+	if envName == "" {
+		return inline, nil
+	}
+	v := os.Getenv(envName)
+	if v == "" {
+		return "", fmt.Errorf("store.%sEnv references empty environment variable %q", kind, envName)
+	}
+	return v, nil
+}
+
+// ResolveUsername returns the username from UsernameEnv (preferred) or Username.
+func (s StoreConfig) ResolveUsername() (string, error) {
+	return resolveCred("username", s.UsernameEnv, s.Username)
+}
+
+// ResolvePassword returns the password from PasswordEnv (preferred) or Password.
+func (s StoreConfig) ResolvePassword() (string, error) {
+	return resolveCred("password", s.PasswordEnv, s.Password)
+}
+
+// ResolveToken returns the token from TokenEnv (preferred) or Token.
+func (s StoreConfig) ResolveToken() (string, error) {
+	return resolveCred("token", s.TokenEnv, s.Token)
+}
+
+// BatchConfig tunes the ingest batch writer.
+type BatchConfig struct {
+	MaxRows         int `json:"maxRows,omitempty"`
+	FlushIntervalMs int `json:"flushIntervalMs,omitempty"`
+}
+
+// MaxRowsOrDefault returns the configured batch size or the default.
+func (b BatchConfig) MaxRowsOrDefault() int {
+	if b.MaxRows > 0 {
+		return b.MaxRows
+	}
+	return DefaultBatchMaxRows
+}
+
+// FlushIntervalMsOrDefault returns the configured flush interval or the default.
+func (b BatchConfig) FlushIntervalMsOrDefault() int {
+	if b.FlushIntervalMs > 0 {
+		return b.FlushIntervalMs
+	}
+	return DefaultBatchFlushMs
+}
+
+// ReconnectConfig tunes the history store's background connect/reconnect loop.
+// Backoff between failed connection attempts doubles from InitialBackoffMs up
+// to MaxBackoffMs (with ±20% jitter, not configurable); PingTimeoutMs bounds
+// each individual connect/ping attempt.
+type ReconnectConfig struct {
+	InitialBackoffMs int `json:"initialBackoffMs,omitempty"`
+	MaxBackoffMs     int `json:"maxBackoffMs,omitempty"`
+	PingTimeoutMs    int `json:"pingTimeoutMs,omitempty"`
+}
+
+// InitialBackoffMsOrDefault returns the configured initial backoff or the default.
+func (r ReconnectConfig) InitialBackoffMsOrDefault() int {
+	if r.InitialBackoffMs > 0 {
+		return r.InitialBackoffMs
+	}
+	return DefaultReconnectInitialBackoffMs
+}
+
+// MaxBackoffMsOrDefault returns the configured backoff cap or the default.
+func (r ReconnectConfig) MaxBackoffMsOrDefault() int {
+	if r.MaxBackoffMs > 0 {
+		return r.MaxBackoffMs
+	}
+	return DefaultReconnectMaxBackoffMs
+}
+
+// PingTimeoutMsOrDefault returns the configured per-attempt timeout or the default.
+func (r ReconnectConfig) PingTimeoutMsOrDefault() int {
+	if r.PingTimeoutMs > 0 {
+		return r.PingTimeoutMs
+	}
+	return DefaultReconnectPingTimeoutMs
+}
+
+// HistoryResource declares one watched Kind's columns and filters. The Kind
+// must also appear in watch.resources so the informer cache is populated.
+type HistoryResource struct {
+	Kind    string          `json:"kind"`
+	Table   string          `json:"table,omitempty"`
+	Columns []HistoryColumn `json:"columns,omitempty"`
+	Filters []HistoryFilter `json:"filters,omitempty"`
+}
+
+// TableName returns the configured table or a default derived from the Kind.
+func (r HistoryResource) TableName() string {
+	if r.Table != "" {
+		return r.Table
+	}
+	return strings.ToLower(r.Kind) + "_versions"
+}
+
+// HistoryColumn declares one ClickHouse column and how to populate it.
+//
+// Two mutually exclusive modes:
+//   - Path mode: embedded Extract (source/path/fallbacks/onMissing) pulls a
+//     value from the watched object, same engine as metric labels.
+//   - Constant mode: Value or ValueEnv supplies a fixed scalar (no path).
+type HistoryColumn struct {
+	Extract
+	// Name is the ClickHouse column name.
+	Name string `json:"name"`
+	// Type is one of the allowlisted ClickHouse types.
+	Type string `json:"type"`
+	// Encode transforms the extracted value: "" (scalar), "json" (marshal the
+	// extracted subtree to a JSON string; requires type String), "kv" (flatten
+	// a map into sorted "k=v" tokens; requires type Array(String)).
+	// Incompatible with constant mode and with onMissing.
+	Encode string `json:"encode,omitempty"`
+	// Index optionally attaches a skip index: "" or "bloom_filter".
+	Index string `json:"index,omitempty"`
+	// Value is a fixed scalar for constant-mode columns (mutually exclusive
+	// with path extraction and with ValueEnv).
+	Value string `json:"value,omitempty"`
+	// ValueEnv names an env var holding the constant; mutually exclusive with
+	// Value and with path extraction. Resolved at startup (fail fast if empty).
+	ValueEnv string `json:"valueEnv,omitempty"`
+}
+
+// IsConstant reports whether this column is populated from Value/ValueEnv
+// rather than json-path extraction.
+func (c HistoryColumn) IsConstant() bool {
+	return c.Value != "" || c.ValueEnv != ""
+}
+
+// HistoryFilter declares one client-side predicate on an extracted field.
+// Top-level filter entries on a resource are AND-combined: every entry must
+// pass for the object to be written. An entry is either a leaf predicate
+// (Extract + Op) or an AnyOf OR-group of leaf predicates.
+type HistoryFilter struct {
+	Extract
+	// Op is one of the allowlisted operators.
+	Op string `json:"op"`
+	// Value is the operand for scalar ops (equals/prefix/suffix/contains/regex).
+	Value string `json:"value,omitempty"`
+	// Values is the operand set for op=in.
+	Values []string `json:"values,omitempty"`
+	// Negate inverts the match result.
+	Negate bool `json:"negate,omitempty"`
+	// AnyOf, when set, makes this entry an OR group: it passes if any child
+	// leaf filter passes. Mutually exclusive with all leaf fields; children
+	// may not nest anyOf (one level only).
+	AnyOf []HistoryFilter `json:"anyOf,omitempty"`
+}
+
+func (h History) validate(reg *Registry) error {
+	if h.Store.Type != "clickhouse" {
+		return fmt.Errorf("store.type: only \"clickhouse\" is supported (got %q)", h.Store.Type)
+	}
+	if strings.TrimSpace(h.Store.DSN) == "" {
+		return fmt.Errorf("store.dsn: required")
+	}
+	switch h.Store.CloseMode {
+	case "", CloseModeRewrite, CloseModeUpdate:
+	default:
+		return fmt.Errorf("store.closeMode: must be %q or %q (got %q)", CloseModeRewrite, CloseModeUpdate, h.Store.CloseMode)
+	}
+	// token/JWT replaces basic auth in clickhouse-go, so the two are mutually
+	// exclusive.
+	hasToken := h.Store.Token != "" || h.Store.TokenEnv != ""
+	hasBasic := h.Store.Username != "" || h.Store.UsernameEnv != "" ||
+		h.Store.Password != "" || h.Store.PasswordEnv != ""
+	if hasToken && hasBasic {
+		return fmt.Errorf("store: token/tokenEnv is mutually exclusive with username/password (JWT replaces basic auth)")
+	}
+	rc := h.Store.Reconnect
+	if rc.InitialBackoffMs < 0 || rc.MaxBackoffMs < 0 || rc.PingTimeoutMs < 0 {
+		return fmt.Errorf("store.reconnect: backoff/timeout values must not be negative")
+	}
+	if rc.InitialBackoffMsOrDefault() > rc.MaxBackoffMsOrDefault() {
+		return fmt.Errorf("store.reconnect: initialBackoffMs (%d) must not exceed maxBackoffMs (%d)",
+			rc.InitialBackoffMsOrDefault(), rc.MaxBackoffMsOrDefault())
+	}
+	if len(h.Resources) == 0 {
+		return fmt.Errorf("resources: at least one resource is required when a history block is declared")
+	}
+
+	constNames := map[string]struct{}{}
+	for i := range h.Constants {
+		c := &h.Constants[i]
+		if err := c.validate(); err != nil {
+			return fmt.Errorf("constants[%d] (name=%q): %w", i, c.Name, err)
+		}
+		if _, reserved := reservedHistoryColumns[c.Name]; reserved {
+			return fmt.Errorf("constants[%d]: name %q is a reserved envelope column", i, c.Name)
+		}
+		if _, dup := constNames[c.Name]; dup {
+			return fmt.Errorf("constants[%d]: column %q is duplicated", i, c.Name)
+		}
+		constNames[c.Name] = struct{}{}
+	}
+
+	if sc := h.Store.ScopeColumn; sc != "" {
+		found := false
+		for i := range h.Constants {
+			if h.Constants[i].Name != sc {
+				continue
+			}
+			if h.Constants[i].Type != "String" {
+				return fmt.Errorf("store.scopeColumn: constant %q must have type String (got %s)", sc, h.Constants[i].Type)
+			}
+			found = true
+			break
+		}
+		if !found {
+			return fmt.Errorf("store.scopeColumn: %q must name a history.constants entry (a fixed per-process value present in every table)", sc)
+		}
+	}
+
+	seenTable := map[string]struct{}{}
+	for i := range h.Resources {
+		r := &h.Resources[i]
+		if err := r.validate(reg, constNames); err != nil {
+			return fmt.Errorf("resources[%d] (kind=%q): %w", i, r.Kind, err)
+		}
+		table := r.TableName()
+		if !chIdentRe.MatchString(table) {
+			return fmt.Errorf("resources[%d]: table %q is not a valid ClickHouse identifier", i, table)
+		}
+		if _, dup := seenTable[table]; dup {
+			return fmt.Errorf("resources[%d]: table %q is duplicated", i, table)
+		}
+		seenTable[table] = struct{}{}
+	}
+	return nil
+}
+
+func (r *HistoryResource) validate(reg *Registry, constNames map[string]struct{}) error {
+	if strings.TrimSpace(r.Kind) == "" {
+		return fmt.Errorf("kind: required")
+	}
+	if _, err := reg.ResourceFor(r.Kind); err != nil {
+		return fmt.Errorf("kind %q is required by history but not included in watch.resources: %w", r.Kind, err)
+	}
+	if len(r.Columns) == 0 {
+		return fmt.Errorf("columns: at least one column is required")
+	}
+	seen := map[string]struct{}{}
+	for i := range r.Columns {
+		c := &r.Columns[i]
+		if err := c.validate(reg); err != nil {
+			return fmt.Errorf("columns[%d] (name=%q): %w", i, c.Name, err)
+		}
+		if _, reserved := reservedHistoryColumns[c.Name]; reserved {
+			return fmt.Errorf("columns[%d]: name %q is a reserved envelope column", i, c.Name)
+		}
+		if _, hit := constNames[c.Name]; hit {
+			return fmt.Errorf("columns[%d]: column %q conflicts with history.constants", i, c.Name)
+		}
+		if _, dup := seen[c.Name]; dup {
+			return fmt.Errorf("columns[%d]: column %q is duplicated", i, c.Name)
+		}
+		seen[c.Name] = struct{}{}
+	}
+	for i := range r.Filters {
+		if err := r.Filters[i].validate(reg); err != nil {
+			return fmt.Errorf("filters[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func (c *HistoryConstant) validate() error {
+	if !chIdentRe.MatchString(c.Name) {
+		return fmt.Errorf("name %q: invalid ClickHouse identifier", c.Name)
+	}
+	if _, ok := historyColumnTypes[c.Type]; !ok {
+		return fmt.Errorf("type %q: unsupported (allowed: String, Array(String), Int64, UInt64, Float64, Bool, DateTime64(3))", c.Type)
+	}
+	switch c.Index {
+	case "", "bloom_filter":
+	default:
+		return fmt.Errorf("index %q: unsupported (allowed: bloom_filter)", c.Index)
+	}
+	return validateConstantValue(c.Type, c.Value, c.ValueEnv)
+}
+
+func (c *HistoryColumn) validate(reg *Registry) error {
+	if !chIdentRe.MatchString(c.Name) {
+		return fmt.Errorf("name %q: invalid ClickHouse identifier", c.Name)
+	}
+	if _, ok := historyColumnTypes[c.Type]; !ok {
+		return fmt.Errorf("type %q: unsupported (allowed: String, Array(String), Int64, UInt64, Float64, Bool, DateTime64(3))", c.Type)
+	}
+	switch c.Index {
+	case "", "bloom_filter":
+	default:
+		return fmt.Errorf("index %q: unsupported (allowed: bloom_filter)", c.Index)
+	}
+
+	if c.IsConstant() {
+		if c.Encode != "" {
+			return fmt.Errorf("encode is incompatible with value/valueEnv")
+		}
+		if strings.TrimSpace(c.Path) != "" || c.Source != "" || len(c.Fallbacks) > 0 || c.OnMissing != nil {
+			return fmt.Errorf("value/valueEnv is mutually exclusive with path/source/fallbacks/onMissing")
+		}
+		return validateConstantValue(c.Type, c.Value, c.ValueEnv)
+	}
+
+	switch c.Encode {
+	case "":
+	case "json":
+		if c.Type != "String" {
+			return fmt.Errorf("encode=json requires type String")
+		}
+	case "kv":
+		if c.Type != "Array(String)" {
+			return fmt.Errorf("encode=kv requires type Array(String)")
+		}
+	default:
+		return fmt.Errorf("encode %q: unsupported (allowed: json, kv)", c.Encode)
+	}
+	if c.Encode != "" && c.OnMissing != nil {
+		return fmt.Errorf("encode is incompatible with onMissing")
+	}
+	// Reuse Extract validation (history has no forEach context).
+	return c.Extract.validate(reg, false)
+}
+
+// validateConstantValue checks scalar constant source fields shared by
+// HistoryColumn (constant mode) and HistoryConstant.
+func validateConstantValue(typ, value, valueEnv string) error {
+	if value != "" && valueEnv != "" {
+		return fmt.Errorf("value and valueEnv are mutually exclusive")
+	}
+	if value == "" && valueEnv == "" {
+		return fmt.Errorf("value or valueEnv is required")
+	}
+	if typ == "Array(String)" {
+		return fmt.Errorf("constant columns do not support type Array(String)")
+	}
+	return nil
+}
+
+func (f *HistoryFilter) validate(reg *Registry) error {
+	if f.AnyOf != nil {
+		if len(f.AnyOf) == 0 {
+			return fmt.Errorf("anyOf: requires at least one child filter")
+		}
+		if f.Op != "" || f.Value != "" || len(f.Values) > 0 || f.Negate ||
+			f.Path != "" || f.Source != "" || len(f.Fallbacks) > 0 || f.OnMissing != nil {
+			return fmt.Errorf("anyOf is mutually exclusive with path/source/fallbacks/onMissing/op/value/values/negate")
+		}
+		for i := range f.AnyOf {
+			if f.AnyOf[i].AnyOf != nil {
+				return fmt.Errorf("anyOf[%d]: nested anyOf is not supported (one level only)", i)
+			}
+			if err := f.AnyOf[i].validate(reg); err != nil {
+				return fmt.Errorf("anyOf[%d]: %w", i, err)
+			}
+		}
+		return nil
+	}
+	if _, ok := historyFilterOps[f.Op]; !ok {
+		return fmt.Errorf("op %q: unsupported (allowed: exists, equals, notEquals, prefix, suffix, contains, in, regex)", f.Op)
+	}
+	switch f.Op {
+	case "exists":
+		// no operand required
+	case "in":
+		if len(f.Values) == 0 {
+			return fmt.Errorf("op=in requires values")
+		}
+	case "regex":
+		if f.Value == "" {
+			return fmt.Errorf("op=regex requires value")
+		}
+		if _, err := regexp.Compile(f.Value); err != nil {
+			return fmt.Errorf("op=regex: invalid pattern %q: %w", f.Value, err)
+		}
+	default:
+		if f.Value == "" {
+			return fmt.Errorf("op=%s requires value", f.Op)
+		}
+	}
+	return f.Extract.validate(reg, false)
+}
+
 // Load reads and validates a config file from disk.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
@@ -749,8 +1322,8 @@ func Load(path string) (*Config, error) {
 // Validate performs structural checks. The caller is expected to run a
 // separate pass that compiles every JSONPath (see pkg/collector/evaluator).
 func (c *Config) Validate() error {
-	if len(c.Rules) == 0 {
-		return fmt.Errorf("rules: at least one rule is required")
+	if len(c.Rules) == 0 && !c.HistoryEnabled() {
+		return fmt.Errorf("at least one of rules (non-empty) or a history block is required; the configuration would do nothing")
 	}
 	if c.MetricPrefix != "" && !metricNameRe.MatchString(c.MetricPrefix+"x") {
 		return fmt.Errorf("metricPrefix %q is not a valid Prometheus metric name prefix", c.MetricPrefix)
@@ -776,6 +1349,11 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("rules[%d]: metric name %q is duplicated across rules", i, metricName)
 		}
 		seenMetric[metricName] = struct{}{}
+	}
+	if c.HistoryEnabled() {
+		if err := c.History.validate(reg); err != nil {
+			return fmt.Errorf("history: %w", err)
+		}
 	}
 	return nil
 }

@@ -53,6 +53,30 @@ func TestValidate_AcceptsMinimalRule(t *testing.T) {
 	}
 }
 
+// A config with neither output path does nothing, so it is rejected rather
+// than left to start informers nobody reads from.
+func TestValidate_RejectsConfigWithNoOutputPath(t *testing.T) {
+	cases := map[string]*Config{
+		"empty":      {},
+		"watch only": {Watch: watchResources("Pod")},
+		"history explicitly disabled": {
+			Watch:   watchResources("Service"),
+			History: &History{Enabled: boolPtr(false)},
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := c.Validate()
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), "would do nothing") {
+				t.Fatalf("error should explain the config does nothing, got: %v", err)
+			}
+		})
+	}
+}
+
 func TestValidate_RejectsInvalidAnchor(t *testing.T) {
 	c := &Config{
 		Watch: watchResources("Pod"),

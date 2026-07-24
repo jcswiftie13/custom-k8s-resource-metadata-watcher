@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log/slog"
@@ -26,6 +27,8 @@ import (
 
 	"github.com/example/metadata-exporter/pkg/collector"
 	"github.com/example/metadata-exporter/pkg/config"
+	"github.com/example/metadata-exporter/pkg/history"
+	"github.com/example/metadata-exporter/pkg/store"
 )
 
 func main() {
@@ -47,7 +50,8 @@ func main() {
 		log.Error("load config failed", "err", err)
 		os.Exit(1)
 	}
-	log.Info("config parsed", "rules", len(cfg.Rules), "discoveryEnabled", cfg.Discovery.Enabled)
+	log.Info("config parsed", "rules", len(cfg.Rules), "historyEnabled", cfg.HistoryEnabled(),
+		"discoveryEnabled", cfg.Discovery.Enabled)
 
 	restCfg, err := buildRestConfig(*kubeconfig)
 	if err != nil {
@@ -78,7 +82,8 @@ func main() {
 		log.Error("resource registry build failed", "err", err)
 		os.Exit(1)
 	}
-	log.Info("config loaded", "rules", len(cfg.Rules), "watchResources", registry.Resources())
+	log.Info("config loaded", "rules", len(cfg.Rules), "historyEnabled", cfg.HistoryEnabled(),
+		"watchResources", registry.Resources())
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector())
@@ -97,11 +102,85 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// History ingest is fully opt-in and decoupled from the scrape path. Config
+	// and credential errors stay fail-fast here; the ClickHouse connection does
+	// NOT — the manager connects in the background with backoff, so an
+	// unreachable store degrades history instead of killing the exporter.
+	var histMgr *history.Manager
+	if cfg.HistoryEnabled() {
+		compiled, err := history.CompileAll(*cfg.History)
+		if err != nil {
+			log.Error("history compile failed", "err", err)
+			os.Exit(1)
+		}
+		sc := cfg.History.Store
+		user, err := sc.ResolveUsername()
+		if err != nil {
+			log.Error("history store username resolve failed", "err", err)
+			os.Exit(1)
+		}
+		pw, err := sc.ResolvePassword()
+		if err != nil {
+			log.Error("history store password resolve failed", "err", err)
+			os.Exit(1)
+		}
+		tok, err := sc.ResolveToken()
+		if err != nil {
+			log.Error("history store token resolve failed", "err", err)
+			os.Exit(1)
+		}
+		scopeVal, err := history.ScopeValue(compiled, sc.ScopeColumn)
+		if err != nil {
+			log.Error("history store scopeColumn resolve failed", "err", err)
+			os.Exit(1)
+		}
+		histMgr = history.NewManager(history.ManagerOptions{
+			StoreOptions: store.Options{
+				DSN:           sc.DSN,
+				Username:      user,
+				Password:      pw,
+				Database:      sc.Database,
+				Token:         tok,
+				Secure:        sc.SecureEnabled(),
+				TLSSkipVerify: sc.TLSSkipVerify,
+				CreateSchema:  sc.CreateSchemaEnabled(),
+				UpdateClose:   sc.CloseModeOrDefault() == config.CloseModeUpdate,
+				Scope:         store.Scope{Column: sc.ScopeColumn, Value: scopeVal},
+			},
+			Compiled:   compiled,
+			Informers:  col.Informers(),
+			Batch:      sc.Batch,
+			CloseMode:  sc.CloseModeOrDefault(),
+			Reconnect:  sc.Reconnect,
+			Registerer: reg,
+		}, log)
+		histMgr.Start(ctx)
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	// Readiness: 503 until the informer caches are synced. History store
+	// health is reported but deliberately never fails readiness — a degraded
+	// history must not eject the exporter from service endpoints.
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		type readyz struct {
+			InformersSynced bool                   `json:"informersSynced"`
+			History         *history.ManagerStatus `json:"history,omitempty"`
+		}
+		resp := readyz{InformersSynced: col.Ready()}
+		if histMgr != nil {
+			st := histMgr.Status()
+			resp.History = &st
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.InformersSynced {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 	server := &http.Server{
 		Addr:              *metricsAddr,

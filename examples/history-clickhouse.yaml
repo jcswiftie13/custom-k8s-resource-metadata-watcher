@@ -1,0 +1,111 @@
+# Example: event-driven ClickHouse version store (history ingest).
+#
+# The `history:` block is fully opt-in and decoupled from the Prometheus scrape
+# path — when history.enabled is false (or absent) the exporter behaves exactly
+# as before. Each watched resource declares which ClickHouse columns exist, the
+# k8s json path each is extracted from, and optional client-side filters
+# (regex-capable) that decide which objects are written.
+
+metricPrefix: "custom_"
+
+watch:
+  resources:
+    # Every kind referenced under history.resources MUST also be watched here.
+    - name: VirtualService
+      apiVersion: networking.istio.io/v1beta1
+      kind: VirtualService
+      resource: virtualservices
+      scope: Namespaced
+    - name: Gateway
+      apiVersion: networking.istio.io/v1beta1
+      kind: Gateway
+      resource: gateways
+      scope: Namespaced
+    - kind: Service
+      scope: Namespaced
+      # Server-side narrowing still happens here. Label selectors support only
+      # k8s set/equality operators (=, in, exists) — NOT regex. Regex lives in
+      # the client-side history.filters below.
+      labelSelector: "istio=ingressgateway"
+
+# No rules: this is a history-only config. Declaring the history block below is
+# what turns ingest on; rules and history are independent output paths and
+# either one alone is a complete configuration. Add a rules: block here to also
+# expose _info metrics on /metrics.
+
+history:
+  enabled: true
+  store:
+    type: clickhouse
+    dsn: "clickhouse://clickhouse:9000/default"
+    # HTTP alternative (e.g. via Istio VirtualService / ingress on 80/443 →
+    # ClickHouse 8123). Scheme selects the protocol — clickhouse://host:8123
+    # is still native and will fail against an HTTP listener:
+    #   dsn: "http://clickhouse:8123/default"
+    #   dsn: "https://clickhouse.example.com/default"  # pair with secure: true
+    # createSchema: dev -> auto CREATE TABLE + additive ADD COLUMN.
+    # prod (default false) -> validate live schema against config, fail fast on
+    # drift, mutate nothing.
+    createSchema: true
+    batch:
+      maxRows: 5000
+      flushIntervalMs: 1000
+    # Background connect/reconnect tuning (all optional). ClickHouse being
+    # unreachable never prevents the exporter from starting: history retries
+    # with exponential backoff (initial → doubling → max, ±20% jitter) and
+    # begins ingesting once connected. pingTimeoutMs bounds each attempt.
+    # reconnect:
+    #   initialBackoffMs: 1000
+    #   maxBackoffMs: 30000
+    #   pingTimeoutMs: 5000
+    # Authentication (all optional; override credentials embedded in the DSN).
+    # Prefer the *Env forms in production so secrets come from a k8s Secret
+    # (mounted as env vars) instead of living in the ConfigMap.
+    username: default
+    passwordEnv: CH_PASSWORD      # env var populated from a Secret; wins over `password`
+    # password: "devsecret"      # inline alternative for local/dev
+    secure: false                # set true for TLS (required by ClickHouse Cloud)
+    # tlsSkipVerify: true        # only for self-signed certs in testing
+    # token / tokenEnv: JWT / access token (ClickHouse Cloud). Mutually
+    # exclusive with username/password.
+    # tokenEnv: CH_TOKEN
+  # Fixed columns injected into every history table (ideal for cluster name).
+  # Prefer valueEnv so the name comes from the Deployment env / downward API.
+  constants:
+    - { name: cluster_name, type: String, value: "dev" }
+    # - { name: cluster_name, type: String, valueEnv: CLUSTER_NAME }
+  resources:
+    - kind: VirtualService
+      table: vs_versions
+      columns:
+        # Full spec, reconstructable at query time.
+        - { name: spec_json, type: String, path: "spec", encode: json }
+        # Materialised join columns for fast has/hasAll lookups.
+        - { name: hosts, type: "Array(String)", path: "spec.hosts[*]" }
+        - { name: bound_gateways, type: "Array(String)", path: "spec.gateways[*]", index: bloom_filter }
+      filters:
+        # Only persist prod/staging VirtualServices. Regex is evaluated
+        # client-side (Go RE2, linear time); anchor patterns with ^...$.
+        - { path: "metadata.namespace", op: regex, value: "^(prod|staging)-" }
+
+    - kind: Gateway
+      table: gw_versions
+      columns:
+        - { name: spec_json, type: String, path: "spec", encode: json }
+        - { name: selector_kv, type: "Array(String)", path: "spec.selector", encode: kv, index: bloom_filter }
+        - { name: server_hosts, type: "Array(String)", path: "spec.servers[*].hosts[*]" }
+
+    - kind: Service
+      table: svc_versions
+      columns:
+        - { name: cluster_ip, type: String, path: "spec.clusterIP" }
+        # Ingress IP union: external IPs and LB status IPs.
+        - { name: ingress_ips, type: "Array(String)", path: "status.loadBalancer.ingress[*].ip", index: bloom_filter }
+        - { name: selector_kv, type: "Array(String)", path: "spec.selector", encode: kv }
+      filters:
+        # Top-level filters are AND-combined; an anyOf entry passes when ANY of
+        # its child conditions matches (OR). anyOf may not nest further anyOf.
+        - { path: "spec.type", op: in, values: ["LoadBalancer", "NodePort"] }
+        - anyOf:
+            - { path: "metadata.namespace", op: prefix, value: "prod-" }
+            - { path: "metadata.labels['tier']", op: equals, value: "critical" }

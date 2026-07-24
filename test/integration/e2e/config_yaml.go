@@ -3,8 +3,124 @@
 package e2e
 
 import (
+	"fmt"
 	"strings"
 )
+
+// clickhouseNativeDSN / clickhouseHTTPDSN are the in-cluster ClickHouse
+// endpoints used by history e2e. Native is the default production path;
+// HTTP covers deployments that reach ClickHouse via an HTTP proxy / ingress
+// (VirtualService on 80/443 → ClickHouse 8123). Scheme must be http(s):// —
+// clickhouse://host:8123 still speaks the native protocol and will fail.
+const (
+	clickhouseNativeDSN = "clickhouse://default@clickhouse:9000/default"
+	clickhouseHTTPDSN   = "http://clickhouse:8123/default"
+)
+
+// istioHistoryConfigYAML renders an exporter config that mirrors the POC's
+// ClickHouse routing-history shape over the native protocol (9000).
+func istioHistoryConfigYAML(namespace string) string {
+	return istioHistoryConfigYAMLWithDSN(namespace, clickhouseNativeDSN)
+}
+
+// istioHistoryConfigYAMLWithDSN is istioHistoryConfigYAML with a caller-chosen
+// ClickHouse DSN (native clickhouse:// or HTTP http:// / https://).
+//
+// It watches the POC resource set (Service, Deployment, Istio Gateway,
+// VirtualService) and materialises four version tables (service_versions /
+// deploy_versions / gw_versions / vs_versions) with the same domain/join
+// columns and bloom indexes as poc/route2a/internal/chstore — reproduced
+// purely through history config, with no import of poc code.
+//
+// It exercises the following aspects in one scenario:
+//   - create table: createSchema:true builds the four tables + bloom indexes.
+//   - type: String / Int64 / Array(String) / encode:kv / encode:json columns.
+//   - filter: the Service history resource keeps only type in (LoadBalancer,NodePort).
+//   - labelSelector: the Gateway watch is narrowed server-side to istio=ingressgateway.
+//   - constants: history.constants injects cluster_name (valueEnv: CLUSTER_NAME) into every table.
+//   - value / onMissing: Service source is a fixed value; team uses path + onMissing.
+func istioHistoryConfigYAMLWithDSN(namespace, dsn string) string {
+	return fmt.Sprintf(`metricPrefix: "it_"
+
+watch:
+  resources:
+    - kind: Service
+      scope: Namespaced
+      namespaces:
+        - %[1]s
+    - kind: Deployment
+      scope: Namespaced
+      namespaces:
+        - %[1]s
+    - name: Gateway
+      group: networking.istio.io
+      version: v1beta1
+      resource: gateways
+      kind: Gateway
+      scope: Namespaced
+      namespaces:
+        - %[1]s
+      labelSelector: "istio=ingressgateway"
+    - name: VirtualService
+      group: networking.istio.io
+      version: v1beta1
+      resource: virtualservices
+      kind: VirtualService
+      scope: Namespaced
+      namespaces:
+        - %[1]s
+
+# history-only: no rules block, so this also exercises the exporter running
+# with the scrape path entirely absent.
+history:
+  enabled: true
+  store:
+    type: clickhouse
+    dsn: %q
+    createSchema: true
+    closeMode: update
+    batch:
+      maxRows: 100
+      flushIntervalMs: 200
+  constants:
+    - { name: cluster_name, type: String, valueEnv: CLUSTER_NAME }
+  resources:
+    - kind: Service
+      table: service_versions
+      columns:
+        - { name: ingress_ips, type: "Array(String)", path: "status.loadBalancer.ingress[*].ip", index: bloom_filter }
+        - { name: selector_kv, type: "Array(String)", path: "spec.selector", encode: kv }
+        - { name: spec_json, type: "String", path: "spec", encode: json }
+        - { name: port, type: "Int64", path: "spec.ports[0].port" }
+        - { name: port_name, type: "String", path: "spec.ports[0].name" }
+        - { name: protocol, type: "String", path: "spec.ports[0].protocol" }
+        - { name: hostname, type: "String", path: "metadata.name" }
+        - { name: source, type: "String", value: "metadata-exporter" }
+        - { name: team, type: "String", path: 'metadata.labels["team"]', onMissing: "unknown" }
+      filters:
+        # Semantically equivalent to op:in over [LoadBalancer, NodePort];
+        # written as anyOf to exercise OR groups end-to-end.
+        - anyOf:
+            - { path: "spec.type", op: equals, value: "LoadBalancer" }
+            - { path: "spec.type", op: equals, value: "NodePort" }
+    - kind: Deployment
+      table: deploy_versions
+      columns:
+        - { name: pod_labels_kv, type: "Array(String)", path: "spec.template.metadata.labels", encode: kv }
+        - { name: team, type: "String", path: 'metadata.labels["team"]', onMissing: "unknown" }
+    - kind: Gateway
+      table: gw_versions
+      columns:
+        - { name: selector_kv, type: "Array(String)", path: "spec.selector", encode: kv, index: bloom_filter }
+        - { name: server_hosts, type: "Array(String)", path: "spec.servers[*].hosts[*]" }
+        - { name: spec_json, type: "String", path: "spec", encode: json }
+    - kind: VirtualService
+      table: vs_versions
+      columns:
+        - { name: bound_gateways, type: "Array(String)", path: "spec.gateways[*]" }
+        - { name: spec_json, type: "String", path: "spec", encode: json }
+`, namespace, dsn)
+}
 
 // sharedRulesYAML is the integration test rule set for cluster-wide and
 // per-namespace topologies. The "controller_*" labels exercise the

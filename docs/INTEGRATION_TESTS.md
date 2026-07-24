@@ -119,6 +119,25 @@ flowchart LR
 - `TestCorrectness_NodeDynamicMetadataMultiKey`
   - Node 動態 metadata 多 key 路徑：`labels` 與 `annotations` 各至少 2 個 key（含特殊字元）皆可正確展平與對值。
 
+### History 類（ClickHouse 路由回溯，見 `docs/istio-virtualservice-routing-history-design.md`）
+
+- `TestHistory_ClickHouseIstioSchema`
+  - 寫入面：exporter `history:` 依 `istioHistoryConfigYAML`（native `clickhouse://…:9000`）建四張 POC-shape 版本表並 ingest 真實 Service/Deployment/Istio Gateway/VirtualService。
+  - 覆蓋 create table（含 bloom index、`closeMode: update` 的 patch-part 表設定）、欄位型別（`encode: kv`/`json`、`Array(String)`）、client 端 filter、server 端 labelSelector、`valid_to` 版本鏈（open sentinel、update 收版、delete 無 tombstone）。
+  - 亦覆蓋 `history.constants`（`valueEnv: CLUSTER_NAME` → 每張表 `cluster_name`）、欄位 `value`（Service `source`）、以及 path `onMissing` hit/miss（Deployment `team=platform`／Service miss → `unknown`）。
+  - e2e config 以 **`closeMode: update`**（lightweight UPDATE 關版，ClickHouse 26.5.5.8）執行；`valid_to` 子測試因此同時驗證 update-close 的版本鏈語意與 rewrite 模式等價。
+- `TestHistory_ClickHouseHTTP`
+  - 與上者共用同一 fixture／斷言（`runHistoryClickHouseIstioSchema`），DSN 改為 **`http://clickhouse:8123/default`**，驗證 HTTP 協定寫入路徑（DDL、`PrepareBatch`、lightweight UPDATE）無需改程式即可運作。
+  - 讀取斷言仍經 pod 內 `clickhouse-client`（native），與 writer protocol 解耦；覆蓋「經 HTTP proxy / ingress 連 ClickHouse」的部署形狀。
+  - 常見誤用：`clickhouse://host:8123` 仍走 native，不是 HTTP。
+- `TestHistory_RoutingResolution`
+  - 解析面閉環：exporter ingest → VS 改 destination 產生第二版本 → **routesim** 範圍查詢（host+path+[t0,t1]）必須回傳每版本的 gateway 與 destination cluster，且 `Segments>=2`、`DistinctCfgs>=2`。
+  - routesim（`test/integration/routesim/`）是 `poc/route2a` bench-worst 管線（`LoadTrafficWindow` → memwindow 切段 → in-memory 3-hop → gwresolve → in-process istiod translate → `router_check_tool`）的**複製**（非 import；poc 之後會移除），並改編為 exporter schema：reader 端 dedup（SQL 不過濾 `valid_to`、client 取 max `ingest_seq`，取代 `FINAL`）、無 `rev` 欄、protojson `DiscardUnknown`、bare/qualified gateway ref 皆可比對。獨立 Go module，`istio.io/istio` 不進主 go.mod。
+  - `router_check_tool` **只允許 native binary**（缺失 = 測試失敗，不 Skip）：host 側把 `GOOS=linux go test -c` 出的 routesim binary 掛進 `envoyproxy/envoy:tools-*` 容器（`--network kind`）執行，binary 架構綁 image platform；ClickHouse 走 kind node 的 NodePort 30900。
+  - env：`ROUTESIM_TEST_BIN`（run.sh 自動建，或 `make routesim-build`）、`ROUTESIM_IMAGE`、`ROUTESIM_PLATFORM`、`E2E_KIND_CONTROL_PLANE`、`SKIP_ROUTESIM_BUILD`。單跑：`make e2e-routing`（可搭 `SKIP_KIND_CREATE=1` 重用叢集）。
+  - 子測試 `update_close_restart_idempotency`：驗證 `closeMode: update` 的「每版本恆一實體列」（raw count 無 FINAL）、exporter 重啟後 `Recover()` 不重插（re-LIST 冪等）、以及重啟後的變更能正確關閉「從 CH 恢復」的開放版本（版本鏈無縫）。
+  - routesim 以 **pruned 讀取模式**執行（`ROUTESIM_UNIQUE_ROWS=1`，因 exporter config 為 `closeMode: update`）：`valid_to` Overlap 條件回到 SQL、dedup 降級為 safety net，並**斷言 `CollapsedRows == 0`**——任何收斂都代表 writer 的行唯一保證被打破。
+
 ## 需要特別說明的「可浮動 / 可調整」機制
 
 ### 1) Scrape error 與 latency 為主要回歸訊號

@@ -1,0 +1,12 @@
+<clickhouse>
+  <!-- PoC only: allow the password-less `default` user from any network so the
+       host-side clients (cmd/ipflow, ip_flow_test) can reach the container over
+       the mapped native port. Overrides the image's localhost-only default. -->
+  <users>
+    <default>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+    </default>
+  </users>
+</clickhouse>

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -48,6 +49,10 @@ type Collector struct {
 	// confusing ways. Collect remains cheap: scrapes are typically
 	// seconds-scale apart and the lock only spans cache iteration.
 	scrapeMu sync.Mutex
+
+	// ready flips once Start has brought the informers up and their caches
+	// synced; /readyz reports it.
+	ready atomic.Bool
 
 	self *selfMetrics
 }
@@ -95,6 +100,18 @@ func New(cfg *config.Config, client dynamic.Interface, log *slog.Logger, opts Op
 	return c, nil
 }
 
+// Informers exposes the shared informer set so other subsystems (e.g. the
+// history ingest path) can register event handlers on the same cache.
+// Handlers registered before Start observe the initial LIST as Add events;
+// handlers registered after Start get the full cache replayed as Add events
+// instead (client-go's late-registration semantics), so either order sees a
+// complete snapshot — late registration only misses transitions that happened
+// in between.
+func (c *Collector) Informers() *ScopedInformers { return c.informers }
+
+// Ready reports whether the informers have started and synced their caches.
+func (c *Collector) Ready() bool { return c.ready.Load() }
+
 // Start launches informers, runs a one-shot LIST dry-run for selectors so
 // configuration mistakes surface immediately, and blocks until ctx is
 // cancelled. Start does NOT trigger metric emission; Prometheus pulls via
@@ -108,6 +125,7 @@ func (c *Collector) Start(ctx context.Context) error {
 	if err := c.informers.Start(ctx); err != nil {
 		return err
 	}
+	c.ready.Store(true)
 	c.log.Info("collector started", "rules", len(c.rules))
 	<-ctx.Done()
 	return nil
